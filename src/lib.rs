@@ -1,11 +1,14 @@
 #![allow(dead_code)] // tmp
 
+mod error;
 mod fs;
 
 #[doc(inline)]
-pub use fs::{AcquiredExisting, File, FileSystem, LockFile};
+pub use error::{Error, Result};
 
-use std::io;
+#[doc(inline)]
+pub use fs::{AcquiredExisting, File, FileSystem};
+
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -17,18 +20,6 @@ const DB_FILE: &str = "db.papaya";
 const MAX_SEGMENTS: usize = u16::MAX as usize;
 const LOCK_NAME: &str = "lock";
 
-pub type Result<T> = std::result::Result<T, Error>;
-
-pub enum Error {
-    Io(io::Error),
-}
-
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
 pub struct Papaya<FileSystem>
 where
     FileSystem: self::FileSystem,
@@ -36,7 +27,6 @@ where
     config: Config<FileSystem>,
     index: Index<FileSystem>,
     datalog: DataLog<FileSystem>,
-    lock: FileSystem::LockFile,
     seed: u32,
     stats: Stats,
     sync_writes: bool,
