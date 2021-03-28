@@ -16,9 +16,9 @@ pub trait FileSystem {
     fn open(path: impl AsRef<Path>, flag: usize, mode: u32) -> Result<Self::File>;
     fn metadata(path: impl AsRef<Path>) -> Result<fs::Metadata>;
     fn remove(path: impl AsRef<Path>) -> Result<()>;
-    fn rename(old: impl AsRef<Path>, new: &Path) -> Result<()>;
-    fn read_dir(path: impl AsRef<Path>) -> Result<fs::Metadata>;
-    fn create_lock_file(path: impl AsRef<Path>, perm: usize) -> Result<()>;
+    fn rename(&mut self, from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<()>;
+    fn read_dir(&self, path: impl AsRef<Path>) -> Result<fs::ReadDir>;
+    fn create_lock_file(&self, path: impl AsRef<Path>, perm: usize) -> Result<()>;
 }
 
 pub enum AcquiredExisting {

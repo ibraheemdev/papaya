@@ -2,23 +2,24 @@
 
 mod error;
 mod fs;
+mod recovery;
+mod segment;
+pub(crate) mod utils;
 
 #[doc(inline)]
 pub use error::{Error, Result};
 
 #[doc(inline)]
+pub use segment::{Segment, SegmentMeta};
+
+#[doc(inline)]
 pub use fs::{AcquiredExisting, File, FileSystem};
 
-use std::path::PathBuf;
-use std::time::Duration;
+use crate::utils::*;
 
-const MAX_KEY_LENGTH: u16 = u16::MAX;
-const MAX_VALUE_LENGTH: u32 = 1 << 30 - 1;
-const MAX_KEYS: u32 = u32::MAX;
-const EXT: &str = ".papaya";
-const DB_FILE: &str = "db.papaya";
-const MAX_SEGMENTS: usize = u16::MAX as usize;
-const LOCK_NAME: &str = "lock";
+use std::fs as sys;
+use std::path::Path;
+use std::time::Duration;
 
 pub struct Papaya<FileSystem>
 where
@@ -33,52 +34,37 @@ where
     compaction_running: i32,
 }
 
+impl<FileSystem> Papaya<FileSystem>
+where
+    FileSystem: self::FileSystem,
+{
+    fn open(path: impl AsRef<Path>, config: Config<FileSystem>) -> Result<Self> {
+        sys::create_dir_all(path.as_ref())?;
+
+        match config.fs.create_lock_file(path.as_ref(), 0o644) {
+            Err(Error::AcquiredExisting) => {
+                // backup
+                recovery::backup_non_segment_files(config.fs)?;
+            }
+            Err(e) => return Err(e),
+            _ => (),
+        };
+
+        todo!()
+    }
+}
+
 struct Config<FileSystem>
 where
     FileSystem: self::FileSystem,
 {
-    path: PathBuf,
-    file_system: FileSystem,
+    fs: FileSystem,
     create_new: bool,
     background_sync_interval: Duration,
     background_compaction_interval: Duration,
     max_segment_size: u32,
     compaction_min_segment_size: u32,
     compaction_min_fragmentation: f32,
-}
-
-impl<FileSystem> Config<FileSystem>
-where
-    FileSystem: self::FileSystem,
-{
-    fn open(self) -> Result<Papaya<FileSystem>> {
-        // let mut builder = fs::DirBuilder::new();
-        // builder.recursive(true);
-
-        // #[cfg(unix)]
-        // std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o755);
-
-        // let mut acquired_existing = false;
-
-        // if fs::metadata(&self.path).is_err() {
-        //     acquired_existing = true;
-        // }
-
-        // let file = fs::File::open(&self.path)?;
-
-        // let try_lock = fs2::FileExt::try_lock_exclusive(&file).map_err(|e| {
-        //     io::Error::new(
-        //         io::ErrorKind::Other,
-        //         format!(
-        //             "Could not acquire lock on {}: {}",
-        //             self.path.to_string_lossy(),
-        //             e
-        //         ),
-        //     )
-        // })?;
-
-        todo!()
-    }
 }
 
 struct Index<FileSystem>
@@ -101,27 +87,8 @@ where
 {
     config: Config<FileSystem>,
     curr: Segment<FileSystem::File>,
-    segments: [Segment<FileSystem::File>; MAX_SEGMENTS],
+    segments: [Segment<FileSystem::File>; MAX_SEGMENTS as _],
     max_sequence_id: u64,
-}
-
-struct Segment<F>
-where
-    F: File,
-{
-    file: F,
-    id: u16,
-    sequence_id: u64,
-    name: String,
-    meta: SegmentMeta,
-}
-
-struct SegmentMeta {
-    puts: u32,
-    is_full: bool,
-    deleted_records: u32,
-    deleted_keys: u32,
-    deleted_bytes: u32,
 }
 
 struct Stats {

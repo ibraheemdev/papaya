@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 fs2 = "0.4"
+log = "0.4.14"
