@@ -35,20 +35,23 @@ pub struct Entry<K, V> {
 // Safety: seize::Link is the first field
 unsafe impl<K, V> AsLink for Entry<K, V> {}
 
-impl<K, V> Entry<K, V> {
-    pub const EMPTY: *mut Self = ptr::null_mut();
-    pub const TOMBSTONE: *mut Self = !1 as _;
-    pub const COPIED: *mut Self = !0 as _;
-}
-
 impl Entry<(), ()> {
-    // tag bit reserved for copy marker
-    const COPYING: usize = 1;
+    // the entry is being copied to a new table
+    const COPYING: usize = 0b01;
+
+    // the entry has been deleted from the table
+    const TOMBSTONE: usize = 0b10;
+
+    // the entry has been successfully copied to the new table
+    const COPIED: usize = 0b11;
+
+    // mask for entry pointer, ignoring tag bits
+    const POINTER: usize = !(Entry::TOMBSTONE | Entry::COPYING);
 }
 
 impl<K, V, S> HashMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> HashMap<K, V, S> {
-        // add extra buffer capacity the same length as the probe limit.
+        // allocate extra buffer capacity the same length as the probe limit.
         // this allows us to avoid overflow checks
         let max_probes = log2!(capacity);
         let capacity = capacity.next_power_of_two() + max_probes;
@@ -115,16 +118,10 @@ where
         let mut i = h1(hash) & (capacity - 1);
         let limit = i + max_probes;
 
-        'probe: loop {
-            // went over the max probe count
-            if i > limit {
-                break;
-            }
-
+        while i <= limit {
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
-            // encountered an empty meta in the probe sequence, the key cannot
-            // exist in the table yet
+            // encountered an empty meta in the probe sequence, the key cannot exist in the table
             if meta == meta::EMPTY {
                 return None;
             }
@@ -133,27 +130,41 @@ where
             if meta & meta::H2 == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
 
-                // the entry was deleted before we could check it, but it's
-                // possible that this was a false positive h2 match, so we
-                // have to keep going
-                if entry == Entry::TOMBSTONE {
-                    i += 1;
-                    continue 'probe;
+                // the entry has been, or is being copied to the new table.
+                // even if the copy is not complete yet, it is possible that the
+                // latest value already exists in the new table courtesy of a concurrent
+                // insert that may have happened-before us, so we cannot simply return
+                // this value.
+                if entry.addr() & Entry::COPYING != 0 {
+                    return self.next_table_ref().unwrap().get(key, guard);
                 }
 
+                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
+
                 // this is a true match
-                if unsafe { (*entry).key.borrow() == key } {
-                    unsafe { return Some(&(*entry).value) }
+                if unsafe { (*entry_ptr).key.borrow() == key } {
+                    // the entry existed in the table but was deleted
+                    if entry.addr() & Entry::TOMBSTONE != 0 {
+                        return None;
+                    }
+
+                    unsafe { return Some(&(*entry_ptr).value) }
                 }
             }
 
-            // this slot either contains another key or a tombstone, keep searching
+            // the slot contained a different key, keep searching
             i += 1;
         }
 
-        // went over the max probe count: the key is not in the table
-        // because any inserts would have triggered a resize at this point
-        return None;
+        // went over the max probe count: the key is not in the table.
+        // any inserts would have triggered a resize at this point.
+        // check if there is an active migration
+        if let Some(next_table) = self.next_table_ref() {
+            return next_table.get(key, guard);
+        }
+
+        // the key is not in the table and there is no active migration
+        None
     }
 
     pub fn insert<'guard>(&self, key: K, value: V, guard: &'guard Guard<'_>) -> Option<&'guard V> {
@@ -182,22 +193,18 @@ where
         let mut i = h1(hash) & (capacity - 1);
         let limit = i + max_probes;
 
-        'probe: loop {
-            // went over the max probe count
-            if i > limit {
-                break;
-            }
-
+        'probe: while i <= limit {
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
+            // possible empty entry
             if meta == meta::EMPTY {
                 match unsafe { self.table.entry(i) }.compare_exchange(
-                    Entry::EMPTY,
+                    ptr::null_mut(),
                     new_entry,
                     Ordering::Release,
                     Ordering::Relaxed,
                 ) {
-                    // succesfully claimed this entry
+                    // successfully claimed this entry
                     Ok(_) => {
                         // update the meta byte
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
@@ -207,12 +214,29 @@ where
                     // lost the entry to someone else, keep searching, unless
                     // it was a concurrent insert of the same key
                     Err(found) => {
-                        // the key matches, perform an update
-                        if unsafe { (*found).key == *key } {
+                        let found_ptr = found.map_addr(|addr| addr & Entry::POINTER);
+
+                        // the key matches, we might be able to perform an update
+                        if unsafe { (*found_ptr).key == *key } {
+                            // the entry is being copied to a new table, we have to go there
+                            // and join the race for the insertion
+                            if found.addr() & Entry::COPYING != 0 {
+                                return self
+                                    .next_table_ref()
+                                    .unwrap()
+                                    .insert_entry(new_entry, guard);
+                            }
+
+                            // perform the update
                             match self.replace_entry(i, found, new_entry, guard) {
                                 Ok(value) => return Some(value),
-                                // lost to a concurrent delete, keep searching
-                                Err(_) => continue 'probe,
+                                // lost to a concurrent copier, retry in the new table
+                                Err(_) => {
+                                    return self
+                                        .next_table_ref()
+                                        .unwrap()
+                                        .insert_entry(new_entry, guard)
+                                }
                             }
                         }
 
@@ -223,34 +247,44 @@ where
 
             if meta & meta::H2 == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
-                // the entry was deleted before we could update it, we must now attempt
-                // find a vacant slot or update a concurrent insert
-                if entry == Entry::TOMBSTONE {
-                    i += 1;
-                    continue 'probe;
-                }
+                // the key matches, we might be able to perform an update
+                if unsafe { (*entry_ptr).key == *key } {
+                    // the entry is being copied to a new table, we have to go there
+                    // and join the race for the insertion
+                    if entry.addr() & Entry::COPYING != 0 {
+                        return self
+                            .next_table_ref()
+                            .unwrap()
+                            .insert_entry(new_entry, guard);
+                    }
 
-                // 1/128 chance that we got a false positive from h2, so we must check full
-                // equality to make sure
-                if unsafe { (*entry).key == *key } {
+                    // perform the update
                     match self.replace_entry(i, entry, new_entry, guard) {
                         Ok(value) => return Some(value),
-                        // lost to a concurrent delete, keep searching
-                        Err(_) => continue 'probe,
+                        // lost to a concurrent copier, retry in the new table
+                        Err(_) => {
+                            return self
+                                .next_table_ref()
+                                .unwrap()
+                                .insert_entry(new_entry, guard)
+                        }
                     }
                 }
             }
 
-            // this slot either contains another key or a tombstone, keep searching
+            // this entry either contains another key, keep searching
             i += 1;
         }
 
-        // went over the max probe count.
-        // the key is not in the table, trigger a resize
+        // went over the max probe count: trigger a resize.
+        // the entry can be safely inserted directly into the new table
+        // as any other concurrent insertions will also see the full
+        // probe sequence.
         let next_table = self.next_table();
 
-        // help along the top-level copy
+        // help along the highest priority (top-level) copy
         let root = guard.protect(&self.root, Ordering::Acquire);
         let root = unsafe { Table::<K, V>::from_raw(root) };
         self.as_ref(root).help_copy(guard);
@@ -259,6 +293,8 @@ where
         self.as_ref(next_table).insert_entry(new_entry, guard)
     }
 
+    // Performs `CAS(entry, new_entry)` on `entries[i]`, returning the previous value if successful.
+    // Returns an error if the entry is copied.
     fn replace_entry<'guard>(
         &self,
         i: usize,
@@ -275,6 +311,8 @@ where
             ) {
                 // succesful update
                 Ok(_) => unsafe {
+                    let entry = entry.map_addr(|addr| addr & Entry::POINTER);
+
                     // retire the old entry
                     guard.retire(entry, reclaim::boxed::<Entry<K, V>>);
 
@@ -282,33 +320,30 @@ where
                     return Ok(&(*entry).value);
                 },
 
-                // lost to a concurrent delete, we must now attempt
-                // find a vacant slot or update a concurrent insert
-                //
-                // we never reuse tombstones to maintain linearizability
-                // against concurrent inserts, so it's as if this never happened.
-                Err(found) if found == Entry::TOMBSTONE => return Err(()),
+                // the entry is being copied to the new table, tell the caller to retry there
+                Err(found) if found.addr() & Entry::COPIED != 0 => unsafe {
+                    return Err(());
+                },
 
-                // someone else updated before us
-                Err(found) => {
-                    // retry our update
-                    entry = found;
-                    continue;
-                }
+                // lost to a concurrent update or delete.
+                // we can safely act as our update happened and was immediately overwritten
+                Err(found) => unsafe {
+                    let entry = found.map_addr(|addr| addr & Entry::POINTER);
+
+                    // return the previous value
+                    return Ok(&(*entry).value);
+                },
             }
         }
     }
 
-    // only inserts if the entry does not already exist
-    pub fn insert_copy<'guard>(
-        &self,
-        new_entry: *mut Entry<K, V>,
-        guard: &'guard Guard<'_>,
-    ) -> Result<usize, usize> {
+    pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         let max_probes = log2!(self.table.capacity);
         let capacity = self.table.capacity - max_probes;
-
-        let key = unsafe { &(*new_entry).key };
 
         let hash = self.hash(&key);
         let h2 = meta::h2(hash);
@@ -324,39 +359,38 @@ where
 
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
+            // encountered an empty meta in the probe sequence, the key
+            // cannot exist in the table
             if meta == meta::EMPTY {
-                match unsafe { self.table.entry(i) }.compare_exchange(
-                    Entry::EMPTY,
-                    new_entry,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    // succesfully claimed this entry
-                    Ok(_) => {
-                        // update the meta byte
-                        unsafe { self.table.meta(i).store(h2, Ordering::Release) };
-                        return Ok(i);
-                    }
-
-                    // lost the entry to someone else
-                    Err(found) => {
-                        // the entry was already copied
-                        if unsafe { (*found).key == *key } {
-                            return Err(i);
-                        }
-
-                        // keep searching
-                        continue 'probe;
-                    }
-                }
+                return None;
             }
 
             if meta & meta::H2 == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
 
-                // the entry was already copied
-                if unsafe { (*entry).key == *key } {
-                    return Err(i);
+                // the entry was deleted before we could check it, but it's
+                // possible that this was a false positive h2 match, so we
+                // have to keep going
+                if entry == Entry::TOMBSTONE {
+                    i += 1;
+                    continue 'probe;
+                }
+
+                // this is a true match
+                if unsafe { (*entry).key.borrow() == key } {
+                    // replace it with a tombstone
+                    let entry = unsafe {
+                        self.table
+                            .entry(i)
+                            .swap(Entry::TOMBSTONE, Ordering::Release)
+                    };
+
+                    // retire the old entry if we were the one to delete
+                    if entry != Entry::TOMBSTONE {
+                        unsafe { guard.retire(entry, reclaim::boxed::<Entry<K, V>>) }
+                    }
+
+                    unsafe { return Some(&(*entry).value) }
                 }
             }
 
@@ -364,11 +398,20 @@ where
             i += 1;
         }
 
-        // went over the max probe count, the key is not in the table
-        let next_table = self.next_table();
-        // don't abandon our copy to help along another one, just insert into
-        // the next table and return to our current copy
-        self.as_ref(next_table).insert_copy(new_entry, guard)
+        // went over the max probe count: the key is not in the table
+        // because any inserts would have triggered a resize at this point
+        return None;
+    }
+
+    pub(crate) fn next_table_ref(&self) -> Option<HashMapRef<'_, K, V, S>> {
+        let state = self.table.resize_state();
+        let next = state.next.load(Ordering::Acquire);
+
+        if !next.is_null() {
+            return unsafe { Some(self.as_ref(Table::from_raw(next))) };
+        }
+
+        None
     }
 
     pub(crate) fn next_table(&self) -> Table<K, V> {
@@ -448,91 +491,6 @@ where
         drop(_allocating);
 
         next
-    }
-
-    pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        let max_probes = log2!(self.table.capacity);
-        let capacity = self.table.capacity - max_probes;
-
-        let hash = self.hash(&key);
-        let h2 = meta::h2(hash);
-
-        let mut i = h1(hash) & (capacity - 1);
-        let limit = i + max_probes;
-
-        'probe: loop {
-            // went over the max probe count
-            if i > limit {
-                break;
-            }
-
-            let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
-
-            // encountered an empty meta in the probe sequence, the key
-            // cannot exist in the table
-            if meta == meta::EMPTY {
-                return None;
-            }
-
-            if meta & meta::H2 == h2 {
-                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
-
-                // the entry was deleted before we could check it, but it's
-                // possible that this was a false positive h2 match, so we
-                // have to keep going
-                if entry == Entry::TOMBSTONE {
-                    i += 1;
-                    continue 'probe;
-                }
-
-                // this is a true match
-                if unsafe { (*entry).key.borrow() == key } {
-                    // replace it with a tombstone
-                    let entry = unsafe {
-                        self.table
-                            .entry(i)
-                            .swap(Entry::TOMBSTONE, Ordering::Release)
-                    };
-
-                    // retire the old entry if we were the one to delete
-                    if entry != Entry::TOMBSTONE {
-                        unsafe { guard.retire(entry, reclaim::boxed::<Entry<K, V>>) }
-                    }
-
-                    unsafe { return Some(&(*entry).value) }
-                }
-            }
-
-            // this slot either contains another key or a tombstone, keep searching
-            i += 1;
-        }
-
-        // went over the max probe count: the key is not in the table
-        // because any inserts would have triggered a resize at this point
-        return None;
-    }
-
-    fn as_ref<'a>(&'a self, table: Table<K, V>) -> HashMapRef<'a, K, V, S> {
-        HashMapRef {
-            table,
-            root: self.root,
-            collector: self.collector,
-            build_hasher: self.build_hasher,
-        }
-    }
-
-    #[inline]
-    fn hash<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        let mut h = self.build_hasher.build_hasher();
-        key.hash(&mut h);
-        h.finish()
     }
 
     // Help along the resize operation until the old table is fully copied from.
@@ -705,6 +663,25 @@ where
 
         return false;
     }
+
+    fn as_ref<'a>(&'a self, table: Table<K, V>) -> HashMapRef<'a, K, V, S> {
+        HashMapRef {
+            table,
+            root: self.root,
+            collector: self.collector,
+            build_hasher: self.build_hasher,
+        }
+    }
+
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Hash + ?Sized,
+    {
+        let mut h = self.build_hasher.build_hasher();
+        key.hash(&mut h);
+        h.finish()
+    }
 }
 
 #[inline]
@@ -716,14 +693,11 @@ mod meta {
     use std::mem;
 
     // an empty slot
-    pub const EMPTY: u8 = 0b1111_1111;
-
-    // a deleted slot
-    pub const TOMBSTONE: u8 = 0b1000_0000;
+    pub const EMPTY: u8 = 0x80;
 
     // h2 mask, ignoring the first bit which is only
     // set for TOMBSTONE and EMPTY
-    pub const H2: u8 = !0x80;
+    pub const H2: u8 = !EMPTY;
 
     #[inline]
     pub fn h2(hash: u64) -> u8 {
