@@ -44,7 +44,7 @@ pub struct Pinned<'a, K, V, S> {
 
 impl<'a, K, V, S> Pinned<'a, K, V, S>
 where
-    K: Hash + Eq + Sync + Send,
+    K: Clone + Hash + Eq + Sync + Send,
     V: Sync + Send,
     S: BuildHasher,
 {

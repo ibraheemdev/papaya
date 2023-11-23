@@ -7,6 +7,7 @@ mod utils;
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::sync::atomic::{self, AtomicPtr, Ordering};
 use std::{hint, mem, ptr};
 
@@ -29,7 +30,7 @@ type Table<K, V> = self::alloc::Table<Entry<K, V>>;
 pub struct Entry<K, V> {
     pub link: Link,
     pub key: K,
-    pub value: V,
+    pub value: MaybeUninit<V>,
 }
 
 // Safety: seize::Link is the first field
@@ -43,10 +44,10 @@ impl Entry<(), ()> {
     const TOMBSTONE: usize = 0b10;
 
     // the entry has been successfully copied to the new table
-    const COPIED: usize = 0b11;
+    const COPIED: usize = Entry::COPYING | Entry::TOMBSTONE;
 
     // mask for entry pointer, ignoring tag bits
-    const POINTER: usize = !(Entry::TOMBSTONE | Entry::COPYING);
+    const POINTER: usize = !(Entry::COPYING | Entry::TOMBSTONE);
 }
 
 impl<K, V, S> HashMap<K, V, S> {
@@ -100,7 +101,7 @@ pub struct HashMapRef<'a, K, V, S> {
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
-    K: Hash + Eq + Sync + Send,
+    K: Clone + Hash + Eq + Sync + Send,
     V: Sync + Send,
     S: BuildHasher,
 {
@@ -148,7 +149,7 @@ where
                         return None;
                     }
 
-                    unsafe { return Some(&(*entry_ptr).value) }
+                    unsafe { return Some((*entry_ptr).value.assume_init_ref()) }
                 }
             }
 
@@ -156,7 +157,7 @@ where
             i += 1;
         }
 
-        // went over the max probe count: the key is not in the table.
+        // went over the max probe count: the key is not in this table.
         // any inserts would have triggered a resize at this point.
         // check if there is an active migration
         if let Some(next_table) = self.next_table_ref() {
@@ -170,7 +171,7 @@ where
     pub fn insert<'guard>(&self, key: K, value: V, guard: &'guard Guard<'_>) -> Option<&'guard V> {
         let entry = Box::into_raw(Box::new(Entry {
             key,
-            value,
+            value: MaybeUninit::new(value),
             link: self.collector.link(),
         }));
 
@@ -317,27 +318,37 @@ where
                     guard.retire(entry, reclaim::boxed::<Entry<K, V>>);
 
                     // return the previous value
-                    return Ok(&(*entry).value);
+                    return Ok((*entry).value.assume_init_ref());
                 },
 
                 // the entry is being copied to the new table, tell the caller to retry there
-                Err(found) if found.addr() & Entry::COPIED != 0 => unsafe {
+                Err(found) if found.addr() & Entry::COPIED != 0 => {
                     return Err(());
-                },
+                }
 
-                // lost to a concurrent update or delete.
-                // we can safely act as our update happened and was immediately overwritten
-                Err(found) => unsafe {
-                    let entry = found.map_addr(|addr| addr & Entry::POINTER);
-
-                    // return the previous value
-                    return Ok(&(*entry).value);
-                },
+                // lost to a concurrent update or delete, retry.
+                Err(found) => {
+                    entry = found;
+                    continue;
+                }
             }
         }
     }
 
     pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
+        self.remove_with(key, ptr::null_mut(), guard)
+    }
+
+    pub fn remove_with<'guard, Q: ?Sized>(
+        &self,
+        key: &Q,
+        mut deletion: *mut Entry<K, V>,
+        guard: &'guard Guard<'_>,
+    ) -> Option<&'guard V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -351,58 +362,103 @@ where
         let mut i = h1(hash) & (capacity - 1);
         let limit = i + max_probes;
 
-        'probe: loop {
-            // went over the max probe count
-            if i > limit {
-                break;
-            }
-
+        while i <= limit {
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
-            // encountered an empty meta in the probe sequence, the key
-            // cannot exist in the table
+            // encountered an empty meta in the probe sequence, the key cannot exist in the table
             if meta == meta::EMPTY {
                 return None;
             }
 
+            // possible match
             if meta & meta::H2 == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
-                // the entry was deleted before we could check it, but it's
-                // possible that this was a false positive h2 match, so we
-                // have to keep going
-                if entry == Entry::TOMBSTONE {
-                    i += 1;
-                    continue 'probe;
-                }
+                // the key matches, we might be able to perform an update
+                if unsafe { (*entry_ptr).key.borrow() == key } {
+                    let owned_key = unsafe { (*entry_ptr).key.clone() };
 
-                // this is a true match
-                if unsafe { (*entry).key.borrow() == key } {
-                    // replace it with a tombstone
-                    let entry = unsafe {
-                        self.table
-                            .entry(i)
-                            .swap(Entry::TOMBSTONE, Ordering::Release)
-                    };
-
-                    // retire the old entry if we were the one to delete
-                    if entry != Entry::TOMBSTONE {
-                        unsafe { guard.retire(entry, reclaim::boxed::<Entry<K, V>>) }
+                    // the entry is being copied to a new table, we have to go there and
+                    // delete it, or put down our deletion first
+                    if entry.addr() & Entry::COPYING != 0 {
+                        return self
+                            .next_table_ref()
+                            .unwrap()
+                            .remove_with(key, deletion, guard);
                     }
 
-                    unsafe { return Some(&(*entry).value) }
+                    // the entry is already deleted
+                    if entry.addr() & Entry::TOMBSTONE != 0 {
+                        return None;
+                    }
+
+                    if deletion.is_null() {
+                        deletion = Box::into_raw(Box::new(Entry {
+                            key: owned_key,
+                            value: MaybeUninit::uninit(),
+                            link: self.collector.link(),
+                        }));
+                    }
+
+                    loop {
+                        // perform the deletion
+                        match unsafe { self.table.entry(i) }.compare_exchange_weak(
+                            entry,
+                            deletion,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        ) {
+                            // succesfully deleted
+                            Ok(_) => unsafe {
+                                let entry = entry.map_addr(|addr| addr & Entry::POINTER);
+
+                                // retire the old entry
+                                guard.retire(entry, reclaim::boxed::<Entry<K, V>>);
+
+                                // return the previous value
+                                return Some((*entry).value.assume_init_ref());
+                            },
+
+                            // the entry is being copied to the new table, retry there
+                            Err(found) if found.addr() & Entry::COPIED != 0 => {
+                                return self
+                                    .next_table_ref()
+                                    .unwrap()
+                                    .remove_with(key, deletion, guard);
+                            }
+
+                            // someone else deleted first
+                            Err(found) if found.addr() & Entry::TOMBSTONE != 0 => {
+                                return None;
+                            }
+
+                            // lost to a concurrent update, retry.
+                            Err(found) => {
+                                entry = found;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
-            // this slot either contains another key or a tombstone, keep searching
+            // this entry either contains another key, keep searching
             i += 1;
         }
 
-        // went over the max probe count: the key is not in the table
-        // because any inserts would have triggered a resize at this point
-        return None;
+        // went over the max probe count: the key is not in this table.
+        // any inserts would have triggered a resize at this point.
+        // check if there is an active migration
+        if let Some(next_table) = self.next_table_ref() {
+            return next_table.remove(key, guard);
+        }
+
+        // the key is not in the table and there is no active migration
+        None
     }
 
+    // Returns a reference to the next table, if it has already been created.
     pub(crate) fn next_table_ref(&self) -> Option<HashMapRef<'_, K, V, S>> {
         let state = self.table.resize_state();
         let next = state.next.load(Ordering::Acquire);
@@ -414,6 +470,7 @@ where
         None
     }
 
+    // Returns the next table, allocating it has not already been created.
     pub(crate) fn next_table(&self) -> Table<K, V> {
         const SPIN_ALLOC: usize = 7;
 
@@ -457,26 +514,11 @@ where
             return unsafe { Table::from_raw(next) };
         }
 
-        // we have the lock, so we are the thread to create
-        // the table
+        // we have the lock, so we are the thread to create the table
         let cap = self.table.capacity;
-        // let len = table.count.load(Ordering::Relaxed);
 
-        // calculate the new table size
-        let next_cap = match cap >> 20 {
-            // // the table has capacity <1M and is >50% full
-            // 0 if (len * 4) >= (cap * 2) => {
-            //     // quadruple the capacity
-            //     cap << 2
-            // }
-            // // or the table has capacity >1M and is >75% full
-            // _ if (len * 4) >= (cap * 3) => {
-            //     // quadruple the capacity
-            //     cap << 2
-            // }
-            // otherwise double it
-            _ => cap << 1,
-        };
+        // calculate the new table size (TODO: store len?)
+        let next_cap = cap << 1;
 
         if next_cap > isize::MAX as usize {
             panic!("Hash table exceeded maximum capacity");
@@ -530,38 +572,6 @@ where
 
             let copied = state.copied.fetch_add(copy_chunk, Ordering::Relaxed);
 
-            // - the table we copy from MUST be all set to COPIED before we perform updates in the
-            //   new table to maintain consistency
-            //      - every helper thread parks until that happens
-            //
-            // - if the new table is too small, we create a new new table
-            //      - a nested table migration will always finish before it's parent, because `join_copy(); insert();` (1)
-            //          - copied++ indicates that a table was copied from the old table to
-            //            *somewhere*, not necessarily to our table. copied == capacity means the old
-            //            table is dead for writers, which is what we need to allow new writes
-            //            to the new table
-            //         - we can't abandon the original table migration, we still have to use CAS
-            //           copied to ensure we don't lose any entries. we don't know how many writers
-            //           there are for them to acknowledge, without a more complex blocking mechanism.
-            //      - we can't promote a table once it's parent is fully copied becase it might not have
-            //        all the entries in the map, it's grandparent copy might still be in-progress
-            //      - so we can only promote the root copy, even if it's full of COPIED, because
-            //        only then are we sure the old root is fully copied from
-            //      - so we wait till the root `copied == root.capacity`, and then we promote it,
-            //        or it's most nested .next table (which is visible from copied.load(acquire)).
-            //      - we know this most nested table is complete because (1), and we know it
-            //        contains all entries because our copy is complete, which means every copy
-            //        before the most nested one is full of COPIED, thus all the entries are in the
-            //        most nested one and we are in a stable state.
-            //        - any time we try to copy we have to check that said copy is not already
-            //          completed, we don't have to try to promote it because copies will always be
-            //          promoted by the last copier, or a parent copy. there is no race.
-            //
-            //  - we can't do the `loop { x.store(x.load); cas(x, COPIED) }` because a nested copy
-            //    might pick up our in complete entry. we can only write up-to-date values to the
-            //    new table.
-
-            // we ..
             if copied + copy_chunk == self.table.capacity {
                 state.futex.store(ResizeState::COMPLETE, Ordering::Release);
                 self.try_promote(next_table);
