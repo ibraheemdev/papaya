@@ -2,8 +2,6 @@ mod alloc;
 mod utils;
 // mod bit_lock;
 
-// TODO: check for copied everywhere
-
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
@@ -37,13 +35,15 @@ pub struct Entry<K, V> {
 unsafe impl<K, V> AsLink for Entry<K, V> {}
 
 impl Entry<(), ()> {
-    // the entry is being copied to a new table
+    // the entry is being copied to the new table, no updates
+    // are allowed on the old table
     const COPYING: usize = 0b01;
 
-    // the entry has been deleted from the table
+    // the entry does not currently contain a value, i.e. it was deleted
+    // or it's value was copied to the new table
     const TOMBSTONE: usize = 0b10;
 
-    // the entry has been successfully copied to the new table
+    // the (non-empty) entry has been copied to the new table
     const COPIED: usize = Entry::COPYING | Entry::TOMBSTONE;
 
     // mask for entry pointer, ignoring tag bits
@@ -132,7 +132,7 @@ where
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
 
                 // the entry has been copied to the new table, retry in there.
-                if entry.addr() & Entry::COPIED != 0 {
+                if entry.addr() & Entry::COPIED == Entry::COPIED {
                     return self.next_table_ref().unwrap().get(key, guard);
                 }
 
@@ -174,14 +174,17 @@ where
             link: self.collector.link(),
         }));
 
-        self.insert_entry(entry, guard)
+        match self.insert_entry(entry, guard) {
+            EntryStatus::Empty | EntryStatus::Tombstone => None,
+            EntryStatus::Value(value) => Some(value),
+        }
     }
 
-    pub fn insert_entry<'guard>(
+    fn insert_entry<'guard>(
         &self,
         new_entry: *mut Entry<K, V>,
         guard: &'guard Guard<'_>,
-    ) -> Option<&'guard V> {
+    ) -> EntryStatus<&'guard V> {
         let max_probes = log2!(self.table.capacity);
         let capacity = self.table.capacity - max_probes;
 
@@ -208,7 +211,7 @@ where
                     Ok(_) => {
                         // update the meta byte
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
-                        return None;
+                        return EntryStatus::Empty;
                     }
 
                     // lost the entry to someone else, keep searching, unless
@@ -218,26 +221,7 @@ where
 
                         // the key matches, we might be able to perform an update
                         if unsafe { (*found_ptr).key == *key } {
-                            // the entry is being copied to a new table, we have to go there
-                            // and join the race for the insertion
-                            if found.addr() & Entry::COPYING != 0 {
-                                return self
-                                    .next_table_ref()
-                                    .unwrap()
-                                    .insert_entry(new_entry, guard);
-                            }
-
-                            // perform the update
-                            match self.replace_entry(i, found, new_entry, guard) {
-                                Ok(value) => return Some(value),
-                                // lost to a concurrent copier, retry in the new table
-                                Err(_) => {
-                                    return self
-                                        .next_table_ref()
-                                        .unwrap()
-                                        .insert_entry(new_entry, guard)
-                                }
-                            }
+                            return self.replace_entry(i, found, new_entry, guard);
                         }
 
                         continue 'probe;
@@ -251,36 +235,13 @@ where
 
                 // the key matches, we might be able to perform an update
                 if unsafe { (*entry_ptr).key == *key } {
-                    // the entry is being copied to a new table, we have to go there
-                    // and join the race for the insertion
-                    if entry.addr() & Entry::COPYING != 0 {
-                        return self
-                            .next_table_ref()
-                            .unwrap()
-                            .insert_entry(new_entry, guard);
-                    }
-
-                    // perform the update
-                    match self.replace_entry(i, entry, new_entry, guard) {
-                        Ok(value) => return Some(value),
-                        // lost to a concurrent copier, retry in the new table
-                        Err(_) => {
-                            return self
-                                .next_table_ref()
-                                .unwrap()
-                                .insert_entry(new_entry, guard)
-                        }
-                    }
+                    return self.replace_entry(i, entry, new_entry, guard);
                 }
             }
 
             // this entry either contains another key, keep searching
             i += 1;
         }
-
-        // TODO: - copy slot and update count if inserting key that is being copied (have to maintain copy counts), or see new table
-        //          - or smarter, insert the new key before copying, if beat the copy, update count?
-        //       - help resize if see new table
 
         // went over the max probe count: trigger a resize.
         // the entry can be safely inserted directly into the new table
@@ -298,15 +259,22 @@ where
     }
 
     // Performs `CAS(entry, new_entry)` on `entries[i]`, returning the previous value if successful.
-    // Returns an error if the entry is copied.
+    //
+    // Inserts into the new table if the entry is being copied.
     fn replace_entry<'guard>(
         &self,
         i: usize,
         mut entry: *mut Entry<K, V>,
         new_entry: *mut Entry<K, V>,
         guard: &'guard Guard<'_>,
-    ) -> Result<&'guard V, ()> {
-        loop {
+    ) -> EntryStatus<&'guard V> {
+        let found = loop {
+            // the entry is being copied to a new table, we have to go there
+            // and join the race for the insertion
+            if entry.addr() & Entry::COPYING != 0 {
+                break entry;
+            }
+
             match unsafe { self.table.entry(i) }.compare_exchange_weak(
                 entry,
                 new_entry,
@@ -320,21 +288,57 @@ where
                     // retire the old entry
                     guard.retire(entry, reclaim::boxed::<Entry<K, V>>);
 
-                    // return the previous value
-                    return Ok((*entry).value.assume_init_ref());
+                    // return the previous value, if there was one
+                    if entry.addr() & Entry::TOMBSTONE == 0 {
+                        return EntryStatus::Value((*entry).value.assume_init_ref());
+                    }
+
+                    return EntryStatus::Tombstone;
                 },
 
-                // the entry is being copied to the new table, tell the caller to retry there
+                // the entry is being copied to the new table, retry there
                 Err(found) if found.addr() & Entry::COPYING != 0 => {
-                    return Err(());
+                    break found;
                 }
 
-                // lost to a concurrent update or delete, retry.
+                // lost to a concurrent update or delete, retry
                 Err(found) => {
                     entry = found;
                     continue;
                 }
             }
+        };
+
+        let next_table = self.next_table_ref().unwrap();
+
+        // insert into the new table
+        match next_table.insert_entry(new_entry, guard) {
+            // if we claimed the slot before the copy, we have to update the copy count
+            EntryStatus::Empty => {
+                self.try_promote(self.table, next_table.table, 1);
+
+                // mark the entry as copied so readers know to look in the new table
+                let copied = found.map_addr(|addr| addr | Entry::TOMBSTONE);
+
+                // mark the entry as copied, or someone else will
+                match unsafe { self.table.entry(i) }.compare_exchange(
+                    found,
+                    copied,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {}
+                    Err(entry) => assert!(entry.addr() & Entry::COPIED == Entry::COPIED),
+                }
+
+                let found_ptr = found.map_addr(|addr| addr & Entry::POINTER);
+
+                // our insertion didn't overwrite anything in the new
+                // table, but logically, we did overwrite the value we
+                // found in the old table
+                unsafe { EntryStatus::Value((*found_ptr).value.assume_init_ref()) }
+            }
+            status => status,
         }
     }
 
@@ -408,7 +412,7 @@ where
                         // perform the deletion
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
                             entry,
-                            deletion,
+                            deletion.map_addr(|addr| addr | Entry::TOMBSTONE),
                             Ordering::Release,
                             Ordering::Relaxed,
                         ) {
@@ -539,85 +543,77 @@ where
     }
 
     // Help along the resize operation until the old table is fully copied from.
+    //
+    // Note this should only be called on the root table.
     fn help_copy(&self, guard: &Guard<'_>) {
         let state = self.table.resize_state();
 
         let next_table = state.next.load(Ordering::Acquire);
 
-        // no-copy in progress
-        assert!(!next_table.is_null());
+        // no copy in progress
+        if next_table.is_null() {
+            return;
+        }
 
         let next_table = unsafe { Table::<K, V>::from_raw(next_table) };
 
-        // try to help, avoid parking
-        if state.copied.load(Ordering::Relaxed) == self.table.capacity {
-            self.try_promote(next_table);
+        // is the copy already complete?
+        if self.try_promote(self.table, next_table, 0) {
             return;
         }
 
         let copy_chunk = self.table.capacity.min(1024);
 
         loop {
+            // claim a range to copy
             let copy_start = state.claim.fetch_add(copy_chunk, Ordering::Relaxed);
 
-            if copy_start > self.table.capacity {
-                break;
+            let mut copied = 0;
+            for i in 0..copy_chunk {
+                // copies wrap around
+                let i = (copy_start + i) & (self.table.capacity - 1);
+
+                // keep track of the entries we actually copy
+                if self.copy_entry_to(i, next_table, guard) {
+                    copied += 1;
+                }
             }
 
-            let mut copy_chunk = copy_chunk;
-            if copy_start + copy_chunk >= self.table.capacity {
-                copy_chunk = self.table.capacity - copy_start;
-            }
-
-            for i in copy_start..(copy_start + copy_chunk) {
-                self.copy_entry_to(i, next_table, guard);
-            }
-
-            let copied = state.copied.fetch_add(copy_chunk, Ordering::Relaxed);
-
-            if copied + copy_chunk == self.table.capacity {
-                state.futex.store(ResizeState::COMPLETE, Ordering::Release);
-                self.try_promote(next_table);
-                atomic_wait::wake_all(&state.futex);
+            // are we done?
+            if self.try_promote(self.table, next_table, copied) {
                 return;
             }
         }
-
-        while state.futex.load(Ordering::Acquire) == ResizeState::PENDING {
-            atomic_wait::wait(&state.futex, ResizeState::PENDING);
-        }
-
-        return;
     }
 
-    fn try_promote(&self, next: Table<K, V>) {
-        // only publish this table if we copied from the root table.
-        // if we didn't, that means this is a nested copy operation,
-        // and the previous copy has not been published yet.
-        if self.root.load(Ordering::Acquire) == self.table.raw {
-            let mut new_root = next;
-            loop {
-                let mut next = next.resize_state().next.load(Ordering::Acquire);
+    // Update the copy state, and attempt to promote a copy to the root table.
+    //
+    // Returns true if the copy is complete, but not necessarily promoted.
+    fn try_promote(&self, current: Table<K, V>, mut next: Table<K, V>, mut copied: usize) -> bool {
+        let state = current.resize_state();
 
-                if next.is_null() {
-                    break;
-                }
+        // update the count
+        let copied = if copied > 0 {
+            state.copied.fetch_add(copied, Ordering::Relaxed) + copied
+        } else {
+            state.copied.load(Ordering::Relaxed)
+        };
 
-                let next = unsafe { Table::<K, V>::from_raw(next) };
-                if next.resize_state().copied.load(Ordering::Acquire) != next.capacity {
-                    break;
-                }
+        // are we done?
+        if copied == self.table.capacity {
+            let root = self.root.load(Ordering::Acquire);
 
-                new_root = next;
+            // we only promote the top-level copy
+            if root == current.raw {
+                self.root
+                    .compare_exchange(root, next.raw, Ordering::Release, Ordering::Relaxed)
+                    .ok();
             }
 
-            self.root.compare_exchange(
-                self.table.raw,
-                new_root.raw,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
+            return true;
         }
+
+        return false;
     }
 
     // Copy the entry at the given index to the new table.
@@ -627,7 +623,7 @@ where
         let mut entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
 
         // the entry has already been copied
-        if entry.addr() & Entry::COPIED != 0 {
+        if entry.addr() & Entry::COPIED == Entry::COPIED {
             return false;
         }
 
@@ -765,6 +761,12 @@ where
     }
 }
 
+enum EntryStatus<V> {
+    Empty,
+    Tombstone,
+    Value(V),
+}
+
 #[inline]
 fn h1(hash: u64) -> usize {
     hash as usize
@@ -773,11 +775,10 @@ fn h1(hash: u64) -> usize {
 mod meta {
     use std::mem;
 
-    // an empty slot
+    // an empty meta slot
     pub const EMPTY: u8 = 0x80;
 
-    // h2 mask, ignoring the first bit which is only
-    // set for TOMBSTONE and EMPTY
+    // h2 mask, ignoring the first bit which is only set for NULL
     pub const H2: u8 = !EMPTY;
 
     #[inline]
