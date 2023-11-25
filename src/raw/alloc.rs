@@ -27,7 +27,6 @@ pub struct ResizeState {
     pub allocating: Mutex<()>,
     pub copied: AtomicUsize,
     pub claim: AtomicUsize,
-    pub futex: AtomicU32,
 }
 
 impl ResizeState {
@@ -65,18 +64,20 @@ impl<T> Table<T> {
                 alloc::handle_alloc_error(layout);
             }
 
-            ptr.cast::<MaybeUninit<seize::Link>>()
-                .write(MaybeUninit::new(link));
+            ptr.cast::<seize::Link>().write(link);
 
             ptr.add(mem::size_of::<seize::Link>())
                 .cast::<usize>()
                 .write(capacity);
 
-            std::ptr::write_bytes(
-                ptr.add(Self::META_OFFSET).cast::<u8>(),
-                super::meta::EMPTY,
-                capacity,
-            );
+            ptr.add(Self::META_OFFSET)
+                .cast::<u8>()
+                .write_bytes(super::meta::EMPTY, capacity);
+
+            let entry_offset = Self::META_OFFSET + (mem::size_of::<u8>() * capacity);
+            ptr.add(entry_offset)
+                .cast::<usize>()
+                .write_bytes(0, capacity);
 
             Table {
                 capacity,
@@ -110,6 +111,7 @@ impl<T> Table<T> {
 
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
         let offset = Self::META_OFFSET + (mem::size_of::<u8>() * self.capacity);
+
         &*self
             .raw
             .add(offset)
