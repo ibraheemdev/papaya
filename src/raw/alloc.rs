@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
-use std::{alloc, slice};
+use std::{alloc, ptr, slice};
 
 use crate::seize;
 
@@ -11,17 +11,20 @@ use crate::seize;
 #[repr(transparent)]
 pub struct RawTable(u8);
 
-// Safety: seize::Link is the first field
+// Safety: seize::Link is the first field (see TableLayout)
 unsafe impl seize::AsLink for RawTable {}
 
 // The table allocation's layout
 struct TableLayout {
     link: seize::Link,
+    len: usize,
     capacity: usize,
+    resize_state: ResizeState,
     meta: [AtomicU8; 0],
     entries: [AtomicPtr<()>; 0],
 }
 
+#[derive(Default)]
 pub struct ResizeState {
     pub next: AtomicPtr<RawTable>,
     pub allocating: Mutex<()>,
@@ -29,16 +32,15 @@ pub struct ResizeState {
     pub claim: AtomicUsize,
 }
 
-impl ResizeState {
-    pub const PENDING: u32 = 0;
-    pub const COMPLETE: u32 = 1;
-}
-
-// Manages a RawTable
+// Manages a table allocation.
 #[repr(C)]
 pub struct Table<T> {
-    pub capacity: usize,
+    // the exposed length of the table
+    pub len: usize,
+    // the raw table pointer
     pub raw: *mut RawTable,
+    // the true (padded) table capacity
+    capacity: usize,
     _t: PhantomData<T>,
 }
 
@@ -48,6 +50,7 @@ impl<T> Clone for Table<T> {
     fn clone(&self) -> Self {
         Table {
             capacity: self.capacity,
+            len: self.len,
             raw: self.raw,
             _t: PhantomData,
         }
@@ -55,31 +58,41 @@ impl<T> Clone for Table<T> {
 }
 
 impl<T> Table<T> {
-    pub fn new(capacity: usize, link: seize::Link) -> Table<T> {
+    pub fn new(len: usize, mut capacity: usize, link: seize::Link) -> Table<T> {
+        assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
+
+        // pad the meta table to fulfill the alignment requirement of an entry
+        capacity = (capacity + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
+
         unsafe {
             let layout = Self::layout(capacity);
-            let ptr = alloc::alloc_zeroed(layout);
+            let ptr = alloc::alloc(layout);
 
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
             }
 
-            ptr.cast::<seize::Link>().write(link);
+            // write the table layout state
+            ptr.cast::<TableLayout>().write(TableLayout {
+                link,
+                len,
+                capacity,
+                resize_state: ResizeState::default(),
+                meta: [],
+                entries: [],
+            });
 
-            ptr.add(mem::size_of::<seize::Link>())
-                .cast::<usize>()
-                .write(capacity);
-
-            ptr.add(Self::META_OFFSET)
+            // initialize the meta table
+            ptr.add(mem::size_of::<TableLayout>())
                 .cast::<u8>()
                 .write_bytes(super::meta::EMPTY, capacity);
 
-            let entry_offset = Self::META_OFFSET + (mem::size_of::<u8>() * capacity);
-            ptr.add(entry_offset)
-                .cast::<usize>()
-                .write_bytes(0, capacity);
+            // zero the entries table
+            let offset = mem::size_of::<TableLayout>() + mem::size_of::<u8>() * capacity;
+            ptr.add(offset).cast::<usize>().write_bytes(0, capacity);
 
             Table {
+                len,
                 capacity,
                 raw: ptr.cast::<RawTable>(),
                 _t: PhantomData,
@@ -88,15 +101,12 @@ impl<T> Table<T> {
     }
 
     pub unsafe fn from_raw(raw: *mut RawTable) -> Table<T> {
-        let capacity = unsafe {
-            raw.add(mem::size_of::<seize::Link>())
-                .cast::<usize>()
-                .read()
-        };
+        let layout = unsafe { &*raw.cast::<TableLayout>() };
 
         Table {
             raw,
-            capacity,
+            len: layout.len,
+            capacity: layout.capacity,
             _t: PhantomData,
         }
     }
@@ -104,27 +114,21 @@ impl<T> Table<T> {
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         &*self
             .raw
-            .add(Self::META_OFFSET)
+            .add(mem::size_of::<TableLayout>())
             .add(i * mem::size_of::<u8>())
             .cast::<AtomicU8>()
     }
 
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
-        let offset = Self::META_OFFSET + (mem::size_of::<u8>() * self.capacity);
+        let offset = mem::size_of::<TableLayout>()
+            + mem::size_of::<u8>() * self.capacity
+            + i * mem::size_of::<AtomicPtr<T>>();
 
-        &*self
-            .raw
-            .add(offset)
-            .add(i * mem::size_of::<AtomicPtr<T>>())
-            .cast::<AtomicPtr<T>>()
+        &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
     pub fn resize_state(&self) -> &ResizeState {
-        let offset = Self::META_OFFSET
-            + (mem::size_of::<u8>() * self.capacity)
-            + (mem::size_of::<AtomicPtr<T>>() * self.capacity);
-
-        unsafe { &*self.raw.add(offset).cast::<ResizeState>() }
+        unsafe { &(*self.raw.cast::<TableLayout>()).resize_state }
     }
 
     pub unsafe fn dealloc(table: *mut Table<T>) {
@@ -132,14 +136,11 @@ impl<T> Table<T> {
         unsafe { alloc::dealloc((*table).raw.cast::<u8>(), layout) }
     }
 
-    const META_OFFSET: usize = mem::size_of::<seize::Link>() + mem::size_of::<usize>();
-
     fn layout(capacity: usize) -> Layout {
         let size = mem::size_of::<TableLayout>()
             + (mem::size_of::<u8>() * capacity) // meta
             + (mem::size_of::<usize>() * capacity); // entries
-        let align = mem::align_of::<TableLayout>();
-        Layout::from_size_align(size, align).unwrap()
+        Layout::from_size_align(size, mem::align_of::<TableLayout>()).unwrap()
     }
 }
 
@@ -148,10 +149,9 @@ fn layout() {
     unsafe {
         let collector = seize::Collector::new();
         let link = collector.link();
-        let table: Table<u8> = Table::new(32, link);
+        let table: Table<u8> = Table::new(30, 31, link);
         let table: Table<u8> = Table::from_raw(table.raw);
+        assert_eq!(table.len, 30);
         assert_eq!(table.capacity, 32);
-        dbg!(table.entry(0));
-        dbg!(table.meta(0));
     }
 }
