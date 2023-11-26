@@ -54,11 +54,11 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> HashMap<K, V, S> {
         // allocate extra buffer capacity the same length as the probe limit.
         // this allows us to avoid overflow checks
-        let max_probes = log2!(capacity);
-        let capacity = capacity.next_power_of_two() + max_probes;
+        let capacity = capacity.next_power_of_two();
+        let buffer = log2!(capacity);
 
         let collector = Collector::new().epoch_frequency(None);
-        let table = alloc::Table::<Entry<K, V>>::new(capacity, collector.link());
+        let table = alloc::Table::<Entry<K, V>>::new(capacity, capacity + buffer, collector.link());
 
         HashMap {
             collector,
@@ -110,13 +110,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let max_probes = log2!(self.table.capacity);
-        let capacity = self.table.capacity - max_probes;
+        let max_probes = log2!(self.table.len);
 
         let hash = self.hash(&key);
         let h2 = meta::h2(hash);
 
-        let mut i = h1(hash) & (capacity - 1);
+        let mut i = h1(hash) & (self.table.len - 1);
         let limit = i + max_probes;
 
         while i <= limit {
@@ -185,15 +184,14 @@ where
         new_entry: *mut Entry<K, V>,
         guard: &'guard Guard<'_>,
     ) -> EntryStatus<&'guard V> {
-        let max_probes = log2!(self.table.capacity);
-        let capacity = self.table.capacity - max_probes;
+        let max_probes = log2!(self.table.len);
 
         let key = unsafe { &(*new_entry).key };
 
         let hash = self.hash(&key);
         let h2 = meta::h2(hash);
 
-        let mut i = h1(hash) & (capacity - 1);
+        let mut i = h1(hash) & (self.table.len - 1);
         let limit = i + max_probes;
 
         'probe: while i <= limit {
@@ -360,13 +358,12 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        let max_probes = log2!(self.table.capacity);
-        let capacity = self.table.capacity - max_probes;
+        let max_probes = log2!(self.table.len);
 
         let hash = self.hash(&key);
         let h2 = meta::h2(hash);
 
-        let mut i = h1(hash) & (capacity - 1);
+        let mut i = h1(hash) & (self.table.len - 1);
         let limit = i + max_probes;
 
         while i <= limit {
@@ -522,18 +519,17 @@ where
         }
 
         // we have the lock, so we are the thread to create the table
-        let cap = self.table.capacity;
-
         // calculate the new table size (TODO: store len?)
-        let next_cap = cap << 1;
+        let next_capacity = self.table.len << 1;
+        let buffer = log2!(next_capacity);
 
-        if next_cap > isize::MAX as usize {
+        if next_capacity > isize::MAX as usize {
             panic!("Hash table exceeded maximum capacity");
         }
 
         // allocate the new table
         let link = self.collector.link();
-        let next = Table::new(next_cap, link);
+        let next = Table::new(next_capacity, next_capacity + buffer, link);
 
         // store it, and release the lock
         state.next.store(next.raw, Ordering::Release);
@@ -562,7 +558,9 @@ where
             return;
         }
 
-        let copy_chunk = self.table.capacity.min(1024);
+        // the true table capacity, we have to copy every entry including from the buffer
+        let capacity = self.table.len + log2!(self.table.len);
+        let copy_chunk = capacity.min(1024);
 
         loop {
             // claim a range to copy
@@ -570,8 +568,9 @@ where
 
             let mut copied = 0;
             for i in 0..copy_chunk {
-                // copies wrap around
-                let i = (copy_start + i) & (self.table.capacity - 1);
+                // copies wrap around. note the capacity including the buffer is not a
+                // power of two
+                let i = (copy_start + i) % capacity;
 
                 // keep track of the entries we actually copy
                 if self.copy_entry_to(i, next_table, guard) {
@@ -600,7 +599,7 @@ where
         };
 
         // are we done?
-        if copied == self.table.capacity {
+        if copied == self.table.len + log2!(self.table.len) {
             let root = self.root.load(Ordering::Acquire);
 
             // we only promote the top-level copy
@@ -683,15 +682,14 @@ where
     //
     // Any matching key found in the table is considered to overwrite the copy.
     pub fn insert_copy<'guard>(&self, copy: *mut Entry<K, V>, guard: &'guard Guard<'_>) {
-        let max_probes = log2!(self.table.capacity);
-        let capacity = self.table.capacity - max_probes;
+        let max_probes = log2!(self.table.len);
 
         let key = unsafe { &(*copy).key };
 
         let hash = self.hash(&key);
         let h2 = meta::h2(hash);
 
-        let mut i = h1(hash) & (capacity - 1);
+        let mut i = h1(hash) & (self.table.len - 1);
         let limit = i + max_probes;
 
         'probe: while i <= limit {
