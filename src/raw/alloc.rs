@@ -14,13 +14,16 @@ pub struct RawTable(u8);
 // Safety: seize::Link is the first field (see TableLayout)
 unsafe impl seize::AsLink for RawTable {}
 
+#[repr(align(16))]
+struct AtomicU128(u128);
+
 // The table allocation's layout
 struct TableLayout {
     link: seize::Link,
     len: usize,
     capacity: usize,
     resize_state: ResizeState,
-    meta: [AtomicU8; 0],
+    meta: [AtomicU128; 0],
     entries: [AtomicPtr<()>; 0],
 }
 
@@ -61,6 +64,8 @@ impl<T> Table<T> {
     pub fn new(len: usize, mut capacity: usize, link: seize::Link) -> Table<T> {
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
+        // pad the meta table to allow one meta group of overflow
+        capacity += ((capacity - len) + 15) & !15;
         // pad the meta table to fulfill the alignment requirement of an entry
         capacity = (capacity + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
 
@@ -111,6 +116,13 @@ impl<T> Table<T> {
         }
     }
 
+    pub unsafe fn meta_ptr(&self, i: usize) -> *mut u8 {
+        self.raw
+            .add(mem::size_of::<TableLayout>())
+            .add(i * mem::size_of::<u8>())
+            .cast::<u8>()
+    }
+
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         &*self
             .raw
@@ -124,6 +136,7 @@ impl<T> Table<T> {
             + mem::size_of::<u8>() * self.capacity
             + i * mem::size_of::<AtomicPtr<T>>();
 
+        assert!(i < self.capacity);
         &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
@@ -131,9 +144,9 @@ impl<T> Table<T> {
         unsafe { &(*self.raw.cast::<TableLayout>()).resize_state }
     }
 
-    pub unsafe fn dealloc(table: *mut Table<T>) {
-        let layout = Self::layout((*table).capacity);
-        unsafe { alloc::dealloc((*table).raw.cast::<u8>(), layout) }
+    pub unsafe fn dealloc(table: Table<T>) {
+        let layout = Self::layout(table.capacity);
+        unsafe { alloc::dealloc(table.raw.cast::<u8>(), layout) }
     }
 
     fn layout(capacity: usize) -> Layout {
@@ -150,8 +163,9 @@ fn layout() {
         let collector = seize::Collector::new();
         let link = collector.link();
         let table: Table<u8> = Table::new(30, 31, link);
-        let table: Table<u8> = Table::from_raw(table.raw);
+        let mut table: Table<u8> = Table::from_raw(table.raw);
         assert_eq!(table.len, 30);
-        assert_eq!(table.capacity, 32);
+        assert_eq!(table.capacity, 48);
+        Table::dealloc(table);
     }
 }
