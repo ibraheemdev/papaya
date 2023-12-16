@@ -12,7 +12,7 @@ use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{self, AtomicPtr, Ordering};
+use std::sync::atomic::{self, AtomicPtr, AtomicU64, Ordering};
 use std::{hint, mem, ptr};
 
 use self::alloc::{RawTable, ResizeState};
@@ -169,6 +169,128 @@ where
 
             // the slot contained a different key, keep searching
             i += 16;
+        }
+
+        // the key is not in the table and there is no active migration
+        None
+    }
+
+    pub fn get_8<'guard, Q>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let max_probes = log2!(self.table.len);
+
+        let hash = self.hash(&key);
+        let h2 = meta::h2(hash);
+
+        let mut i = h1(hash) & (self.table.len - 1);
+        let before = i & 7;
+        i &= !7;
+
+        let start = i;
+        let limit = i + max_probes + before;
+
+        // TODO: endianness
+        let before_mask: u64 = ((!0) >> (before * 8) << (before * 8));
+
+        while i <= limit {
+            let mut metas = unsafe { (*self.table.meta_ptr(i).cast::<u64>()) };
+            let mut metas = metas.to_be_bytes();
+            // println!("{:0meta);
+            // println!("{:08b}", h2);
+
+            // make sure not to search the bytes outside the probe chain
+            if i == start {
+                metas = (u64::from_le_bytes(metas) & before_mask).to_le_bytes();
+            }
+
+            // let metas = meta.to_le_bytes();
+
+            // for bit in x86_64::match_byte_8(meta, h2) {
+            for (bit, &meta) in metas.iter().enumerate() {
+                if meta == h2 {
+                    let i = i + bit;
+                    let mut entry =
+                        unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+
+                    let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
+
+                    // this is a true match
+                    if !entry_ptr.is_null() && unsafe { (*entry_ptr).key.borrow() == key } {
+                        // the entry existed in the table but was deleted
+                        if entry.addr() & Entry::TOMBSTONE != 0 {
+                            return None;
+                        }
+
+                        // we don't care if the entry is currently being copied, because any
+                        // concurrent inserts of the same key would have marked the entry as COPIED
+                        // after they complete. thus this is still the latest value.
+                        unsafe { return Some((*entry_ptr).value.assume_init_ref()) }
+                    }
+                }
+                if meta == meta::EMPTY {
+                    return None;
+                }
+            }
+
+            // if x86_64::match_empty_8(meta).any_set() {
+            //     return None;
+            // }
+
+            // the slot contained a different key, keep searching
+            i += 8;
+        }
+
+        // the key is not in the table and there is no active migration
+        None
+    }
+
+    pub fn get_nosimd<'guard, Q>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let max_probes = log2!(self.table.len);
+
+        let hash = self.hash(&key);
+        let h2 = meta::h2(hash);
+
+        let mut i = h1(hash) & (self.table.len - 1);
+        let start = i;
+        let limit = i + max_probes;
+
+        while i <= limit {
+            let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
+
+            // encountered an empty entry in the probe sequence, the key cannot exist in the table
+            if meta == meta::EMPTY {
+                return None;
+            }
+
+            // metadata match
+            if meta == h2 {
+                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+
+                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
+
+                // this is a true match
+                if unsafe { (*entry_ptr).key.borrow() == key } {
+                    // the entry existed in the table but was deleted
+                    if entry.addr() & Entry::TOMBSTONE != 0 {
+                        return None;
+                    }
+
+                    // we don't care if the entry is currently being copied, because any
+                    // concurrent inserts of the same key would have marked the entry as COPIED
+                    // after they complete. thus this is still the latest value.
+                    unsafe { return Some((*entry_ptr).value.assume_init_ref()) }
+                }
+            }
+
+            // the slot contained a different key, keep searching
+            i += 1;
         }
 
         // the key is not in the table and there is no active migration
@@ -893,7 +1015,18 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
             if entry.addr() == Entry::TOMBCOPIED {
                 continue;
             }
+
+            if entry.is_null() {
+                continue;
+            }
+
+            // let entry = unsafe { Box::from_raw(entry.map_addr(|addr| addr & Entry::POINTER)) };
+
+            // // drop the value
+            // let _ = unsafe { entry.value.assume_init() };
         }
+
+        unsafe { Table::dealloc(table) };
     }
 }
 

@@ -5,20 +5,6 @@ macro_rules! log2 {
     };
 }
 
-// fast division on powers of two
-macro_rules! div2 {
-    ($a:expr, $b:expr) => {
-        $a >> log2!($b)
-    };
-}
-
-// fast modulo on a power of two
-macro_rules! mod2 {
-    ($a:expr, $b:expr) => {
-        $a & ($b - 1)
-    };
-}
-
 // Polyfill for the unstable strict-provenance APIs.
 pub unsafe trait StrictProvenance: Sized {
     fn addr(self) -> usize;
@@ -55,4 +41,4 @@ unsafe impl<T> StrictProvenance for *mut T {
     }
 }
 
-pub(crate) use {div2, log2, mod2};
+pub(crate) use log2;
