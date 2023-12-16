@@ -10,6 +10,12 @@ pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
 }
 
+impl<K, V> Default for HashMap<K, V> {
+    fn default() -> Self {
+        HashMap::new()
+    }
+}
+
 impl<K, V> HashMap<K, V> {
     pub fn new() -> HashMap<K, V> {
         HashMap::with_capacity(32)
@@ -54,6 +60,24 @@ where
         Q: Hash + Eq + ?Sized,
     {
         self.raw.with_ref(|m| m.get(key, &self.guard), &self.guard)
+    }
+
+    pub fn get_8<Q>(&'a self, key: &Q) -> Option<&'a V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.raw
+            .with_ref(|m| m.get_8(key, &self.guard), &self.guard)
+    }
+
+    pub fn get_nosimd<Q>(&'a self, key: &Q) -> Option<&'a V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.raw
+            .with_ref(|m| m.get_nosimd(key, &self.guard), &self.guard)
     }
 
     pub fn insert(&'a self, key: K, value: V) -> Option<&'a V> {

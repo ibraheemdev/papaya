@@ -9,17 +9,14 @@ pub use map::HashMap;
 #[test]
 fn bench() {
     let map = HashMap::new();
-    for i in 0..1228 {
+    for i in 0..1000 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
 
     let y = map.pin();
-    let x = std::time::Instant::now();
-    for i in 0..1228 {
-        assert_eq!(y.get(&i), Some(&(i + 1)));
+    for i in 0..1000 {
+        assert_eq!(y.get_nosimd(&i), Some(&(i + 1)));
     }
-
-    println!("{}", x.elapsed().as_nanos());
 }
 
 #[test]
