@@ -1,10 +1,9 @@
 use crate::raw;
+use crate::seize::Guard;
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
-
-use crate::seize::Guard;
 
 pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
@@ -62,24 +61,6 @@ where
         self.raw.with_ref(|m| m.get(key, &self.guard), &self.guard)
     }
 
-    pub fn get_8<Q>(&'a self, key: &Q) -> Option<&'a V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.raw
-            .with_ref(|m| m.get_8(key, &self.guard), &self.guard)
-    }
-
-    pub fn get_nosimd<Q>(&'a self, key: &Q) -> Option<&'a V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.raw
-            .with_ref(|m| m.get_nosimd(key, &self.guard), &self.guard)
-    }
-
     pub fn insert(&'a self, key: K, value: V) -> Option<&'a V> {
         self.raw
             .with_ref(|m| m.insert(key, value, &self.guard), &self.guard)
@@ -95,7 +76,6 @@ where
     }
 }
 
-// try_insert
 #[derive(Debug, PartialEq, Eq)]
 pub struct OccupiedError<'a, V> {
     pub current: &'a V,

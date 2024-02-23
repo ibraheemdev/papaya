@@ -524,11 +524,12 @@ pub struct Node {
     reclaim: unsafe fn(*mut Link),
     // unions for different phases of a node's lifetime
     batch: BatchNode,
-    reservation: ReservationNode,
+    pub reservation: ReservationNode,
 }
 
 #[repr(C)]
-union ReservationNode {
+pub union ReservationNode {
+    pub data: ManuallyDrop<AtomicUsize>,
     // SLOT (after retiring): next node in the reservation list
     next: ManuallyDrop<AtomicPtr<Node>>,
     // SLOT (while retiring): temporary location for an active reservation list

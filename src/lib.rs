@@ -15,7 +15,7 @@ fn bench() {
 
     let y = map.pin();
     for i in 0..1000 {
-        assert_eq!(y.get_nosimd(&i), Some(&(i + 1)));
+        assert_eq!(y.get(&i), Some(&(i + 1)));
     }
 }
 
@@ -67,14 +67,14 @@ fn basic() {
 }
 
 #[test]
-fn foo() {
+fn stress() {
     let map = HashMap::new();
 
     std::thread::scope(|s| {
-        for x in 0..16 {
+        for t in 0..16 {
             let map = &map;
             s.spawn(move || {
-                let (start, end) = (8192 * x, 8192 * (x + 1));
+                let (start, end) = ((1 << 14) * t, (1 << 14) * (t + 1));
 
                 for i in start..end {
                     assert_eq!(map.pin().insert(i, i + 1), None);
