@@ -89,15 +89,15 @@ impl Collector {
     /// # Examples
     ///
     /// ```rust
-    /// # use seize::AtomicPtr;
-    /// # use std::sync::atomic::Ordering;
-    /// # let collector = seize::Collector::new();
-    /// let ptr = AtomicPtr::new(collector.link_boxed(1_usize));
+    /// // # use seize::AtomicPtr;
+    /// // # use std::sync::atomic::Ordering;
+    /// // # let collector = seize::Collector::new();
+    /// // let ptr = AtomicPtr::new(collector.link_boxed(1_usize));
     ///
-    /// let guard = collector.enter();
-    /// let value = guard.protect(&ptr, Ordering::Acquire);
-    /// unsafe { assert_eq!(**value, 1) }
-    /// # unsafe { guard.retire(value, seize::reclaim::boxed::<usize>) };
+    /// // let guard = collector.enter();
+    /// // let value = guard.protect(&ptr, Ordering::Acquire);
+    /// // unsafe { assert_eq!(**value, 1) }
+    /// // # unsafe { guard.retire(value, seize::reclaim::boxed::<usize>) };
     /// ```
     ///
     /// Note that `enter` is reentrant, and it is legal to create
@@ -105,22 +105,22 @@ impl Collector {
     /// marked as active until the last guard is dropped:
     ///
     /// ```rust
-    /// # use seize::AtomicPtr;
-    /// # use std::sync::atomic::Ordering;
-    /// # let collector = seize::Collector::new();
-    /// let ptr = AtomicPtr::new(collector.link_boxed(1_usize));
+    /// // # use seize::AtomicPtr;
+    /// // # use std::sync::atomic::Ordering;
+    /// // # let collector = seize::Collector::new();
+    /// // let ptr = AtomicPtr::new(collector.link_boxed(1_usize));
     ///
-    /// let guard1 = collector.enter();
-    /// let guard2 = collector.enter();
+    /// // let guard1 = collector.enter();
+    /// // let guard2 = collector.enter();
     ///
-    /// let value = guard2.protect(&ptr, Ordering::Acquire);
-    /// drop(guard1);
-    /// // the first guard is dropped, but `value`
-    /// // is still safe to access as a guard still
-    /// // exists
-    /// unsafe { assert_eq!(**value, 1) }
-    /// # unsafe { guard2.retire(value, seize::reclaim::boxed::<usize>) };
-    /// drop(guard2) // _now_, the thread is marked as inactive
+    /// // let value = guard2.protect(&ptr, Ordering::Acquire);
+    /// // drop(guard1);
+    /// // // the first guard is dropped, but `value`
+    /// // // is still safe to access as a guard still
+    /// // // exists
+    /// // unsafe { assert_eq!(**value, 1) }
+    /// // # unsafe { guard2.retire(value, seize::reclaim::boxed::<usize>) };
+    /// // drop(guard2) // _now_, the thread is marked as inactive
     /// ```
     pub fn enter(&self) -> Guard<'_> {
         self.raw.enter();

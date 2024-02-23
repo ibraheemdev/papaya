@@ -116,13 +116,6 @@ impl<T> Table<T> {
         }
     }
 
-    pub unsafe fn meta_ptr(&self, i: usize) -> *mut u8 {
-        self.raw
-            .add(mem::size_of::<TableLayout>())
-            .add(i * mem::size_of::<u8>())
-            .cast::<u8>()
-    }
-
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         &*self
             .raw
