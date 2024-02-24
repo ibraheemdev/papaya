@@ -11,8 +11,8 @@ parking_lot_core = "0.9.7"
 tracing = { version = "0.1.35", optional = true }
 
 [dev-dependencies]
-criterion = "0.5.1"
-dashmap = "5.5.3"
+# criterion = "0.5.1"
+# dashmap = "5.5.3"
 
 [[bench]]
 name = "bench"

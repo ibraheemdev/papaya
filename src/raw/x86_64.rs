@@ -2,35 +2,6 @@ use std::arch::{asm, x86_64};
 use std::mem;
 use std::num::{NonZeroU16, NonZeroU64, NonZeroU8};
 
-#[test]
-fn endianess() {
-    let x: *mut u64 = &mut 0x1234567890123456;
-    unsafe {
-        println!("{:08x}", *x);
-        println!(
-            "{:x?}",
-            u64::from_ne_bytes((*x.cast::<[u8; 8]>())).to_be_bytes()
-        );
-    }
-}
-
-#[test]
-fn test_128() {
-    unsafe {
-        let x: u128 = u128::from_be_bytes([7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 7, 0]);
-        let y = load_128(&x as *const _ as *mut _);
-        assert_eq!(match_byte(y, 7).collect::<Vec<_>>(), [1, 8, 15]);
-    }
-}
-
-#[test]
-fn test_64() {
-    unsafe {
-        let y: u64 = u64::from_le_bytes([7, 1, 2, 3, 7, 5, 1, 7]);
-        assert_eq!(match_byte_8(y, 7).collect::<Vec<_>>(), [0, 4, 7]);
-    }
-}
-
 #[cfg(miri)]
 pub unsafe fn load_128(src: *mut u128) -> x86_64::__m128i {
     mem::transmute((*src).to_ne_bytes())

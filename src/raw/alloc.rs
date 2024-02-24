@@ -43,7 +43,7 @@ pub struct Table<T> {
     // the raw table pointer
     pub raw: *mut RawTable,
     // the true (padded) table capacity
-    pub capacity: usize,
+    capacity: usize,
     _t: PhantomData<T>,
 }
 
