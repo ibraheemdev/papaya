@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
 // fast log2 on a power of two
 macro_rules! log2 {
     ($x:expr) => {
@@ -38,6 +40,29 @@ unsafe impl<T> StrictProvenance for *mut T {
 
     fn unmask(self, mask: usize) -> usize {
         self.addr() & !mask
+    }
+}
+
+pub trait AtomicPtrFetchOps<T> {
+    fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T;
+}
+
+impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
+    fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T {
+        #[cfg(not(miri))]
+        {
+            // mark the entry as copied
+            unsafe { &*(self as *const AtomicPtr<T> as *const AtomicUsize) }
+                .fetch_or(value, Ordering::Release) as *mut T
+        }
+
+        #[cfg(miri)]
+        {
+            self.fetch_update(Ordering::Release, Ordering::Relaxed, |ptr| {
+                Some(ptr.map_addr(|addr| addr | value))
+            })
+            .unwrap()
+        }
     }
 }
 
