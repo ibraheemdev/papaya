@@ -9,7 +9,7 @@ use std::sync::atomic::{self, fence, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 use std::{hint, mem, ptr};
 
 use self::alloc::{RawTable, ResizeState};
-use self::utils::{log2, StrictProvenance};
+use self::utils::{log2, AtomicPtrFetchOps, StrictProvenance};
 use crate::seize::{self, reclaim, AsLink, Collector, Guard, Link, Linked};
 
 // A lock-free hash-map.
@@ -58,6 +58,7 @@ impl Entry<(), ()> {
     // Retires the entry if it's reference count is 0.
     unsafe fn try_retire_value<K, V>(entry: *mut Entry<K, V>, guard: &Guard<'_>) -> bool {
         // ensure this is the last active copy
+        assert!(entry.addr() & Entry::POINTER == entry.addr());
         let count = (*entry).copies();
         if count.fetch_sub(1, Ordering::Release) != 0 {
             return false;
@@ -166,7 +167,9 @@ where
         while i <= probe_limit {
             let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
-            // found an empty entry in the probe sequence, the entry is not in this table
+            // found an empty entry in the probe sequence, the entry is not this table, or
+            // any other table because writers only write to the new table if an entry is copied
+            // or the table is promoted
             if meta == meta::EMPTY {
                 break;
             }
@@ -360,8 +363,11 @@ where
                 }
 
                 // mark the entry as copied
-                unsafe { &*(self.table.entry(i) as *const _ as *const AtomicUsize) }
-                    .fetch_or(Entry::COPIED, Ordering::Release);
+                unsafe {
+                    self.table
+                        .entry(i)
+                        .fetch_or(Entry::COPIED, Ordering::Release)
+                };
 
                 // increment the copy count because we beat the attempted copy
                 self.try_promote(next_table.table, 1, guard);
@@ -522,8 +528,11 @@ where
                 self.try_promote(next_table.table, 1, guard);
 
                 // mark the entry as copied
-                unsafe { &*(self.table.entry(i) as *const _ as *const AtomicUsize) }
-                    .fetch_or(Entry::COPIED, Ordering::Release);
+                unsafe {
+                    self.table
+                        .entry(i)
+                        .fetch_or(Entry::COPIED, Ordering::Release)
+                };
 
                 // our insertion didn't overwrite anything in the new table, but logically,
                 // we did overwrite the value we found in the old table
@@ -636,8 +645,11 @@ where
 
         // mark the entry as copied
         if copied {
-            unsafe { &*(self.table.entry(i) as *const _ as *const AtomicUsize) }
-                .fetch_or(Entry::COPIED, Ordering::Release);
+            unsafe {
+                self.table
+                    .entry(i)
+                    .fetch_or(Entry::COPIED, Ordering::Release);
+            }
         } else {
             // otherwise we have to decrement the reference count because either an update won
             // the race and this entry was never in the new table, or the thread that did the copy
@@ -870,6 +882,8 @@ fn drop_entries<K, V>(table: &mut Table<K, V>) {
                     &seize::Guard::unprotected()
                 ));
             }
+
+            continue;
         }
 
         // any other non-null entry should be retired through reference counting
