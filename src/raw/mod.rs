@@ -10,6 +10,7 @@ use std::{hint, mem, ptr};
 
 use self::alloc::{RawTable, ResizeState};
 use self::utils::{log2, AtomicPtrFetchOps, StrictProvenance};
+use crate::map::ResizeBehavior;
 use crate::seize::{self, reclaim, AsLink, Collector, Guard, Link, Linked};
 
 // A lock-free hash-map.
@@ -17,6 +18,7 @@ pub struct HashMap<K, V, S> {
     collector: Collector,
     table: AtomicPtr<RawTable>,
     build_hasher: S,
+    pub resize_behavior: ResizeBehavior,
     _kv: PhantomData<(K, V)>,
 }
 
@@ -109,6 +111,7 @@ impl<K, V, S> HashMap<K, V, S> {
         HashMap {
             collector,
             build_hasher,
+            resize_behavior: ResizeBehavior::Blocking,
             table: AtomicPtr::new(table.raw),
             _kv: PhantomData,
         }
@@ -124,6 +127,7 @@ impl<K, V, S> HashMap<K, V, S> {
             root: &self.table,
             collector: &self.collector,
             build_hasher: &self.build_hasher,
+            resize_behavior: self.resize_behavior.clone(),
         }
     }
 
@@ -141,6 +145,7 @@ impl<K, V, S> HashMap<K, V, S> {
 pub struct HashMapRef<'a, K, V, S> {
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
+    resize_behavior: ResizeBehavior,
     collector: &'a Collector,
     build_hasher: &'a S,
 }
@@ -204,10 +209,12 @@ where
             i += 1;
         }
 
-        // went over the max probe count: the key is not in this table, but it
-        // might be in the new table
-        if let Some(next_table) = self.next_table_ref() {
-            return next_table.get(key, guard);
+        // went over the max probe count: the key is not in this table, but it might be in the new table
+        // if incremental resizing is enabled
+        if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
+            if let Some(next_table) = self.next_table_ref() {
+                return next_table.get(key, guard);
+            }
         }
 
         None
@@ -572,7 +579,11 @@ where
 
         // the true table capacity, we have to copy every entry including from the buffer
         let capacity = self.table.len + log2!(self.table.len);
-        let copy_chunk = capacity.min(1024);
+        let copy_chunk = match self.resize_behavior {
+            ResizeBehavior::Incremental(amount) => (capacity as f32 * amount) as usize,
+            ResizeBehavior::Blocking => 1024,
+        }
+        .min(capacity);
 
         loop {
             // claim a range to copy
@@ -580,8 +591,7 @@ where
 
             let mut copied = 0;
             for i in 0..copy_chunk {
-                // copies wrap around. note the capacity including the buffer is not a
-                // power of two
+                // note the capacity including the buffer is not a power of two
                 let i = (copy_start + i) % capacity;
 
                 // keep track of the entries we actually copy
@@ -592,6 +602,10 @@ where
 
             // are we done?
             if self.try_promote(next_table, copied, guard) {
+                return;
+            }
+
+            if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
                 return;
             }
         }
@@ -878,6 +892,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
             root: self.root,
             collector: self.collector,
             build_hasher: self.build_hasher,
+            resize_behavior: self.resize_behavior.clone(),
         }
     }
 }

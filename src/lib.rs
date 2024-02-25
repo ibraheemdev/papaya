@@ -4,11 +4,12 @@ mod map;
 mod raw;
 mod seize;
 
-pub use map::HashMap;
+pub use map::{HashMap, ResizeBehavior};
 
 #[test]
 fn bench() {
-    let map = HashMap::new();
+    let mut map = HashMap::new();
+    map.resize_behavior(ResizeBehavior::Incremental(0.01));
     for i in 0..1000 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
@@ -21,7 +22,8 @@ fn bench() {
 
 #[test]
 fn basic() {
-    let map = HashMap::new();
+    let mut map = HashMap::new();
+    map.resize_behavior(ResizeBehavior::Incremental(0.01));
 
     assert!(map.pin().get(&100).is_none());
     map.pin().insert(100, 101);
@@ -68,7 +70,8 @@ fn basic() {
 
 #[test]
 fn stress() {
-    let map = HashMap::new();
+    let mut map = HashMap::new();
+    map.resize_behavior(ResizeBehavior::Incremental(0.01));
 
     std::thread::scope(|s| {
         for t in 0..16 {
