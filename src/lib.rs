@@ -9,7 +9,6 @@ pub use map::{HashMap, ResizeBehavior};
 #[test]
 fn bench() {
     let mut map = HashMap::new();
-    map.resize_behavior(ResizeBehavior::Incremental(0.01));
     for i in 0..1000 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
@@ -28,6 +27,8 @@ fn basic() {
     assert!(map.pin().get(&100).is_none());
     map.pin().insert(100, 101);
     assert_eq!(map.pin().get(&100), Some(&101));
+    map.pin().update(100, |x| x + 2);
+    assert_eq!(map.pin().get(&100), Some(&103));
 
     assert!(map.pin().get(&200).is_none());
     map.pin().insert(200, 202);
@@ -35,7 +36,7 @@ fn basic() {
 
     assert!(map.pin().get(&300).is_none());
 
-    assert_eq!(map.pin().remove(&100), Some(&101));
+    assert_eq!(map.pin().remove(&100), Some(&103));
     assert_eq!(map.pin().remove(&200), Some(&202));
     assert!(map.pin().remove(&300).is_none());
 
@@ -52,7 +53,15 @@ fn basic() {
     }
 
     for i in 0..64 {
-        assert_eq!(map.pin().remove(&i), Some(&(i + 1)));
+        assert_eq!(map.pin().update(i, |i| i - 1), Some(&(i + 1)));
+    }
+
+    for i in 0..64 {
+        assert_eq!(map.pin().get(&i), Some(&i));
+    }
+
+    for i in 0..64 {
+        assert_eq!(map.pin().remove(&i), Some(&i));
     }
 
     for i in 0..64 {
