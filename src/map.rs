@@ -5,12 +5,9 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
-#[derive(Clone)]
-pub enum ResizeBehavior {
-    Incremental(f32),
-    Blocking,
-}
-
+/// A lock-free hash table.
+///
+/// For more information, see the [crate-level documentation](crate);
 pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
 }
@@ -76,6 +73,14 @@ where
             .with_ref(|m| m.insert(key, value, &self.guard), &self.guard)
     }
 
+    pub fn update<F>(&'a self, key: K, f: F) -> Option<&'a V>
+    where
+        F: Fn(&V) -> V,
+    {
+        self.raw
+            .with_ref(|m| m.update(key, f, &self.guard), &self.guard)
+    }
+
     pub fn remove<Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
@@ -84,6 +89,12 @@ where
         self.raw
             .with_ref(|m| m.remove(key, &self.guard), &self.guard)
     }
+}
+
+#[derive(Clone)]
+pub enum ResizeBehavior {
+    Incremental(f32),
+    Blocking,
 }
 
 #[derive(Debug, PartialEq, Eq)]

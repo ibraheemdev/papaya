@@ -105,7 +105,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let capacity = capacity.next_power_of_two();
         let buffer = log2!(capacity);
 
-        let collector = Collector::new().epoch_frequency(None);
+        let collector = Collector::new().epoch_frequency(None).batch_size(2000);
         let table = alloc::Table::<Entry<K, V>>::new(capacity, capacity + buffer, collector.link());
 
         HashMap {
@@ -396,6 +396,127 @@ where
         status
     }
 
+    // Update an entry with a remapping function.
+    pub fn update<'guard, F>(&self, mut key: K, f: F, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    where
+        F: Fn(&V) -> V,
+    {
+        let mut update: *mut Entry<K, V> = Box::into_raw(Box::new(Entry {
+            key,
+            value: MaybeUninit::uninit(),
+            link: self.collector.link(),
+        }));
+
+        self.update_with(update, f, guard)
+    }
+
+    // Update an entry with a remapping function.
+    pub fn update_with<'guard, F>(
+        &self,
+        mut update: *mut Entry<K, V>,
+        f: F,
+        guard: &'guard Guard<'_>,
+    ) -> Option<&'guard V>
+    where
+        F: Fn(&V) -> V,
+    {
+        let hash = unsafe { self.hash(&(*update).key) };
+        let h2 = meta::h2(hash);
+
+        let mut i = h1(hash) & (self.table.len - 1);
+        let probe_limit = i + log2!(self.table.len);
+
+        while i <= probe_limit {
+            let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+
+            // found an empty entry, the key is not in this table
+            if meta == meta::EMPTY {
+                return None;
+            }
+
+            // found a phantom entry, switch to the new table
+            if meta == meta::PHANTOM {
+                break;
+            }
+
+            if meta == h2 {
+                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
+
+                // the key matches, we might be able to perform an update
+                if unsafe { (*entry_ptr).key == (*update).key } {
+                    let entry = loop {
+                        // the entry is being copied to a new table, we have to copy it before we
+                        // can update it
+                        if entry.addr() & Entry::COPYING != 0 {
+                            break entry;
+                        }
+
+                        // the entry was deleted in this table and is not marked as copied,
+                        // so it can't have been updated in the new table
+                        if entry.addr() & Entry::TOMBSTONE != 0 {
+                            return None;
+                        }
+
+                        // perform the update
+                        unsafe {
+                            let value = f((*entry_ptr).value.assume_init_ref());
+                            (*update).value = MaybeUninit::new(value);
+                        }
+
+                        match unsafe { self.table.entry(i) }.compare_exchange_weak(
+                            entry,
+                            update,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        ) {
+                            // succesful update
+                            Ok(_) => unsafe {
+                                let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
+
+                                // retire the only entry
+                                Entry::try_retire_value(entry_ptr, guard);
+                                return Some((*entry_ptr).value.assume_init_ref());
+                            },
+
+                            // lost to a concurrent update or delete, retry
+                            Err(found) => {
+                                unsafe {
+                                    // drop the old value
+                                    (*update).value.assume_init_drop()
+                                }
+
+                                entry = found;
+                            }
+                        }
+                    };
+
+                    let new_table = self.next_table_ref().unwrap();
+
+                    // the entry has not been copied yet, we need to copy it
+                    if entry.addr() & Entry::COPIED == 0 {
+                        self.copy_entry(i, entry, new_table.table, guard);
+                    }
+
+                    // update the entry in the new table
+                    return new_table.update_with(update, f, guard);
+                }
+            }
+
+            i += 1;
+        }
+
+        // went over the max probe count: the key is not in this table, but it might be in the new table
+        // if incremental resizing is enabled
+        if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
+            if let Some(next_table) = self.next_table_ref() {
+                return next_table.update_with(update, f, guard);
+            }
+        }
+
+        None
+    }
+
     // Removes a key from the map, returning the value at the key if the key was previously in the map.
     pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
     where
@@ -595,7 +716,7 @@ where
                 let i = (copy_start + i) % capacity;
 
                 // keep track of the entries we actually copy
-                if self.copy_entry_to(i, next_table, guard) {
+                if self.copy_index(i, next_table, guard) {
                     copied += 1;
                 }
             }
@@ -614,9 +735,21 @@ where
     // Copy the entry at the given index to the new table.
     //
     // Returns true if this thread ended up doing the copy.
-    fn copy_entry_to(&self, i: usize, new_table: Table<K, V>, guard: &Guard<'_>) -> bool {
-        let mut entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
+    fn copy_index(&self, i: usize, new_table: Table<K, V>, guard: &Guard<'_>) -> bool {
+        let entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
+        self.copy_entry(i, entry, new_table, guard)
+    }
 
+    // Copy the given entry to the new table.
+    //
+    // Returns true if this thread ended up doing the copy.
+    fn copy_entry(
+        &self,
+        i: usize,
+        mut entry: *mut Entry<K, V>,
+        new_table: Table<K, V>,
+        guard: &Guard<'_>,
+    ) -> bool {
         loop {
             // the entry has already been copied
             if entry.addr() & Entry::COPIED != 0
