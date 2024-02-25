@@ -5,6 +5,12 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
+#[derive(Clone)]
+pub enum ResizeBehavior {
+    Incremental(f32),
+    Blocking,
+}
+
 pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
 }
@@ -39,6 +45,10 @@ impl<K, V, S> HashMap<K, V, S> {
             guard: self.raw.guard(),
             raw: &self.raw,
         }
+    }
+
+    pub fn resize_behavior(&mut self, resize_behavior: ResizeBehavior) {
+        self.raw.resize_behavior = resize_behavior;
     }
 }
 
