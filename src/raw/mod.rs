@@ -58,7 +58,6 @@ impl Entry<(), ()> {
     // Retires the entry if it's reference count is 0.
     unsafe fn try_retire_value<K, V>(entry: *mut Entry<K, V>, guard: &Guard<'_>) -> bool {
         // ensure this is the last active copy
-        assert!(entry.addr() & Entry::POINTER == entry.addr());
         let count = (*entry).copies();
         if count.fetch_sub(1, Ordering::Release) != 0 {
             return false;
@@ -167,10 +166,13 @@ where
         while i <= probe_limit {
             let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
-            // found an empty entry in the probe sequence, the entry is not this table, or
-            // any other table because writers only write to the new table if an entry is copied
-            // or the table is promoted
+            // found an empty entry, the entry is not the table
             if meta == meta::EMPTY {
+                return None;
+            }
+
+            // found a phantom entry, retry in the new table
+            if meta == meta::PHANTOM {
                 break;
             }
 
@@ -242,6 +244,11 @@ where
         while i <= probe_limit {
             let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
+            // found a phantom entry, switch to the new table
+            if meta == meta::PHANTOM {
+                break;
+            }
+
             if meta == meta::EMPTY {
                 match unsafe { self.table.entry(i) }.compare_exchange(
                     ptr::null_mut(),
@@ -256,15 +263,9 @@ where
                         return EntryStatus::Empty;
                     }
                     Err(found) => {
-                        // An (EMPTY -> COPIED) "phantom" transition marks a move to the new table for any
-                        // writers, as it is guaranteed to be visible in the probe chain to readers, or any
-                        // other writer who tries to claim this entry. This optimization allows us to move
-                        // to the new table quicker, and prevent potential interference between copiers and
-                        // writers.
-                        //
-                        // Note that because of this deleters must check the new table even if they
-                        // encounter an empty entry in the probe chain.
+                        // found a phantom entry, mark it for readers and switch to the new table.
                         if found.addr() == Entry::COPYING {
+                            unsafe { self.table.meta(i).store(meta::PHANTOM, Ordering::Release) };
                             break;
                         }
 
@@ -416,9 +417,13 @@ where
         while i <= probe_limit {
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
-            // encountered an empty entry in the probe sequence, the key is not in this table,
-            // but it might be in the next table due to a phantom transition
+            // encountered an empty entry, the key is not in this table
             if meta == meta::EMPTY {
+                return None;
+            }
+
+            // encountered a phantom entry, retry in the new table
+            if meta == meta::PHANTOM {
                 break;
             }
 
@@ -623,7 +628,13 @@ where
                     Ordering::Acquire,
                 )
             } {
-                // the entry was empty or a tombstone, so we're done
+                // we created a phantom entry, there is nothing to copy
+                Ok(_) if entry.is_null() => {
+                    unsafe { self.table.meta(i).store(meta::PHANTOM, Ordering::Release) };
+                    return true;
+                }
+
+                // the entry was a tombstone, there is nothing to copy
                 Ok(_) if entry.is_null() || entry.addr() & Entry::TOMBSTONE != 0 => {
                     return true;
                 }
@@ -677,6 +688,11 @@ where
         while i <= probe_limit {
             let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
+            // found a phantom entry, switch to the nested resize
+            if meta == meta::PHANTOM {
+                break;
+            }
+
             if meta == meta::EMPTY {
                 match unsafe { self.table.entry(i) }.compare_exchange(
                     ptr::null_mut(),
@@ -691,8 +707,9 @@ where
                         return true;
                     }
                     Err(found) => {
-                        // found a phantom entry, move to the nested resize
+                        // found a phantom entry, mark it for readers and switch to the nested resize
                         if found.addr() == Entry::COPYING {
+                            unsafe { self.table.meta(i).store(meta::PHANTOM, Ordering::Release) };
                             break;
                         }
 
@@ -917,6 +934,13 @@ mod meta {
 
     // Marks an empty entry.
     pub const EMPTY: u8 = 0x80;
+
+    // An (EMPTY -> COPIED) "phantom" transition marks a move to the new table for any
+    // writers, as it is guaranteed to be visible in the probe chain to readers, or any
+    // other writer who tries to claim this entry. This optimization allows us to move
+    // to the new table quicker, and prevent potential interference between copiers and
+    // writers.
+    pub const PHANTOM: u8 = u8::MAX;
 
     /// Returns the top bits of the hash, used as metadata.
     #[inline]
