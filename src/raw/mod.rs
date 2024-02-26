@@ -59,12 +59,6 @@ impl Entry<(), ()> {
 
     // Retires the entry if it's reference count is 0.
     unsafe fn try_retire_value<K, V>(entry: *mut Entry<K, V>, guard: &Guard<'_>) -> bool {
-        // ensure this is the last active copy
-        let count = (*entry).copies();
-        if count.fetch_sub(1, Ordering::Release) != 0 {
-            return false;
-        }
-
         guard.retire(entry, |link| {
             let entry_addr: *mut Entry<K, V> = link.cast();
             let entry = unsafe { Box::from_raw(entry_addr) };
@@ -74,27 +68,6 @@ impl Entry<(), ()> {
         });
 
         true
-    }
-
-    // Retires a tombstone entry if it's reference count is 0.
-    unsafe fn try_retire_tombstone<K, V>(entry: *mut Entry<K, V>, guard: &Guard<'_>) -> bool {
-        // ensure this is the last active copy
-        let count = (*entry).copies();
-        if count.fetch_sub(1, Ordering::Release) != 0 {
-            return false;
-        }
-
-        guard.retire(entry, |link| seize::reclaim::boxed::<Entry<K, V>>(link));
-        true
-    }
-}
-
-impl<K, V> Entry<K, V> {
-    // The number of tables this entry is in.
-    //
-    // Note: the count start at 0 so is offset by 1.
-    fn copies(&self) -> &AtomicUsize {
-        unsafe { &(*self.link.node.get()).reservation.data }
     }
 }
 
@@ -176,30 +149,22 @@ where
                 return None;
             }
 
-            // found a phantom entry, retry in the new table
-            if meta == meta::PHANTOM {
-                break;
+            // found an empty entry, the entry is not the table
+            if meta == meta::TOMBSTONE {
+                continue;
             }
 
             if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+
+                if entry.addr() == Entry::TOMBSTONE {
+                    continue;
+                }
+
                 let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
                 // check for a full match
                 if unsafe { (*entry_ptr).key.borrow() } == key {
-                    // the entry was copied to a new table
-                    if entry.addr() & Entry::COPIED != 0
-                        || entry.addr() & Entry::TOMBCOPIED == Entry::TOMBCOPIED
-                    {
-                        break;
-                    }
-
-                    // the entry was deleted in this table and is not marked as copied,
-                    // so it can't have been updated in the new table
-                    if entry.addr() & Entry::TOMBSTONE != 0 {
-                        return None;
-                    }
-
                     // we don't care if this entry is currently being copied because until the copy is
                     // completed, this is the latest value
                     unsafe { return Some((*entry_ptr).value.assume_init_ref()) }
@@ -207,14 +172,6 @@ where
             }
 
             i += 1;
-        }
-
-        // went over the max probe count: the key is not in this table, but it might be in the new table
-        // if incremental resizing is enabled
-        if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
-            if let Some(next_table) = self.next_table_ref() {
-                return next_table.get(key, guard);
-            }
         }
 
         None
@@ -251,9 +208,8 @@ where
         while i <= probe_limit {
             let mut meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
-            // found a phantom entry, switch to the new table
-            if meta == meta::PHANTOM {
-                break;
+            if meta == meta::TOMBSTONE {
+                continue;
             }
 
             if meta == meta::EMPTY {
@@ -270,9 +226,12 @@ where
                         return EntryStatus::Empty;
                     }
                     Err(found) => {
-                        // found a phantom entry, mark it for readers and switch to the new table.
+                        if found.addr() == Entry::TOMBSTONE {
+                            continue;
+                        }
+
+                        // found a phantom entry, switch to the new table.
                         if found.addr() == Entry::COPYING {
-                            unsafe { self.table.meta(i).store(meta::PHANTOM, Ordering::Release) };
                             break;
                         }
 
@@ -281,7 +240,10 @@ where
 
                         // the key matches, we might be able to perform an update
                         if unsafe { (*found_ptr).key == *key } {
-                            return self.replace_entry(i, found, new_entry, guard);
+                            match self.replace_entry(i, found, new_entry, guard) {
+                                Ok(status) => return status,
+                                Err(_) => break,
+                            }
                         }
 
                         continue;
@@ -291,11 +253,19 @@ where
 
             if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+
+                if entry.addr() == Entry::TOMBSTONE {
+                    continue;
+                }
+
                 let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
                 // the key matches, we might be able to perform an update
                 if unsafe { (*entry_ptr).key == *key } {
-                    return self.replace_entry(i, entry, new_entry, guard);
+                    match self.replace_entry(i, entry, new_entry, guard) {
+                        Ok(status) => return status,
+                        Err(_) => break,
+                    }
                 }
             }
 
@@ -323,12 +293,12 @@ where
         mut entry: *mut Entry<K, V>,
         new_entry: *mut Entry<K, V>,
         guard: &'guard Guard<'_>,
-    ) -> EntryStatus<&'guard V> {
-        let found = loop {
-            // the entry is being copied to a new table, we have to go there
-            // and join the race for the insertion
+    ) -> Result<EntryStatus<&'guard V>, ()> {
+        loop {
+            // the entry is being copied to a new table, we have to finish the resize
+            // before we insert
             if entry.addr() & Entry::COPYING != 0 {
-                break entry;
+                return Err(());
             }
 
             match unsafe { self.table.entry(i) }.compare_exchange_weak(
@@ -341,59 +311,21 @@ where
                 Ok(_) => unsafe {
                     let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
-                    // we replaced a tomstone
-                    if entry.addr() & Entry::TOMBSTONE != 0 {
-                        Entry::try_retire_tombstone(entry_ptr, guard);
-                        return EntryStatus::Tombstone;
-                    }
-
                     Entry::try_retire_value(entry_ptr, guard);
-                    return EntryStatus::Value((*entry_ptr).value.assume_init_ref());
+                    return Ok(EntryStatus::Value((*entry_ptr).value.assume_init_ref()));
                 },
+
+                // lost to a concurrent update or delete, retry
+                Err(found) if found.addr() == Entry::TOMBSTONE => {
+                    return Ok(EntryStatus::Tombstone);
+                }
 
                 // lost to a concurrent update or delete, retry
                 Err(found) => {
                     entry = found;
                 }
             }
-        };
-
-        let next_table = self.next_table_ref().unwrap();
-
-        // insert into the new table
-        let status = match next_table.insert_entry(new_entry, guard) {
-            // we claimed the slot before the copier
-            EntryStatus::Empty => {
-                // the entry in the old table was a tombstone and was never going to be copied,
-                // so we don't have to worry about the copy count
-                if found.addr() & Entry::TOMBCOPIED == Entry::TOMBCOPIED {
-                    return EntryStatus::Tombstone;
-                }
-
-                // mark the entry as copied
-                unsafe {
-                    self.table
-                        .entry(i)
-                        .fetch_or(Entry::COPIED, Ordering::Release)
-                };
-
-                // increment the copy count because we beat the attempted copy
-                self.try_promote(next_table.table, 1, guard);
-
-                // our insertion didn't overwrite anything in the new table, but logically,
-                // we did overwrite the value we found in the old table
-                let found_ptr = found.map_addr(|addr| addr & Entry::POINTER);
-                unsafe { EntryStatus::Value((*found_ptr).value.assume_init_ref()) }
-            }
-            status => status,
-        };
-
-        // help along the top-level copy
-        let root = guard.protect(&self.root, Ordering::Acquire);
-        let root = unsafe { Table::<K, V>::from_raw(root) };
-        self.as_ref(root).help_copy(guard);
-
-        status
+        }
     }
 
     // Update an entry with a remapping function.
@@ -434,28 +366,25 @@ where
                 return None;
             }
 
-            // found a phantom entry, switch to the new table
-            if meta == meta::PHANTOM {
-                break;
+            if meta == meta::TOMBSTONE {
+                continue;
             }
 
             if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+
+                if entry.addr() == Entry::TOMBSTONE {
+                    continue;
+                }
+
                 let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
                 // the key matches, we might be able to perform an update
                 if unsafe { (*entry_ptr).key == (*update).key } {
                     let entry = loop {
-                        // the entry is being copied to a new table, we have to copy it before we
-                        // can update it
+                        // the entry is being copied to a new table, we have to copy it before we can update it
                         if entry.addr() & Entry::COPYING != 0 {
                             break entry;
-                        }
-
-                        // the entry was deleted in this table and is not marked as copied,
-                        // so it can't have been updated in the new table
-                        if entry.addr() & Entry::TOMBSTONE != 0 {
-                            return None;
                         }
 
                         // perform the update
@@ -478,6 +407,11 @@ where
                                 Entry::try_retire_value(entry_ptr, guard);
                                 return Some((*entry_ptr).value.assume_init_ref());
                             },
+
+                            // the entry got deleted
+                            Err(found) if found.addr() == Entry::TOMBSTONE => {
+                                return None;
+                            }
 
                             // lost to a concurrent update or delete, retry
                             Err(found) => {
@@ -506,32 +440,11 @@ where
             i += 1;
         }
 
-        // went over the max probe count: the key is not in this table, but it might be in the new table
-        // if incremental resizing is enabled
-        if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
-            if let Some(next_table) = self.next_table_ref() {
-                return next_table.update_with(update, f, guard);
-            }
-        }
-
         None
     }
 
     // Removes a key from the map, returning the value at the key if the key was previously in the map.
     pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.remove_with(key, ptr::null_mut(), guard)
-    }
-
-    fn remove_with<'guard, Q: ?Sized>(
-        &self,
-        key: &Q,
-        mut deletion: *mut Entry<K, V>,
-        guard: &'guard Guard<'_>,
-    ) -> Option<&'guard V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -550,47 +463,31 @@ where
                 return None;
             }
 
-            // encountered a phantom entry, retry in the new table
-            if meta == meta::PHANTOM {
-                break;
-            }
-
             if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
                 let entry_ptr = entry.map_addr(|addr| addr & Entry::POINTER);
 
+                if entry.addr() == Entry::TOMBSTONE {
+                    continue;
+                }
+
                 // the key matches, we might be able to perform an update
                 if unsafe { (*entry_ptr).key.borrow() == key } {
-                    // the entry was deleted in this table and is not marked as copied,
-                    // so it can't have been updated in the new table
-                    if entry.addr() & Entry::TOMBCOPIED == Entry::TOMBSTONE {
-                        return None;
-                    }
-
                     let owned_key = unsafe { (*entry_ptr).key.clone() };
 
-                    if deletion.is_null() {
-                        // allocate the entry that marks the key as deleted
-                        deletion = Box::into_raw(Box::new(Entry {
-                            key: owned_key,
-                            value: MaybeUninit::uninit(),
-                            link: self.collector.link(),
-                        }));
-
-                        deletion = deletion.map_addr(|addr| addr | Entry::TOMBSTONE);
-                    }
-
-                    // the entry is being copied to a new table, we have to go there and
-                    // delete it, or put down our deletion first
+                    // the entry is being copied to a new table, we have to go there and delete it
                     if entry.addr() & Entry::COPYING != 0 {
-                        return self.remove_copy(i, entry, deletion, guard);
+                        let next_table = self.next_table_ref().unwrap();
+                        // TODO: can't do this, have to finish copy before deleting
+                        self.copy_entry(i, found, next_table.table, guard);
+                        return next_table.remove(key, guard);
                     }
 
                     loop {
                         // perform the deletion
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
                             entry,
-                            deletion,
+                            Entry::TOMBSTONE as _,
                             Ordering::Release,
                             Ordering::Relaxed,
                         ) {
@@ -606,7 +503,7 @@ where
                             // also be a tombcopied entry, but we still then have to ensure it's not in
                             // the new table
                             Err(found) if found.addr() & Entry::COPYING != 0 => {
-                                return self.remove_copy(i, entry, deletion, guard);
+                                break;
                             }
 
                             // the entry was deleted in this table and is not marked as copied,
@@ -630,52 +527,11 @@ where
         // went over the max probe count: the key is not in this table, but it
         // might be in the new table
         if let Some(next_table) = self.next_table_ref() {
-            return next_table.remove_with(key, deletion, guard);
+            next_table.help_copy(guard);
+            return next_table.remove(key, guard);
         }
 
         return None;
-    }
-
-    fn remove_copy<'guard>(
-        &self,
-        i: usize,
-        found: *mut Entry<K, V>,
-        deletion: *mut Entry<K, V>,
-        guard: &'guard Guard<'_>,
-    ) -> Option<&'guard V> {
-        let next_table = self.next_table_ref().unwrap();
-
-        // insert our deletion into the new table
-        // TODO: this will unnecessarily overwrite existing tombstones
-        match next_table.insert_entry(deletion, guard) {
-            // if we claimed the slot before the copy, we have to update the copy count
-            EntryStatus::Empty => {
-                // the entry in the old table was a tombstone and was never going to be copied.
-                // we made sure it wasn't in the new table, but we don't have to worry about the
-                // copy count
-                if found.addr() & Entry::TOMBSTONE != 0 {
-                    return None;
-                }
-
-                // otherwise, we have to increment it
-                self.try_promote(next_table.table, 1, guard);
-
-                // mark the entry as copied
-                unsafe {
-                    self.table
-                        .entry(i)
-                        .fetch_or(Entry::COPIED, Ordering::Release)
-                };
-
-                // our insertion didn't overwrite anything in the new table, but logically,
-                // we did overwrite the value we found in the old table
-                let found_ptr = found.map_addr(|addr| addr & Entry::POINTER);
-                unsafe { Some((*found_ptr).value.assume_init_ref()) }
-            }
-            // the entry was already deleted in the new table
-            EntryStatus::Tombstone => None,
-            EntryStatus::Value(value) => Some(value),
-        }
     }
 
     // Help along the resize operation until the old table is fully copied from.
@@ -700,20 +556,24 @@ where
 
         // the true table capacity, we have to copy every entry including from the buffer
         let capacity = self.table.len + log2!(self.table.len);
-        let copy_chunk = match self.resize_behavior {
-            ResizeBehavior::Incremental(amount) => (capacity as f32 * amount) as usize,
-            ResizeBehavior::Blocking => 1024,
-        }
-        .min(capacity);
+        let copy_chunk = capacity.min(1024);
 
-        loop {
+        'claim: loop {
+            if state.claim.load(Ordering::Acquire) >= capacity {
+                break;
+            }
+
             // claim a range to copy
             let copy_start = state.claim.fetch_add(copy_chunk, Ordering::Relaxed);
 
             let mut copied = 0;
             for i in 0..copy_chunk {
                 // note the capacity including the buffer is not a power of two
-                let i = (copy_start + i) % capacity;
+                let i = copy_start + i;
+
+                if i >= capacity {
+                    break 'claim;
+                }
 
                 // keep track of the entries we actually copy
                 if self.copy_index(i, next_table, guard) {
@@ -725,10 +585,10 @@ where
             if self.try_promote(next_table, copied, guard) {
                 return;
             }
+        }
 
-            if matches!(self.resize_behavior, ResizeBehavior::Incremental(_)) {
-                return;
-            }
+        while state.futex.load(Ordering::Acquire) == ResizeState::PENDING {
+            atomic_wait::wait(&state.futex, ResizeState::PENDING);
         }
     }
 
@@ -777,7 +637,7 @@ where
             } {
                 // we created a phantom entry, there is nothing to copy
                 Ok(_) if entry.is_null() => {
-                    unsafe { self.table.meta(i).store(meta::PHANTOM, Ordering::Release) };
+                    unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
                     return true;
                 }
 
@@ -795,9 +655,6 @@ where
         }
 
         entry = entry.map_addr(|addr| addr & Entry::POINTER);
-
-        // increment the copy count
-        unsafe { (*entry).copies().fetch_add(1, Ordering::Relaxed) };
 
         let copied = self.as_ref(new_table).insert_copy(entry, guard);
 
@@ -992,24 +849,25 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
 
         if copied == self.table.len + log2!(self.table.len) {
             let root = self.root.load(Ordering::Acquire);
+            state.futex.store(ResizeState::COMPLETE, Ordering::Release);
 
             // we only promote the top-level copy
             if root == self.table.raw {
-                if self
-                    .root
+                self.root
                     .compare_exchange(root, next.raw, Ordering::Release, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    // retire the old table
-                    unsafe {
-                        guard.retire(root, |link| {
-                            let raw: *mut RawTable = link.cast();
-                            let mut table: Table<K, V> = Table::from_raw(raw);
-                            drop_entries(&mut table);
-                            Table::dealloc(table);
-                        })
-                    };
-                }
+                    .unwrap();
+
+                atomic_wait::wake_all(&state.futex);
+
+                // retire the old table
+                unsafe {
+                    guard.retire(root, |link| {
+                        let raw: *mut RawTable = link.cast();
+                        let mut table: Table<K, V> = Table::from_raw(raw);
+                        drop_entries(&mut table);
+                        Table::dealloc(table);
+                    })
+                };
             }
 
             return true;
@@ -1041,13 +899,6 @@ fn drop_entries<K, V>(table: &mut Table<K, V>) {
 
         // tombstone entries are allocated but never copied to another table
         if entry.addr() & Entry::TOMBSTONE != 0 {
-            unsafe {
-                assert!(Entry::try_retire_tombstone(
-                    entry_ptr,
-                    &seize::Guard::unprotected()
-                ));
-            }
-
             continue;
         }
 
@@ -1083,12 +934,7 @@ mod meta {
     // Marks an empty entry.
     pub const EMPTY: u8 = 0x80;
 
-    // An (EMPTY -> COPIED) "phantom" transition marks a move to the new table for any
-    // writers, as it is guaranteed to be visible in the probe chain to readers, or any
-    // other writer who tries to claim this entry. This optimization allows us to move
-    // to the new table quicker, and prevent potential interference between copiers and
-    // writers.
-    pub const PHANTOM: u8 = u8::MAX;
+    pub const TOMBSTONE: u8 = u8::MAX;
 
     /// Returns the top bits of the hash, used as metadata.
     #[inline]

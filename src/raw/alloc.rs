@@ -33,6 +33,12 @@ pub struct ResizeState {
     pub allocating: Mutex<()>,
     pub copied: AtomicUsize,
     pub claim: AtomicUsize,
+    pub futex: AtomicU32,
+}
+
+impl ResizeState {
+    pub const PENDING: u32 = 0;
+    pub const COMPLETE: u32 = 1;
 }
 
 // Manages a table allocation.
