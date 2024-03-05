@@ -65,20 +65,18 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.with_ref(|m| m.get(key, &self.guard), &self.guard)
+        self.raw.root(&self.guard).get(key, &self.guard)
     }
 
     pub fn insert(&'a self, key: K, value: V) -> Option<&'a V> {
-        self.raw
-            .with_ref(|m| m.insert(key, value, &self.guard), &self.guard)
+        self.raw.root(&self.guard).insert(key, value, &self.guard)
     }
 
     pub fn update<F>(&'a self, key: K, f: F) -> Option<&'a V>
     where
         F: Fn(&V) -> V,
     {
-        self.raw
-            .with_ref(|m| m.update(key, f, &self.guard), &self.guard)
+        self.raw.root(&self.guard).update(key, f, &self.guard)
     }
 
     pub fn remove<Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V>
@@ -86,8 +84,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
-        self.raw
-            .with_ref(|m| m.remove(key, &self.guard), &self.guard)
+        self.raw.root(&self.guard).remove(key, &self.guard)
     }
 }
 
