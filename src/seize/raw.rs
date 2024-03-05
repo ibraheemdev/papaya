@@ -16,11 +16,9 @@ pub struct Collector {
     // The global epoch value
     pub(crate) epoch: AtomicU64,
     // Per-thread reservations lists
-    reservations: ThreadLocal<CachePadded<Reservation>>,
+    pub reservations: ThreadLocal<CachePadded<Reservation>>,
     // Per-thread batches of retired nodes
     batches: ThreadLocal<UnsafeCell<CachePadded<Batch>>>,
-    // The number of nodes allocated per-thread
-    node_count: ThreadLocal<UnsafeCell<u64>>,
     // The number of node allocations before advancing the global epoch
     pub(crate) epoch_frequency: Option<NonZeroU64>,
     // The number of nodes in a batch before we free
@@ -33,17 +31,16 @@ impl Collector {
             epoch: AtomicU64::new(1),
             reservations: ThreadLocal::with_capacity(threads),
             batches: ThreadLocal::with_capacity(threads),
-            node_count: ThreadLocal::with_capacity(threads),
             epoch_frequency: Some(epoch_frequency),
             batch_size,
         }
     }
 
     // Create a new node
-    pub fn node(&self) -> Node {
+    pub fn node(&self, reservation: &Reservation) -> Node {
         // safety: node counts are only accessed by the current thread
-        let count = unsafe { &mut *self.node_count.get_or(Default::default).get() };
-        *count += 1;
+        let count = reservation.node_count.get();
+        reservation.node_count.set(count + 1);
 
         // record the current epoch value
         //
@@ -52,7 +49,7 @@ impl Collector {
         // than might actually be
         let birth_epoch = match self.epoch_frequency {
             // advance the global epoch
-            Some(ref freq) if *count % freq.get() == 0 => {
+            Some(ref freq) if count % freq.get() == 0 => {
                 let epoch = self.epoch.fetch_add(1, Ordering::Relaxed);
                 trace!("advancing global epoch to {}", epoch + 1);
                 epoch + 1
@@ -73,7 +70,7 @@ impl Collector {
     }
 
     // Mark the current thread as active
-    pub fn enter(&self) {
+    pub fn enter(&self) -> &Reservation {
         trace!("marking thread as active");
 
         let reservation = self.reservations.get_or(Default::default);
@@ -94,6 +91,8 @@ impl Collector {
             //   in the total order)
             reservation.head.store(ptr::null_mut(), Ordering::SeqCst);
         }
+
+        reservation
     }
 
     // Load an atomic pointer
@@ -558,13 +557,15 @@ impl Node {
 
 // A per-thread reservation list
 #[repr(C)]
-struct Reservation {
+pub struct Reservation {
     // The head of the list
     head: AtomicPtr<Node>,
     // The epoch this thread last accessed a pointer in
     epoch: AtomicU64,
     // the number of active guards for this thread
     guards: Cell<u64>,
+    // the number of allocated nodes for this thread
+    node_count: Cell<u64>,
 }
 
 impl Default for Reservation {
@@ -573,6 +574,7 @@ impl Default for Reservation {
             head: AtomicPtr::new(Node::INACTIVE),
             epoch: AtomicU64::new(0),
             guards: Cell::new(0),
+            node_count: Cell::new(0),
         }
     }
 }
