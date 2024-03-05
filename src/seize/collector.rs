@@ -123,10 +123,11 @@ impl Collector {
     /// // drop(guard2) // _now_, the thread is marked as inactive
     /// ```
     pub fn enter(&self) -> Guard<'_> {
-        self.raw.enter();
+        let reservation = self.raw.enter();
 
         Guard {
             collector: self,
+            reservation,
             should_retire: UnsafeCell::new(false),
             _a: PhantomData,
         }
@@ -137,7 +138,12 @@ impl Collector {
     /// See [the guide](crate#allocating-objects) for details.
     pub fn link(&self) -> Link {
         Link {
-            node: UnsafeCell::new(self.raw.node()),
+            node: unsafe {
+                UnsafeCell::new(
+                    self.raw
+                        .node(&*self.raw.reservations.get_or(Default::default)),
+                )
+            },
         }
     }
 
@@ -222,6 +228,7 @@ impl fmt::Debug for Collector {
 /// See [`Collector::enter`] for details.
 pub struct Guard<'a> {
     collector: *const Collector,
+    reservation: *const raw::Reservation,
     should_retire: UnsafeCell<bool>,
     _a: PhantomData<&'a Collector>,
 }
@@ -245,8 +252,15 @@ impl Guard<'_> {
     pub const unsafe fn unprotected() -> Guard<'static> {
         Guard {
             collector: ptr::null(),
+            reservation: ptr::null(),
             should_retire: UnsafeCell::new(false),
             _a: PhantomData,
+        }
+    }
+
+    pub fn link(&self) -> Link {
+        Link {
+            node: unsafe { UnsafeCell::new((*self.collector).raw.node(&*self.reservation)) },
         }
     }
 

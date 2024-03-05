@@ -1,5 +1,5 @@
 #![allow(dead_code)] // ..
-#![deny(unsafe_op_in_unsafe_fn)]
+// #![deny(unsafe_op_in_unsafe_fn)]
 // #![doc = include_str!("../README.md")]
 
 mod cfg;

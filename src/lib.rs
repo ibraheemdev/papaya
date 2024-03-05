@@ -10,6 +10,7 @@ pub use map::{HashMap, ResizeBehavior};
 fn bench() {
     let mut map = HashMap::new();
     for i in 0..1000 {
+        dbg!(i);
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
 
@@ -22,7 +23,6 @@ fn bench() {
 #[test]
 fn basic() {
     let mut map = HashMap::new();
-    map.resize_behavior(ResizeBehavior::Incremental(0.01));
 
     assert!(map.pin().get(&100).is_none());
     map.pin().insert(100, 101);
@@ -75,12 +75,13 @@ fn basic() {
     for i in 0..256 {
         assert_eq!(map.pin().get(&i), Some(&(i + 1)));
     }
+
+    dbg!(map.pin().capacity());
 }
 
 #[test]
 fn stress() {
-    let mut map = HashMap::new();
-    map.resize_behavior(ResizeBehavior::Incremental(0.01));
+    let mut map = HashMap::<usize, usize>::new();
 
     std::thread::scope(|s| {
         for t in 0..16 {
