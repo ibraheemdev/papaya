@@ -245,8 +245,10 @@ where
 
                         // ensure the meta table is updated to avoid breaking the probe chain
                         unsafe {
-                            let hash = self.hash(&(*found_ptr).key);
-                            self.table.meta(i).store(meta::h2(hash), Ordering::Release);
+                            if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
+                                let hash = self.hash(&(*found_ptr).key);
+                                self.table.meta(i).store(meta::h2(hash), Ordering::Release);
+                            }
                         }
 
                         // if the same key was just inserted, we might be able to update
@@ -292,8 +294,8 @@ where
         }
 
         // went over the max probe count or found a copied entry: trigger a resize.
-        let next_table = self.get_or_alloc_next(guard);
-        self.help_copy(guard);
+        self.get_or_alloc_next(guard);
+        let next_table = self.help_copy(guard);
         self.as_ref(next_table).insert_entry(new_entry, guard)
     }
 
@@ -445,9 +447,9 @@ where
 
         if copying {
             // found a copied entry, finish the resize and update it in the new table
-            let next_table = self.next_table_ref().unwrap();
-            self.help_copy(guard);
-            return next_table.update_with(update, f, guard);
+            self.next_table_ref().unwrap();
+            let next_table = self.help_copy(guard);
+            return self.as_ref(next_table).update_with(update, f, guard);
         }
 
         None
@@ -537,90 +539,130 @@ where
 
         // found a copied entry, we have to finish the resize and delete it in the new table
         if copying {
-            let next_table = self.next_table_ref().unwrap();
-            self.help_copy(guard);
-            return next_table.remove(key, guard);
+            assert!(self.next_table_ref().is_some());
+            let next_table = self.help_copy(guard);
+            return self.as_ref(next_table).remove(key, guard);
         }
 
         return None;
     }
 
     // Help along the resize operation until it completes.
-    fn help_copy(&self, guard: &Guard<'_>) {
-        let state = self.table.resize_state();
+    fn help_copy(&self, guard: &Guard<'_>) -> Table<K, V> {
+        // while we only copy from the root table, if the new allocation runs out of space the
+        // copy must be aborted, so we use the resize state of the aborted table to manage the
+        // next resize attempt. `curr` represents the root, or last aborted table.
+        let mut curr = self.table;
 
-        let next_table = state.next.load(Ordering::Acquire);
-        assert!(!next_table.is_null());
+        let next = curr.state().next.load(Ordering::Acquire);
+        assert!(!next.is_null());
+        let mut next = unsafe { Table::<K, V>::from_raw(next) };
 
-        let next_table = unsafe { Table::<K, V>::from_raw(next_table) };
-
-        // the copy already completed
-        if self.try_promote(next_table, 0, guard) {
-            return;
-        }
-
-        // the true table capacity, we have to copy every entry including from the buffer
-        let capacity = self.table.len + probe_limit!(self.table.len);
-        let copy_chunk = capacity.min(1024);
-
-        loop {
-            // every entry has already been claimed
-            if state.claim.load(Ordering::Acquire) >= capacity {
-                break;
+        'copy: loop {
+            // make sure we are at the correct table
+            while curr.state().status.load(Ordering::Acquire) == ResizeState::ABORTED {
+                curr = next;
+                next = self.as_ref(next).get_or_alloc_next(guard);
             }
 
-            // claim a range to copy
-            let copy_start = state.claim.fetch_add(copy_chunk, Ordering::AcqRel);
+            // the copy already completed
+            if self.try_promote(curr.state(), next, 0, guard) {
+                return next;
+            }
 
-            let mut copied = 0;
-            for i in 0..copy_chunk {
-                let i = copy_start + i;
+            // the true table capacity, we have to copy every entry including from the buffer
+            let capacity = self.table.len + probe_limit!(self.table.len);
+            let copy_chunk = capacity.min(1024);
 
-                if i >= capacity {
+            loop {
+                // every entry has already been claimed
+                if curr.state().claim.load(Ordering::Acquire) >= capacity {
                     break;
                 }
 
-                // copy each entry
-                self.copy_index(i, next_table);
-                copied += 1;
+                // claim a range to copy
+                let copy_start = curr.state().claim.fetch_add(copy_chunk, Ordering::AcqRel);
+
+                let mut copied = 0;
+                for i in 0..copy_chunk {
+                    let i = copy_start + i;
+
+                    if i >= capacity {
+                        break;
+                    }
+
+                    // if this table doesn't have space, we have to abort the copy and allocate a
+                    // new table
+                    if !self.copy_index(i, next) {
+                        // abort the copy
+                        curr.state()
+                            .status
+                            .store(ResizeState::ABORTED, Ordering::Release);
+                        let allocated = self.as_ref(next).get_or_alloc_next(guard);
+                        atomic_wait::wake_all(&curr.state().status);
+
+                        // retry in a new table
+                        curr = next;
+                        next = allocated;
+                        continue 'copy;
+                    }
+
+                    copied += 1;
+                }
+
+                // are we done?
+                if self.try_promote(curr.state(), next, copied, guard) {
+                    return next;
+                }
             }
 
-            // are we done?
-            if self.try_promote(next_table, copied, guard) {
-                return;
-            }
-        }
+            // we copied all that we can, wait for the table to be promoted
+            loop {
+                let status = curr.state().status.load(Ordering::Acquire);
 
-        // we copied all that we can, wait for the table to be promoted
-        while state.futex.load(Ordering::Acquire) == ResizeState::PENDING {
-            atomic_wait::wait(&state.futex, ResizeState::PENDING);
+                // if this copy was aborted, we have to retry in the new table
+                if status == ResizeState::ABORTED {
+                    continue 'copy;
+                }
+
+                // the copy is complete
+                if status == ResizeState::COMPLETE {
+                    return next;
+                }
+
+                atomic_wait::wait(&curr.state().status, ResizeState::PENDING);
+            }
         }
     }
 
     // Copy the entry at the given index to the new table.
-    fn copy_index(&self, i: usize, new_table: Table<K, V>) {
-        // mark the entry as copying
-        let entry = unsafe {
-            self.table
-                .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::AcqRel)
-        };
+    fn copy_index(&self, i: usize, new_table: Table<K, V>) -> bool {
+        let mut entry = unsafe { self.table.entry(i) }.load(Ordering::Acquire);
+
+        if entry.addr() & Entry::COPYING == 0 {
+            // mark the entry as copying
+            entry = unsafe {
+                self.table
+                    .entry(i)
+                    .fetch_or(Entry::COPYING, Ordering::AcqRel)
+            };
+        }
 
         // there is nothing to copy
-        if entry.is_null() {
+        if entry.mask(Entry::POINTER).is_null() {
             unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
-            return;
+            return true;
         } else if entry.addr() & Entry::TOMBSTONE != 0 {
-            return;
+            return true;
         }
 
         // otherwise, copy the value
         let entry = entry.mask(Entry::POINTER);
-        self.as_ref(new_table).insert_copy(entry);
+        self.as_ref(new_table).insert_copy(entry)
     }
 
     // Copy an entry into the table.
-    fn insert_copy<'guard>(&self, new_entry: *mut Entry<K, V>) {
+    fn insert_copy<'guard>(&self, new_entry: *mut Entry<K, V>) -> bool {
         let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
 
         let hash = self.hash(key);
@@ -636,22 +678,33 @@ where
                 let entry = unsafe { self.table.entry(i) };
 
                 // try to claim the entry
-                if entry
-                    .compare_exchange(
-                        ptr::null_mut(),
-                        new_entry,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    unsafe { self.table.meta(i).store(meta::h2(hash), Ordering::Release) };
-                    return;
+                match entry.compare_exchange(
+                    ptr::null_mut(),
+                    new_entry,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        unsafe { self.table.meta(i).store(meta::h2(hash), Ordering::Release) };
+                        return true;
+                    }
+                    Err(found) => {
+                        let found_ptr = found.mask(Entry::POINTER);
+                        assert!(!found_ptr.is_null());
+
+                        // ensure the meta table is updated to avoid breaking the probe chain
+                        unsafe {
+                            if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
+                                let hash = self.hash(&(*found_ptr).key);
+                                self.table.meta(i).store(meta::h2(hash), Ordering::Release);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        todo!("nested resize")
+        false
     }
 
     // Returns the hash of a key.
@@ -708,7 +761,7 @@ impl<'guard, K: 'guard, V: 'guard> Iterator for Iter<'guard, K, V> {
 impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     // Returns a reference to the next table if it has already been created.
     fn next_table_ref(&self) -> Option<HashMapRef<'root, K, V, S>> {
-        let state = self.table.resize_state();
+        let state = self.table.state();
         let next = state.next.load(Ordering::Acquire);
 
         if !next.is_null() {
@@ -722,7 +775,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     fn get_or_alloc_next(&self, guard: &Guard<'_>) -> Table<K, V> {
         const SPIN_ALLOC: usize = 7;
 
-        let state = self.table.resize_state();
+        let state = self.table.state();
         let next = state.next.load(Ordering::Acquire);
 
         // the next table is already allocated
@@ -763,7 +816,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         }
 
         // double the table's capacity
-        let next_capacity = self.table.len << 1;
+        let next_capacity = self.table.len / 2;
         let buffer = probe_limit!(next_capacity);
 
         if next_capacity > isize::MAX as usize {
@@ -781,8 +834,13 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     // Update the copy state and attempt to promote a copy to the root table.
     //
     // Returns true if the table was promoted.
-    fn try_promote(&self, next: Table<K, V>, copied: usize, guard: &Guard<'_>) -> bool {
-        let state = self.table.resize_state();
+    fn try_promote(
+        &self,
+        state: &ResizeState,
+        next: Table<K, V>,
+        copied: usize,
+        guard: &Guard<'_>,
+    ) -> bool {
         let capacity = self.table.len + probe_limit!(self.table.len);
 
         // update the count
@@ -813,8 +871,8 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 }
 
                 // wake up anyone waiting for the promotion
-                state.futex.store(ResizeState::COMPLETE, Ordering::Release);
-                atomic_wait::wake_all(&state.futex);
+                state.status.store(ResizeState::COMPLETE, Ordering::Release);
+                atomic_wait::wake_all(&state.status);
                 return true;
             }
         }
@@ -836,7 +894,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
 impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
         let table = unsafe { Table::<K, V>::from_raw(*self.table.get_mut()) };
-        assert!(table.resize_state().next.load(Ordering::Acquire).is_null());
+        assert!(table.state().next.load(Ordering::Acquire).is_null());
 
         // drop all the entries
         for i in 0..(table.len + probe_limit!(table.len)) {
