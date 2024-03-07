@@ -97,7 +97,7 @@ impl Collector {
 
     // Load an atomic pointer
     #[inline]
-    pub fn protect<T>(&self, ptr: &AtomicPtr<T>, ordering: Ordering) -> *mut T {
+    pub fn protect<T>(&self, ptr: &AtomicPtr<T>, _ordering: Ordering) -> *mut T {
         if self.epoch_frequency.is_none() {
             // epoch tracking is disabled, but pointer loads still need to be seqcst to participate
             // in the total order. see `enter` for details

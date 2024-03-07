@@ -138,12 +138,10 @@ impl Collector {
     /// See [the guide](crate#allocating-objects) for details.
     pub fn link(&self) -> Link {
         Link {
-            node: unsafe {
-                UnsafeCell::new(
-                    self.raw
-                        .node(&*self.raw.reservations.get_or(Default::default)),
-                )
-            },
+            node: UnsafeCell::new(
+                self.raw
+                    .node(&*self.raw.reservations.get_or(Default::default)),
+            ),
         }
     }
 

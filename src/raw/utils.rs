@@ -1,12 +1,5 @@
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-// fast log2 on a power of two
-macro_rules! log2 {
-    ($x:expr) => {
-        (usize::BITS as usize) - ($x.leading_zeros() as usize) - 1
-    };
-}
-
 // Polyfill for the unstable strict-provenance APIs.
 pub unsafe trait StrictProvenance: Sized {
     fn addr(self) -> usize;
@@ -53,17 +46,15 @@ impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
         {
             // mark the entry as copied
             unsafe { &*(self as *const AtomicPtr<T> as *const AtomicUsize) }
-                .fetch_or(value, Ordering::Release) as *mut T
+                .fetch_or(value, ordering) as *mut T
         }
 
         #[cfg(miri)]
         {
-            self.fetch_update(Ordering::Release, Ordering::Relaxed, |ptr| {
+            self.fetch_update(ordering, Ordering::Acquire, |ptr| {
                 Some(ptr.map_addr(|addr| addr | value))
             })
             .unwrap()
         }
     }
 }
-
-pub(crate) use log2;

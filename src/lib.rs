@@ -1,14 +1,14 @@
-#![allow(dead_code, unused, unstable_name_collisions)]
+#![allow(unstable_name_collisions)]
 
 mod map;
 mod raw;
 mod seize;
 
-pub use map::{HashMap, ResizeBehavior};
+pub use map::HashMap;
 
 #[test]
 fn bench() {
-    let mut map = HashMap::new();
+    let map = HashMap::new();
     for i in 0..1000 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
@@ -21,8 +21,7 @@ fn bench() {
 
 #[test]
 fn basic() {
-    let mut map = HashMap::new();
-    map.resize_behavior(ResizeBehavior::Incremental(0.01));
+    let map = HashMap::new();
 
     assert!(map.pin().get(&100).is_none());
     map.pin().insert(100, 101);
@@ -75,18 +74,19 @@ fn basic() {
     for i in 0..256 {
         assert_eq!(map.pin().get(&i), Some(&(i + 1)));
     }
+
+    dbg!(map.pin().capacity());
 }
 
 #[test]
 fn stress() {
-    let mut map = HashMap::new();
-    map.resize_behavior(ResizeBehavior::Incremental(0.01));
+    let map = HashMap::<usize, usize>::new();
 
     std::thread::scope(|s| {
         for t in 0..16 {
             let map = &map;
             s.spawn(move || {
-                let (start, end) = ((1 << 14) * t, (1 << 14) * (t + 1));
+                let (start, end) = ((1 << 8) * t, (1 << 8) * (t + 1));
 
                 for i in start..end {
                     assert_eq!(map.pin().insert(i, i + 1), None);
