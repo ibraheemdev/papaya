@@ -197,7 +197,7 @@ impl Collector {
 
         // safety: asserted by T: AsLink
         let link = ptr.cast::<Link>();
-        let node = UnsafeCell::raw_get(ptr::addr_of_mut!((*link).node));
+        let node = unsafe { UnsafeCell::raw_get(ptr::addr_of_mut!((*link).node)) };
 
         // safety: `ptr` is guaranteed to be a valid pointer
         //

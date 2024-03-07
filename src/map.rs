@@ -45,12 +45,12 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 }
 
-pub struct Pinned<'a, K, V, S> {
-    guard: Guard<'a>,
-    raw: &'a raw::HashMap<K, V, S>,
+pub struct Pinned<'table, K, V, S> {
+    guard: Guard<'table>,
+    raw: &'table raw::HashMap<K, V, S>,
 }
 
-impl<'a, K, V, S> Pinned<'a, K, V, S>
+impl<'table, K, V, S> Pinned<'table, K, V, S>
 where
     K: Clone + Hash + Eq + Sync + Send,
     V: Sync + Send,
@@ -60,7 +60,13 @@ where
         self.raw.capacity(&self.guard)
     }
 
-    pub fn get<Q>(&'a self, key: &Q) -> Option<&'a V>
+    pub fn iter(&self) -> Iter<'_, K, V> {
+        Iter {
+            raw: self.raw.root(&self.guard).iter(&self.guard),
+        }
+    }
+
+    pub fn get<'g, Q>(&'g self, key: &Q) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -68,23 +74,35 @@ where
         self.raw.root(&self.guard).get(key, &self.guard)
     }
 
-    pub fn insert(&'a self, key: K, value: V) -> Option<&'a V> {
+    pub fn insert(&self, key: K, value: V) -> Option<&V> {
         self.raw.root(&self.guard).insert(key, value, &self.guard)
     }
 
-    pub fn update<F>(&'a self, key: K, f: F) -> Option<&'a V>
+    pub fn update<F>(&self, key: K, f: F) -> Option<&V>
     where
         F: Fn(&V) -> V,
     {
         self.raw.root(&self.guard).update(key, f, &self.guard)
     }
 
-    pub fn remove<Q: ?Sized>(&'a self, key: &Q) -> Option<&'a V>
+    pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
         self.raw.root(&self.guard).remove(key, &self.guard)
+    }
+}
+
+pub struct Iter<'guard, K, V> {
+    raw: raw::Iter<'guard, K, V>,
+}
+
+impl<'guard, K: 'guard, V: 'guard> Iterator for Iter<'guard, K, V> {
+    type Item = (&'guard K, &'guard V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next()
     }
 }
 

@@ -175,6 +175,16 @@ where
         None
     }
 
+    // Returns an iterator over the keys and values of this table.
+    pub fn iter<'guard>(&self, guard: &'guard Guard<'_>) -> Iter<'guard, K, V> {
+        Iter {
+            i: 0,
+            table: self.table,
+            capacity: self.table.len + probe_limit!(self.table.len),
+            _guard: guard,
+        }
+    }
+
     // Inserts a key-value pair into the map.
     pub fn insert<'guard>(&self, key: K, value: V, guard: &'guard Guard<'_>) -> Option<&'guard V> {
         let entry = Box::into_raw(Box::new(Entry {
@@ -653,6 +663,45 @@ where
         let mut h = self.build_hasher.build_hasher();
         key.hash(&mut h);
         h.finish()
+    }
+}
+
+// An iterator over the keys and values of this table.
+pub struct Iter<'guard, K, V> {
+    table: Table<K, V>,
+    capacity: usize,
+    _guard: &'guard Guard<'guard>,
+    i: usize,
+}
+
+impl<'guard, K: 'guard, V: 'guard> Iterator for Iter<'guard, K, V> {
+    type Item = (&'guard K, &'guard V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.i >= self.capacity {
+                return None;
+            }
+
+            let meta = unsafe { self.table.meta(self.i) }.load(Ordering::Acquire);
+
+            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
+                self.i += 1;
+                continue;
+            }
+
+            let entry = unsafe { self.table.entry(self.i) }.load(Ordering::Acquire);
+
+            if entry.addr() & Entry::TOMBSTONE != 0 {
+                self.i += 1;
+                continue;
+            }
+
+            let entry = unsafe { &*entry.mask(Entry::POINTER) };
+            let value = unsafe { entry.value.assume_init_ref() };
+            self.i += 1;
+            return Some((&entry.key, value));
+        }
     }
 }
 
