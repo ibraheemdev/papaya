@@ -17,6 +17,11 @@ fn bench() {
     for i in 0..1000 {
         assert_eq!(y.get(&i), Some(&(i + 1)));
     }
+
+    let v: Vec<_> = (0..1000).map(|i| (i, i + 1)).collect();
+    let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
+    got.sort();
+    assert_eq!(v, got);
 }
 
 #[test]
@@ -81,12 +86,13 @@ fn basic() {
 #[test]
 fn stress() {
     let map = HashMap::<usize, usize>::new();
+    let chunk = 1 << 8;
 
     std::thread::scope(|s| {
         for t in 0..16 {
             let map = &map;
             s.spawn(move || {
-                let (start, end) = ((1 << 8) * t, (1 << 8) * (t + 1));
+                let (start, end) = (chunk * t, chunk * (t + 1));
 
                 for i in start..end {
                     assert_eq!(map.pin().insert(i, i + 1), None);
@@ -111,7 +117,17 @@ fn stress() {
                 for i in start..end {
                     assert_eq!(map.pin().get(&i), Some(&(i + 1)));
                 }
+
+                for (&k, &v) in map.pin().iter() {
+                    assert!(k < chunk * 16);
+                    assert_eq!(v, k + 1);
+                }
             });
         }
     });
+
+    let v: Vec<_> = (0..chunk * 16).map(|i| (i, i + 1)).collect();
+    let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
+    got.sort();
+    assert_eq!(v, got);
 }

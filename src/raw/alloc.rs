@@ -15,6 +15,7 @@ pub struct RawTable(u8);
 unsafe impl seize::AsLink for RawTable {}
 
 #[repr(align(16))]
+#[allow(unused)]
 struct AtomicU128(u128);
 
 // The table allocation's layout
@@ -124,6 +125,7 @@ impl<T> Table<T> {
     }
 
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
+        assert!(i < self.capacity);
         &*self
             .raw
             .add(mem::size_of::<TableLayout>())

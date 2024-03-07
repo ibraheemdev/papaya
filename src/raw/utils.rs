@@ -5,9 +5,7 @@ pub unsafe trait StrictProvenance: Sized {
     fn addr(self) -> usize;
     fn with_addr(self, addr: usize) -> Self;
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
-    fn set(self, mask: usize) -> Self;
     fn mask(self, mask: usize) -> Self;
-    fn unmask(self, mask: usize) -> usize;
 }
 
 unsafe impl<T> StrictProvenance for *mut T {
@@ -25,14 +23,6 @@ unsafe impl<T> StrictProvenance for *mut T {
 
     fn mask(self, mask: usize) -> Self {
         self.map_addr(|addr| addr & mask)
-    }
-
-    fn set(self, mask: usize) -> Self {
-        self.map_addr(|addr| addr | mask)
-    }
-
-    fn unmask(self, mask: usize) -> usize {
-        self.addr() & !mask
     }
 }
 
