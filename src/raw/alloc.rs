@@ -35,12 +35,13 @@ pub struct ResizeState {
     pub allocating: Mutex<()>,
     pub copied: AtomicUsize,
     pub claim: AtomicUsize,
-    pub futex: AtomicU32,
+    pub status: AtomicU32,
 }
 
 impl ResizeState {
     pub const PENDING: u32 = 0;
-    pub const COMPLETE: u32 = 1;
+    pub const ABORTED: u32 = 1;
+    pub const COMPLETE: u32 = 2;
 }
 
 // Manages a table allocation.
@@ -142,7 +143,7 @@ impl<T> Table<T> {
         &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
-    pub fn resize_state(&self) -> &ResizeState {
+    pub fn state(&self) -> &ResizeState {
         unsafe { &(*self.raw.cast::<TableLayout>()).resize_state }
     }
 

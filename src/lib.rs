@@ -9,16 +9,24 @@ pub use map::HashMap;
 #[test]
 fn bench() {
     let map = HashMap::new();
-    for i in 0..1000 {
+    for i in 0..2000 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
 
     let y = map.pin();
-    for i in 0..1000 {
+    for i in 0..2000 {
         assert_eq!(y.get(&i), Some(&(i + 1)));
     }
+}
 
-    let v: Vec<_> = (0..1000).map(|i| (i, i + 1)).collect();
+#[test]
+fn iter() {
+    let map = HashMap::new();
+    for i in 0..10_000 {
+        assert_eq!(map.pin().insert(i, i + 1), None);
+    }
+
+    let v: Vec<_> = (0..10_000).map(|i| (i, i + 1)).collect();
     let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
     got.sort();
     assert_eq!(v, got);
@@ -86,11 +94,12 @@ fn basic() {
 #[test]
 fn stress() {
     let map = HashMap::<usize, usize>::new();
-    let chunk = 1 << 8;
+    let chunk = 1 << 14;
 
     std::thread::scope(|s| {
         for t in 0..16 {
             let map = &map;
+
             s.spawn(move || {
                 let (start, end) = (chunk * t, chunk * (t + 1));
 
