@@ -816,7 +816,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         }
 
         // double the table's capacity
-        let next_capacity = self.table.len / 2;
+        let next_capacity = self.table.len << 1;
         let buffer = probe_limit!(next_capacity);
 
         if next_capacity > isize::MAX as usize {
