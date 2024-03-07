@@ -43,10 +43,6 @@ impl<K, V, S> HashMap<K, V, S> {
             raw: &self.raw,
         }
     }
-
-    pub fn resize_behavior(&mut self, resize_behavior: ResizeBehavior) {
-        self.raw.resize_behavior = resize_behavior;
-    }
 }
 
 pub struct Pinned<'a, K, V, S> {
@@ -63,6 +59,7 @@ where
     pub fn capacity(&self) -> usize {
         self.raw.capacity(&self.guard)
     }
+
     pub fn get<Q>(&'a self, key: &Q) -> Option<&'a V>
     where
         K: Borrow<Q>,
@@ -89,12 +86,6 @@ where
     {
         self.raw.root(&self.guard).remove(key, &self.guard)
     }
-}
-
-#[derive(Clone)]
-pub enum ResizeBehavior {
-    Incremental(f32),
-    Blocking,
 }
 
 #[derive(Debug, PartialEq, Eq)]

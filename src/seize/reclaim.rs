@@ -18,7 +18,7 @@ use super::Link;
 /// passing this function to [`retire`](crate::Collector::retire):
 /// the link passed must have been created from a **valid**
 /// `Linked<T>`.
-pub unsafe fn boxed<T>(mut link: *mut Link) {
+pub unsafe fn boxed<T>(link: *mut Link) {
     unsafe {
         let _ = Box::from_raw(link.cast::<T>());
     }
@@ -34,7 +34,7 @@ pub unsafe fn boxed<T>(mut link: *mut Link) {
 /// passing this function to [`retire`](crate::Collector::retire):
 /// the link passed must have been created from a **valid**
 /// `Linked<T>`.
-pub unsafe fn in_place<T>(mut link: *mut Link) {
+pub unsafe fn in_place<T>(link: *mut Link) {
     unsafe {
         ptr::drop_in_place(link.cast::<T>());
     }

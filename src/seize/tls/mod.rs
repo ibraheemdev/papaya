@@ -97,7 +97,7 @@ where
             let entry = &*bucket_ptr.add(thread.index);
 
             // read without atomic operations as only this thread can set the value.
-            if (&entry.present as *const _ as *const bool).read() {
+            if entry.present.load(Ordering::Relaxed) {
                 (*entry.value.get()).assume_init_ref()
             } else {
                 // insert the new element into the bucket
@@ -168,7 +168,9 @@ where
                 continue;
             }
 
-            unsafe { Box::from_raw(std::slice::from_raw_parts_mut(bucket_ptr, this_bucket_size)) };
+            let _ = unsafe {
+                Box::from_raw(std::slice::from_raw_parts_mut(bucket_ptr, this_bucket_size))
+            };
         }
     }
 }

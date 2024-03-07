@@ -1,9 +1,9 @@
+use std::alloc;
 use std::alloc::Layout;
 use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
+use std::mem::{self};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
-use std::{alloc, ptr, slice};
 
 use crate::seize;
 
@@ -18,6 +18,7 @@ unsafe impl seize::AsLink for RawTable {}
 struct AtomicU128(u128);
 
 // The table allocation's layout
+#[allow(unused)]
 struct TableLayout {
     link: seize::Link,
     len: usize,
@@ -162,7 +163,7 @@ fn layout() {
         let collector = seize::Collector::new();
         let link = collector.link();
         let table: Table<u8> = Table::new(30, 31, link);
-        let mut table: Table<u8> = Table::from_raw(table.raw);
+        let table: Table<u8> = Table::from_raw(table.raw);
         assert_eq!(table.len, 30);
         assert_eq!(table.capacity, 48);
         Table::dealloc(table);
