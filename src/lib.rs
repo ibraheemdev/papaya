@@ -87,8 +87,6 @@ fn basic() {
     for i in 0..256 {
         assert_eq!(map.pin().get(&i), Some(&(i + 1)));
     }
-
-    dbg!(map.pin().capacity());
 }
 
 #[test]

@@ -14,9 +14,9 @@ use crate::seize::{self, AsLink, Collector, Guard, Link};
 
 // A lock-free hash-map.
 pub struct HashMap<K, V, S> {
-    collector: Collector,
+    pub collector: Collector,
     table: AtomicPtr<RawTable>,
-    build_hasher: S,
+    hash_builder: S,
     _kv: PhantomData<(K, V)>,
 }
 
@@ -69,38 +69,39 @@ macro_rules! probe_limit {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-    // Creates an empty table.
-    pub fn new(build_hasher: S) -> HashMap<K, V, S> {
+    // Creates a table with the given capacity and hasher.
+    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
         let collector = Collector::new().epoch_frequency(None);
 
-        HashMap {
-            collector,
-            build_hasher,
-            table: AtomicPtr::new(ptr::null_mut()),
-            _kv: PhantomData,
+        // the table is lazily allocated
+        if capacity == 0 {
+            return HashMap {
+                collector,
+                hash_builder,
+                table: AtomicPtr::new(ptr::null_mut()),
+                _kv: PhantomData,
+            };
         }
-    }
 
-    // Creates a table with the given capacity and hasher.
-    pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> HashMap<K, V, S> {
-        // allocate buffer capacity the same length as the probe limit. this allows us
-        // to avoid overflow checks
-        let capacity = capacity.next_power_of_two();
+        // round the capacity to the next power of two based on an estimated load factor
+        // to hold `capacity` elements
+        let capacity = (capacity + (capacity >> 1) + 1).next_power_of_two();
+
+        // allocate buffer capacity the same length as the probe limit. this allows us to avoid overflow checks
         let buffer = probe_limit!(capacity);
 
-        let collector = Collector::new().epoch_frequency(None);
         let table = Table::<K, V>::new(capacity, capacity + buffer, collector.link());
 
         HashMap {
             collector,
-            build_hasher,
+            hash_builder,
             table: AtomicPtr::new(table.raw),
             _kv: PhantomData,
         }
     }
 
     // Returns the capacity of the table.
-    pub fn capacity<'guard>(&self, guard: &'guard Guard<'_>) -> usize {
+    pub fn capacity<'g>(&self, guard: &'g Guard<'_>) -> usize {
         self.root(guard).table.len
     }
 
@@ -110,7 +111,14 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     // Returns a reference to the root hash table.
-    pub fn root<'guard>(&self, guard: &'guard Guard<'_>) -> HashMapRef<'_, K, V, S> {
+    pub fn root<'g>(&self, guard: &'g Guard<'_>) -> HashMapRef<'_, K, V, S> {
+        if let Some(c) = guard.collector() {
+            assert!(
+                Collector::ptr_eq(c, &self.collector),
+                "accessed map with incorrect guard"
+            )
+        }
+
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
         self.as_ref(table)
@@ -122,7 +130,7 @@ impl<K, V, S> HashMap<K, V, S> {
             table,
             root: &self.table,
             collector: &self.collector,
-            build_hasher: &self.build_hasher,
+            hash_builder: &self.hash_builder,
         }
     }
 }
@@ -132,17 +140,28 @@ pub struct HashMapRef<'a, K, V, S> {
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
     collector: &'a Collector,
-    build_hasher: &'a S,
+    hash_builder: &'a S,
+}
+
+impl<K, V, S> HashMapRef<'_, K, V, S> {
+    // Returns an iterator over the keys and values of this table.
+    pub fn iter<'g>(&self, guard: &'g Guard<'_>) -> Iter<'g, K, V> {
+        Iter {
+            i: 0,
+            table: self.table,
+            capacity: self.table.len + probe_limit!(self.table.len),
+            _guard: guard,
+        }
+    }
 }
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
-    K: Clone + Sync + Send + Hash + Eq,
-    V: Sync + Send,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     // Returns a reference to the value corresponding to the key.
-    pub fn get<'guard, Q>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    pub fn get_entry<'g, Q>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -180,10 +199,12 @@ where
                 }
 
                 let entry_ptr = entry.mask(Entry::POINTER);
+                let entry_key = unsafe { &(*entry_ptr).key };
 
                 // check for a full match
-                if unsafe { (*entry_ptr).key.borrow() } == key {
-                    unsafe { return Some((*entry_ptr).value.assume_init_ref()) }
+                if entry_key.borrow() == key {
+                    let value = unsafe { (*entry_ptr).value.assume_init_ref() };
+                    return Some((entry_key, value));
                 }
             }
         }
@@ -191,23 +212,26 @@ where
         None
     }
 
-    // Returns an iterator over the keys and values of this table.
-    pub fn iter<'guard>(&self, guard: &'guard Guard<'_>) -> Iter<'guard, K, V> {
-        Iter {
-            i: 0,
-            table: self.table,
-            capacity: self.table.len + probe_limit!(self.table.len),
-            _guard: guard,
-        }
+    // Returns the hash of a key.
+    #[inline]
+    fn hash<Q>(&self, key: &Q) -> u64
+    where
+        Q: Hash + ?Sized,
+    {
+        let mut h = self.hash_builder.build_hasher();
+        key.hash(&mut h);
+        h.finish()
     }
+}
 
+impl<K, V, S> HashMapRef<'_, K, V, S>
+where
+    K: Clone + Sync + Send + Hash + Eq,
+    V: Sync + Send,
+    S: BuildHasher,
+{
     // Inserts a key-value pair into the map.
-    pub fn insert<'guard>(
-        &mut self,
-        key: K,
-        value: V,
-        guard: &'guard Guard<'_>,
-    ) -> Option<&'guard V> {
+    pub fn insert<'g>(&mut self, key: K, value: V, guard: &'g Guard<'_>) -> Option<&'g V> {
         let entry = Box::into_raw(Box::new(Entry {
             key,
             value: MaybeUninit::new(value),
@@ -221,11 +245,11 @@ where
     }
 
     // Inserts an entry into the map.
-    fn insert_entry<'guard>(
+    fn insert_entry<'g>(
         &mut self,
         new_entry: *mut Entry<K, V>,
-        guard: &'guard Guard<'_>,
-    ) -> EntryStatus<&'guard V> {
+        guard: &'g Guard<'_>,
+    ) -> EntryStatus<&'g V> {
         if self.table.raw.is_null() {
             self.init(guard);
         }
@@ -327,13 +351,13 @@ where
     // Replaces the value of an existing entry, returning the previous value if successful.
     //
     // Inserts into the new table if the entry is being copied.
-    fn replace_entry<'guard>(
+    fn replace_entry<'g>(
         &self,
         i: usize,
         mut entry: *mut Entry<K, V>,
         new_entry: *mut Entry<K, V>,
-        guard: &'guard Guard<'_>,
-    ) -> Result<EntryStatus<&'guard V>, ()> {
+        guard: &'g Guard<'_>,
+    ) -> Result<EntryStatus<&'g V>, ()> {
         loop {
             // the entry is being copied to a new table, we have to finish the resize before we insert
             if entry.addr() & Entry::COPYING != 0 {
@@ -369,7 +393,7 @@ where
     }
 
     // Update an entry with a remapping function.
-    pub fn update<'guard, F>(&self, key: K, f: F, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    pub fn update<'g, F>(&self, key: K, f: F, guard: &'g Guard<'_>) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
     {
@@ -387,12 +411,12 @@ where
     }
 
     // Update an entry with a remapping function.
-    pub fn update_with<'guard, F>(
+    pub fn update_with<'g, F>(
         &self,
         update: *mut Entry<K, V>,
         f: F,
-        guard: &'guard Guard<'_>,
-    ) -> Option<&'guard V>
+        guard: &'g Guard<'_>,
+    ) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
     {
@@ -485,7 +509,7 @@ where
     }
 
     // Removes a key from the map, returning the value at the key if the key was previously in the map.
-    pub fn remove<'guard, Q: ?Sized>(&self, key: &Q, guard: &'guard Guard<'_>) -> Option<&'guard V>
+    pub fn remove<'g, Q: ?Sized>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -581,7 +605,7 @@ where
     }
 
     // Allocate the inital table.
-    fn init<'guard>(&mut self, guard: &'guard Guard<'_>) {
+    fn init<'g>(&mut self, guard: &'g Guard<'_>) {
         const CAPACITY: usize = 32;
         const BUFFER: usize = probe_limit!(CAPACITY);
 
@@ -716,7 +740,7 @@ where
     }
 
     // Copy an entry into the table.
-    fn insert_copy<'guard>(&self, new_entry: *mut Entry<K, V>) -> bool {
+    fn insert_copy<'g>(&self, new_entry: *mut Entry<K, V>) -> bool {
         let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
 
         let hash = self.hash(key);
@@ -760,29 +784,29 @@ where
 
         false
     }
-
-    // Returns the hash of a key.
-    #[inline]
-    fn hash<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        let mut h = self.build_hasher.build_hasher();
-        key.hash(&mut h);
-        h.finish()
-    }
 }
 
 // An iterator over the keys and values of this table.
-pub struct Iter<'guard, K, V> {
-    table: Table<K, V>,
-    capacity: usize,
-    _guard: &'guard Guard<'guard>,
+pub struct Iter<'g, K, V> {
     i: usize,
+    capacity: usize,
+    table: Table<K, V>,
+    _guard: &'g Guard<'g>,
 }
 
-impl<'guard, K: 'guard, V: 'guard> Iterator for Iter<'guard, K, V> {
-    type Item = (&'guard K, &'guard V);
+impl<'g, K, V> Clone for Iter<'g, K, V> {
+    fn clone(&self) -> Self {
+        Iter {
+            table: self.table,
+            capacity: self.capacity,
+            _guard: self._guard,
+            i: self.i,
+        }
+    }
+}
+
+impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
+    type Item = (&'g K, &'g V);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.table.raw.is_null() {
@@ -944,7 +968,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
             table,
             root: self.root,
             collector: self.collector,
-            build_hasher: self.build_hasher,
+            hash_builder: self.hash_builder,
         }
     }
 }
