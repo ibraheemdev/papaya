@@ -69,6 +69,18 @@ macro_rules! probe_limit {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
+    // Creates an empty table.
+    pub fn new(build_hasher: S) -> HashMap<K, V, S> {
+        let collector = Collector::new().epoch_frequency(None);
+
+        HashMap {
+            collector,
+            build_hasher,
+            table: AtomicPtr::new(ptr::null_mut()),
+            _kv: PhantomData,
+        }
+    }
+
     // Creates a table with the given capacity and hasher.
     pub fn with_capacity_and_hasher(capacity: usize, build_hasher: S) -> HashMap<K, V, S> {
         // allocate buffer capacity the same length as the probe limit. this allows us
@@ -77,7 +89,7 @@ impl<K, V, S> HashMap<K, V, S> {
         let buffer = probe_limit!(capacity);
 
         let collector = Collector::new().epoch_frequency(None);
-        let table = alloc::Table::<Entry<K, V>>::new(capacity, capacity + buffer, collector.link());
+        let table = Table::<K, V>::new(capacity, capacity + buffer, collector.link());
 
         HashMap {
             collector,
@@ -135,6 +147,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        if self.table.raw.is_null() {
+            return None;
+        }
+
         let hash = self.hash(key);
         let h2 = meta::h2(hash);
 
@@ -186,7 +202,12 @@ where
     }
 
     // Inserts a key-value pair into the map.
-    pub fn insert<'guard>(&self, key: K, value: V, guard: &'guard Guard<'_>) -> Option<&'guard V> {
+    pub fn insert<'guard>(
+        &mut self,
+        key: K,
+        value: V,
+        guard: &'guard Guard<'_>,
+    ) -> Option<&'guard V> {
         let entry = Box::into_raw(Box::new(Entry {
             key,
             value: MaybeUninit::new(value),
@@ -201,10 +222,14 @@ where
 
     // Inserts an entry into the map.
     fn insert_entry<'guard>(
-        &self,
+        &mut self,
         new_entry: *mut Entry<K, V>,
         guard: &'guard Guard<'_>,
     ) -> EntryStatus<&'guard V> {
+        if self.table.raw.is_null() {
+            self.init(guard);
+        }
+
         let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
 
         let hash = self.hash(key);
@@ -348,6 +373,10 @@ where
     where
         F: Fn(&V) -> V,
     {
+        if self.table.raw.is_null() {
+            return None;
+        }
+
         let update: *mut Entry<K, V> = Box::into_raw(Box::new(Entry {
             key,
             link: guard.link(),
@@ -461,6 +490,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq,
     {
+        if self.table.raw.is_null() {
+            return None;
+        }
+
         let hash = self.hash(key);
         let h2 = meta::h2(hash);
 
@@ -545,6 +578,27 @@ where
         }
 
         return None;
+    }
+
+    // Allocate the inital table.
+    fn init<'guard>(&mut self, guard: &'guard Guard<'_>) {
+        const CAPACITY: usize = 32;
+        const BUFFER: usize = probe_limit!(CAPACITY);
+
+        let table = Table::<K, V>::new(CAPACITY, CAPACITY + BUFFER, guard.link());
+        match self.root.compare_exchange(
+            ptr::null_mut(),
+            table.raw,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => self.table = table,
+            // someone us allocated before us, deallocate our table
+            Err(found) => {
+                unsafe { Table::dealloc(table) }
+                self.table = unsafe { Table::from_raw(found) };
+            }
+        }
     }
 
     // Help along the resize operation until it completes.
@@ -731,6 +785,10 @@ impl<'guard, K: 'guard, V: 'guard> Iterator for Iter<'guard, K, V> {
     type Item = (&'guard K, &'guard V);
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.table.raw.is_null() {
+            return None;
+        }
+
         loop {
             if self.i >= self.capacity {
                 return None;
@@ -893,7 +951,12 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
 
 impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
-        let table = unsafe { Table::<K, V>::from_raw(*self.table.get_mut()) };
+        let table = *self.table.get_mut();
+        if table.is_null() {
+            return;
+        }
+
+        let table = unsafe { Table::<K, V>::from_raw(table) };
         assert!(table.state().next.load(Ordering::Acquire).is_null());
 
         // drop all the entries

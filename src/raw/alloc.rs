@@ -115,6 +115,15 @@ impl<T> Table<T> {
     }
 
     pub unsafe fn from_raw(raw: *mut RawTable) -> Table<T> {
+        if raw.is_null() {
+            return Table {
+                raw,
+                len: 0,
+                capacity: 0,
+                _t: PhantomData,
+            };
+        }
+
         let layout = unsafe { &*raw.cast::<TableLayout>() };
 
         Table {
