@@ -5,9 +5,11 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash};
 
-/// A lock-free hash table.
+/// A concurrent hash table.
 ///
-/// For more information, see the [crate-level documentation](crate);
+/// Most hash table operations require a [`Guard`](crate::Guard), which can be acquired through
+/// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level
+/// documentation](crate) for more details.
 pub struct HashMap<K, V, S = RandomState> {
     pub raw: raw::HashMap<K, V, S>,
 }
@@ -19,8 +21,21 @@ impl<K, V> Default for HashMap<K, V> {
 }
 
 impl<K, V> HashMap<K, V> {
+    /// Creates an empty `HashMap`.
+    ///
+    /// The hash map is initally crated with a capacity of 0, so it will not allocate until it is
+    /// first inserted into.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    /// let map: HashMap<&str, i32> = HashMap::new();
+    /// ```
     pub fn new() -> HashMap<K, V> {
-        HashMap::with_capacity(32)
+        HashMap {
+            raw: raw::HashMap::new(RandomState::new()),
+        }
     }
 
     pub fn with_capacity(capacity: usize) -> HashMap<K, V> {
