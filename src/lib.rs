@@ -2,7 +2,6 @@
 
 mod map;
 mod raw;
-mod seize;
 
 pub use map::HashMap;
 

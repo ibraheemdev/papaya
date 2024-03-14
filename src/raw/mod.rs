@@ -10,7 +10,8 @@ use std::{hint, ptr};
 
 use self::alloc::{RawTable, ResizeState};
 use self::utils::{AtomicPtrFetchOps, StrictProvenance};
-use crate::seize::{self, AsLink, Collector, Guard, Link};
+
+use seize::{AsLink, Collector, Guard, Link};
 
 // A lock-free hash-map.
 pub struct HashMap<K, V, S> {
@@ -235,7 +236,7 @@ where
         let entry = Box::into_raw(Box::new(Entry {
             key,
             value: MaybeUninit::new(value),
-            link: guard.link(),
+            link: self.collector.link(),
         }));
 
         match self.insert_entry(entry, guard) {
@@ -251,7 +252,7 @@ where
         guard: &'g Guard<'_>,
     ) -> EntryStatus<&'g V> {
         if self.table.raw.is_null() {
-            self.init(guard);
+            self.init();
         }
 
         let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
@@ -343,7 +344,7 @@ where
         }
 
         // went over the max probe count or found a copied entry: trigger a resize.
-        self.get_or_alloc_next(guard);
+        self.get_or_alloc_next();
         let next_table = self.help_copy(guard);
         self.as_ref(next_table).insert_entry(new_entry, guard)
     }
@@ -375,7 +376,7 @@ where
                     let entry_ptr = entry.mask(Entry::POINTER);
 
                     // retire the old value
-                    guard.retire(entry_ptr, Entry::retire::<K, V>);
+                    guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
                     return Ok(EntryStatus::Value((*entry_ptr).value.assume_init_ref()));
                 },
 
@@ -403,7 +404,7 @@ where
 
         let update: *mut Entry<K, V> = Box::into_raw(Box::new(Entry {
             key,
-            link: guard.link(),
+            link: self.collector.link(),
             value: MaybeUninit::uninit(),
         }));
 
@@ -477,7 +478,7 @@ where
                                 let entry_ptr = entry.mask(Entry::POINTER);
 
                                 // retire the old entry
-                                guard.retire(entry_ptr, Entry::retire::<K, V>);
+                                guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
                                 return Some((*entry_ptr).value.assume_init_ref());
                             },
 
@@ -570,7 +571,7 @@ where
 
                                 // retire the old value
                                 let entry = entry.mask(Entry::POINTER);
-                                guard.retire(entry_ptr, Entry::retire::<K, V>);
+                                guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
                                 return Some((*entry).value.assume_init_ref());
                             },
@@ -605,11 +606,11 @@ where
     }
 
     // Allocate the inital table.
-    fn init<'g>(&mut self, guard: &'g Guard<'_>) {
+    fn init<'g>(&mut self) {
         const CAPACITY: usize = 32;
         const BUFFER: usize = probe_limit!(CAPACITY);
 
-        let table = Table::<K, V>::new(CAPACITY, CAPACITY + BUFFER, guard.link());
+        let table = Table::<K, V>::new(CAPACITY, CAPACITY + BUFFER, self.collector.link());
         match self.root.compare_exchange(
             ptr::null_mut(),
             table.raw,
@@ -640,7 +641,7 @@ where
             // make sure we are at the correct table
             while curr.state().status.load(Ordering::Acquire) == ResizeState::ABORTED {
                 curr = next;
-                next = self.as_ref(next).get_or_alloc_next(guard);
+                next = self.as_ref(next).get_or_alloc_next();
             }
 
             // the copy already completed
@@ -676,7 +677,7 @@ where
                         curr.state()
                             .status
                             .store(ResizeState::ABORTED, Ordering::Release);
-                        let allocated = self.as_ref(next).get_or_alloc_next(guard);
+                        let allocated = self.as_ref(next).get_or_alloc_next();
                         atomic_wait::wake_all(&curr.state().status);
 
                         // retry in a new table
@@ -854,7 +855,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     }
 
     // Returns the next table, allocating it has not already been created.
-    fn get_or_alloc_next(&self, guard: &Guard<'_>) -> Table<K, V> {
+    fn get_or_alloc_next(&self) -> Table<K, V> {
         const SPIN_ALLOC: usize = 7;
 
         let state = self.table.state();
@@ -906,7 +907,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         }
 
         // allocate the new table
-        let next = Table::new(next_capacity, next_capacity + buffer, guard.link());
+        let next = Table::new(next_capacity, next_capacity + buffer, self.collector.link());
         state.next.store(next.raw, Ordering::Release);
         drop(_allocating);
 
@@ -943,7 +944,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 ) {
                     Ok(_) => unsafe {
                         // retire the old table. not we don't drop any entries because everything was copied
-                        guard.retire(self.table.raw, |link| {
+                        guard.defer_retire(self.table.raw, |link| {
                             let raw: *mut RawTable = link.cast();
                             let table: Table<K, V> = Table::from_raw(raw);
                             Table::dealloc(table);
@@ -993,7 +994,7 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
                 continue;
             }
 
-            unsafe { seize::Guard::unprotected().retire(entry_ptr, Entry::retire::<K, V>) }
+            unsafe { self.collector.retire(entry_ptr, Entry::retire::<K, V>) }
         }
 
         // deallocate the table

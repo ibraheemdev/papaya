@@ -5,9 +5,7 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
-num_cpus = "1.13.1"
-once_cell = "1.16.0"
-tracing = { version = "0.1.35", optional = true }
+seize = "0.3.1"
 
 [dev-dependencies]
 

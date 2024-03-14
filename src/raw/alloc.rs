@@ -5,8 +5,6 @@ use std::mem::{self};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
 
-use crate::seize;
-
 // A hash table layed out in a single allocation
 #[repr(transparent)]
 pub struct RawTable(u8);
