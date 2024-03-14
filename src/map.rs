@@ -1,5 +1,5 @@
 use crate::raw;
-use crate::seize::{Collector, Guard};
+use seize::{Collector, Guard};
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
