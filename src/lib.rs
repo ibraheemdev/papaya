@@ -3,6 +3,9 @@
 mod map;
 mod raw;
 
+use std::collections::HashSet;
+
+use fxhash::FxBuildHasher;
 pub use map::HashMap;
 
 #[test]
@@ -15,6 +18,19 @@ fn bench() {
     let y = map.pin();
     for i in 0..2000 {
         assert_eq!(y.get(&i), Some(&(i + 1)));
+    }
+}
+
+#[test]
+fn resize() {
+    use rand::distributions::Distribution;
+    let mut rng = rand::thread_rng();
+    let zipf = zipf::ZipfDistribution::new(usize::MAX, 1.08).unwrap();
+    let sample = zipf.sample_iter(&mut rng).take(1_usize << 22);
+
+    let map = HashMap::with_hasher(FxBuildHasher::default());
+    for i in sample {
+        map.pin().insert(i, i + 1);
     }
 }
 
