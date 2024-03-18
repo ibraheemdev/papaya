@@ -29,7 +29,7 @@ type Table<K, V> = self::alloc::Table<Entry<K, V>>;
 pub struct Entry<K, V> {
     pub link: Link,
     pub key: K,
-    pub value: MaybeUninit<V>,
+    pub value: V,
 }
 
 // The state of an entry that was just updated.
@@ -62,10 +62,7 @@ impl Entry<(), ()> {
     // Retires an entry.
     unsafe fn retire<K, V>(link: *mut Link) {
         let entry_addr: *mut Entry<K, V> = link.cast();
-        let entry = unsafe { Box::from_raw(entry_addr) };
-
-        // drop the value
-        let _ = unsafe { entry.value.assume_init() };
+        let _entry = unsafe { Box::from_raw(entry_addr) };
     }
 }
 
@@ -200,13 +197,11 @@ where
                     continue;
                 }
 
-                let entry_ptr = entry.mask(Entry::POINTER);
-                let entry_key = unsafe { &(*entry_ptr).key };
+                let entry_ptr = unsafe { &*entry.mask(Entry::POINTER) };
 
                 // check for a full match
-                if entry_key.borrow() == key {
-                    let value = unsafe { (*entry_ptr).value.assume_init_ref() };
-                    return Some((entry_key, value));
+                if entry_ptr.key.borrow() == key {
+                    return Some((&entry_ptr.key, &entry_ptr.value));
                 }
             }
         }
@@ -234,7 +229,7 @@ where
     ) -> EntryStatus<'g, V> {
         let entry = Box::into_raw(Box::new(Entry {
             key,
-            value: MaybeUninit::new(value),
+            value,
             link: self.collector.link(),
         }));
 
@@ -260,10 +255,8 @@ where
         }
 
         let new_ref = unsafe { &*new_entry.mask(Entry::POINTER) };
-        let key_ref = &new_ref.key;
-        let value_ref = unsafe { new_ref.value.assume_init_ref() };
 
-        let hash = self.hash(&key_ref);
+        let hash = self.hash(&new_ref.key);
         let h2 = meta::h2(hash);
 
         let i = h1(hash) & (self.table.len - 1);
@@ -287,7 +280,7 @@ where
                     // successfully claimed this entry
                     Ok(_) => {
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
-                        return EntryStatus::Empty(value_ref);
+                        return EntryStatus::Empty(&new_ref.value);
                     }
                     Err(found) => {
                         fence(Ordering::Acquire);
@@ -308,16 +301,15 @@ where
                         }
 
                         // if the same key was just inserted, we might be able to update
-                        if unsafe { (*found_ptr).key == *key_ref } {
+                        if unsafe { (*found_ptr).key == new_ref.key } {
                             // don't replace the existing value, bail
                             if !replace {
                                 let new_entry = unsafe { Box::from_raw(new_entry) };
-                                let not_inserted = unsafe { new_entry.value.assume_init() };
-                                let found = unsafe { (*found_ptr).value.assume_init_ref() };
+                                let current = unsafe { &(*found_ptr).value };
 
                                 return EntryStatus::Error {
-                                    not_inserted,
-                                    current: found,
+                                    current,
+                                    not_inserted: new_entry.value,
                                 };
                             }
 
@@ -350,16 +342,15 @@ where
                 let entry_ptr = entry.mask(Entry::POINTER);
 
                 // if the key matches, we might be able to update
-                if unsafe { (*entry_ptr).key == *key_ref } {
+                if unsafe { (*entry_ptr).key == new_ref.key } {
                     // don't replace the existing value, bail
                     if !replace {
                         let new_entry = unsafe { Box::from_raw(new_entry) };
-                        let not_inserted = unsafe { new_entry.value.assume_init() };
-                        let found = unsafe { (*entry_ptr).value.assume_init_ref() };
+                        let current = unsafe { &(*entry_ptr).value };
 
                         return EntryStatus::Error {
-                            not_inserted,
-                            current: found,
+                            current,
+                            not_inserted: new_entry.value,
                         };
                     }
 
@@ -410,7 +401,7 @@ where
 
                     // retire the old value
                     guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
-                    return ReplaceStatus::Replaced((*entry_ptr).value.assume_init_ref());
+                    return ReplaceStatus::Replaced(&(*entry_ptr).value);
                 },
 
                 // lost to a delete
@@ -435,7 +426,7 @@ where
             return None;
         }
 
-        let update: *mut Entry<K, V> = Box::into_raw(Box::new(Entry {
+        let update = Box::into_raw(Box::new(Entry {
             key,
             link: self.collector.link(),
             value: MaybeUninit::uninit(),
@@ -447,7 +438,7 @@ where
     // Update an entry with a remapping function.
     pub fn update_with<'g, F>(
         &self,
-        update: *mut Entry<K, V>,
+        update: *mut Entry<K, MaybeUninit<V>>,
         mut value_present: bool,
         f: F,
         guard: &'g Guard<'_>,
@@ -497,9 +488,9 @@ where
 
                         // construct the new value
                         unsafe {
-                            let value = f((*entry_ptr).value.assume_init_ref());
+                            let value = f(&(*entry_ptr).value);
 
-                            // drop the old value, if `f has already been called
+                            // drop the old value, if `f` has already been called
                             if value_present {
                                 (*update).value.assume_init_drop();
                             }
@@ -510,7 +501,7 @@ where
 
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
                             entry,
-                            update,
+                            update as _,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
@@ -520,7 +511,7 @@ where
 
                                 // retire the old entry
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
-                                return Some((*entry_ptr).value.assume_init_ref());
+                                return Some(&(*entry_ptr).value);
                             },
 
                             // the entry got deleted
@@ -796,10 +787,7 @@ where
                                 // retire the old value
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
-                                return Some((
-                                    &(*entry_ptr).key,
-                                    (*entry_ptr).value.assume_init_ref(),
-                                ));
+                                return Some((&(*entry_ptr).key, &(*entry_ptr).value));
                             },
 
                             // the entry is being copied to the new table
@@ -951,9 +939,8 @@ impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
             }
 
             let entry = unsafe { &*entry.mask(Entry::POINTER) };
-            let value = unsafe { entry.value.assume_init_ref() };
             self.i += 1;
-            return Some((&entry.key, value));
+            return Some((&entry.key, &entry.value));
         }
     }
 }
