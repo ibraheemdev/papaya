@@ -112,6 +112,7 @@ impl<T> Table<T> {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn from_raw(raw: *mut RawTable) -> Table<T> {
         if raw.is_null() {
             return Table {
@@ -132,6 +133,7 @@ impl<T> Table<T> {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         assert!(i < self.capacity);
         &*self
@@ -141,6 +143,7 @@ impl<T> Table<T> {
             .cast::<AtomicU8>()
     }
 
+    #[inline(always)]
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
         let offset = mem::size_of::<TableLayout>()
             + mem::size_of::<u8>() * self.capacity
