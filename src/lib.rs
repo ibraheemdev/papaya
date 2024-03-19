@@ -3,9 +3,8 @@
 mod map;
 mod raw;
 
-use std::collections::HashSet;
-
 use fxhash::FxBuildHasher;
+
 pub use map::HashMap;
 
 #[test]
