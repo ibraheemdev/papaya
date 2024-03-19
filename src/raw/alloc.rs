@@ -15,11 +15,10 @@ pub struct RawTable(u8);
 unsafe impl seize::AsLink for RawTable {}
 
 #[repr(align(16))]
-#[allow(unused)]
 struct AtomicU128(u128);
 
 // The table allocation's layout
-#[allow(unused)]
+#[repr(C)]
 struct TableLayout {
     link: seize::Link,
     len: usize,
