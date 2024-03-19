@@ -128,27 +128,58 @@ pub struct CachePadded<T> {
     value: T,
 }
 
-pub struct Counter(Vec<CachePadded<AtomicUsize>>);
+pub struct Sharded<T>(Vec<CachePadded<T>>);
 
-impl Counter {
-    pub fn new() -> Counter {
+impl<T> Default for Sharded<T>
+where
+    T: Default,
+{
+    fn default() -> Sharded<T> {
         let num_cpus = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
-        let counters = (0..num_cpus.next_power_of_two())
+        let shards = (0..num_cpus.next_power_of_two())
             .map(|_| Default::default())
             .collect();
-        Counter(counters)
+        Sharded(shards)
+    }
+}
+
+impl<T> Sharded<T> {
+    pub fn get(&self) -> &T {
+        &self.0[thread_id() & (self.0.len() - 1)].value
     }
 
-    pub fn add(&self, i: usize) {
-        self.0[thread_id() & (self.0.len() - 1)]
-            .value
-            .fetch_add(i, Ordering::Relaxed);
+    pub fn sum(&self, f: impl Fn(&T) -> usize) -> usize {
+        self.0.iter().map(|c| f(&c.value)).sum()
+    }
+}
+
+// A counter that tracks the total number of occupied entries (including tombstones),
+// as well as the number of active entries.
+#[derive(Default)]
+pub struct Counter {
+    pub entries: AtomicUsize,
+    pub deleted: AtomicUsize,
+}
+
+impl Counter {
+    pub fn insert(&self, n: usize) {
+        self.entries.fetch_add(n, Ordering::Relaxed);
     }
 
-    pub fn get(&self) -> usize {
-        self.0.iter().map(|c| c.value.load(Ordering::Relaxed)).sum()
+    pub fn delete(&self, n: usize) {
+        self.deleted.fetch_add(n, Ordering::Release);
+    }
+
+    pub fn active(&self) -> usize {
+        // acquire ensures entries >= deleted
+        let deleted = self.deleted.load(Ordering::Acquire);
+        self.entries.load(Ordering::Relaxed) - deleted
+    }
+
+    pub fn total(&self) -> usize {
+        self.entries.load(Ordering::Relaxed)
     }
 }
 

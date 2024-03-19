@@ -146,6 +146,39 @@ impl<K, V, S> HashMap<K, V, S> {
             table: self,
         }
     }
+
+    /// Returns the number of entries in the map.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    ///
+    /// map.pin().insert(1, "a");
+    /// map.pin().insert(2, "b");
+    /// assert!(map.pin().len() == 2);
+    /// ```
+    pub fn len(&self, guard: &Guard<'_>) -> usize {
+        self.raw.root(guard).len()
+    }
+
+    /// Returns `true` if the map is empty. Otherwise returns `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert!(map.pin().is_empty());
+    /// map.pin().insert("a", 1);
+    /// assert!(!map.pin().is_empty());
+    /// ```
+    pub fn is_empty(&self, guard: &Guard<'_>) -> bool {
+        self.len(guard) == 0
+    }
 }
 
 impl<K, V, S> HashMap<K, V, S>
@@ -514,6 +547,22 @@ pub struct OccupiedError<'a, V: 'a> {
 pub struct HashMapRef<'table, K, V, S> {
     guard: Guard<'table>,
     table: &'table HashMap<K, V, S>,
+}
+
+impl<'table, K, V, S> HashMapRef<'table, K, V, S> {
+    /// Returns the number of entries in the map.
+    ///
+    /// See [`HashMap::len`] for details.
+    pub fn len(&self) -> usize {
+        self.table.len(&self.guard)
+    }
+
+    /// Returns `true` if the map is empty. Otherwise returns `false`.
+    ///
+    /// See [`HashMap::is_empty`] for details.
+    pub fn is_empty(&self) -> bool {
+        self.table.is_empty(&self.guard)
+    }
 }
 
 impl<'table, K, V, S> HashMapRef<'table, K, V, S>

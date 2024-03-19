@@ -5,6 +5,8 @@ use std::mem::{self};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
 
+use super::utils::{Counter, Sharded};
+
 // A hash table layed out in a single allocation
 #[repr(transparent)]
 pub struct RawTable(u8);
@@ -22,13 +24,14 @@ struct TableLayout {
     link: seize::Link,
     len: usize,
     capacity: usize,
-    resize_state: ResizeState,
+    state: State,
     meta: [AtomicU128; 0],
     entries: [AtomicPtr<()>; 0],
 }
 
 #[derive(Default)]
-pub struct ResizeState {
+pub struct State {
+    pub count: Sharded<Counter>,
     pub next: AtomicPtr<RawTable>,
     pub allocating: Mutex<()>,
     pub copied: AtomicUsize,
@@ -36,7 +39,7 @@ pub struct ResizeState {
     pub status: AtomicU32,
 }
 
-impl ResizeState {
+impl State {
     pub const PENDING: u32 = 0;
     pub const ABORTED: u32 = 1;
     pub const COMPLETE: u32 = 2;
@@ -89,7 +92,7 @@ impl<T> Table<T> {
                 link,
                 len,
                 capacity,
-                resize_state: ResizeState::default(),
+                state: State::default(),
                 meta: [],
                 entries: [],
             });
@@ -153,8 +156,8 @@ impl<T> Table<T> {
         &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
-    pub fn state(&self) -> &ResizeState {
-        unsafe { &(*self.raw.cast::<TableLayout>()).resize_state }
+    pub fn state(&self) -> &State {
+        unsafe { &(*self.raw.cast::<TableLayout>()).state }
     }
 
     pub unsafe fn dealloc(table: Table<T>) {

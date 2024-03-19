@@ -8,8 +8,8 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{fence, AtomicPtr, Ordering};
 use std::{hint, ptr};
 
-use self::alloc::{RawTable, ResizeState};
-use self::utils::{AtomicPtrFetchOps, StrictProvenance};
+use self::alloc::{RawTable, State};
+use self::utils::{AtomicPtrFetchOps, Counter, StrictProvenance};
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -17,7 +17,6 @@ use seize::{AsLink, Collector, Guard, Link};
 pub struct HashMap<K, V, S> {
     pub collector: Collector,
     table: AtomicPtr<RawTable>,
-    entries: utils::Counter,
     hash_builder: S,
     _kv: PhantomData<(K, V)>,
 }
@@ -86,7 +85,6 @@ impl<K, V, S> HashMap<K, V, S> {
                 collector,
                 hash_builder,
                 table: AtomicPtr::new(ptr::null_mut()),
-                entries: utils::Counter::new(),
                 _kv: PhantomData,
             };
         }
@@ -103,7 +101,6 @@ impl<K, V, S> HashMap<K, V, S> {
         HashMap {
             collector,
             hash_builder,
-            entries: utils::Counter::new(),
             table: AtomicPtr::new(table.raw),
             _kv: PhantomData,
         }
@@ -139,7 +136,6 @@ impl<K, V, S> HashMap<K, V, S> {
         HashMapRef {
             table,
             root: &self.table,
-            entries: &self.entries,
             collector: &self.collector,
             hash_builder: &self.hash_builder,
         }
@@ -150,7 +146,6 @@ impl<K, V, S> HashMap<K, V, S> {
 pub struct HashMapRef<'a, K, V, S> {
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
-    entries: &'a utils::Counter,
     collector: &'a Collector,
     hash_builder: &'a S,
 }
@@ -238,7 +233,7 @@ where
 
         // we inserted a new entry, update the entry count
         if let EntryStatus::Empty(_) | EntryStatus::Tombstone(_) = result {
-            self.entries.add(1)
+            self.table.state().count.get().insert(1);
         }
 
         result
@@ -578,7 +573,7 @@ where
 
         'copy: loop {
             // make sure we are at the correct table
-            while curr.state().status.load(Ordering::Acquire) == ResizeState::ABORTED {
+            while curr.state().status.load(Ordering::Acquire) == State::ABORTED {
                 curr = next;
                 next = self.as_ref(next).get_or_alloc_next();
             }
@@ -613,9 +608,7 @@ where
                     // new table
                     if !self.copy_index(i, next) {
                         // abort the copy
-                        curr.state()
-                            .status
-                            .store(ResizeState::ABORTED, Ordering::Release);
+                        curr.state().status.store(State::ABORTED, Ordering::Release);
                         let allocated = self.as_ref(next).get_or_alloc_next();
                         atomic_wait::wake_all(&curr.state().status);
 
@@ -639,21 +632,23 @@ where
                 let status = curr.state().status.load(Ordering::Acquire);
 
                 // if this copy was aborted, we have to retry in the new table
-                if status == ResizeState::ABORTED {
+                if status == State::ABORTED {
                     continue 'copy;
                 }
 
                 // the copy is complete
-                if status == ResizeState::COMPLETE {
+                if status == State::COMPLETE {
                     return next;
                 }
 
-                atomic_wait::wait(&curr.state().status, ResizeState::PENDING);
+                atomic_wait::wait(&curr.state().status, State::PENDING);
             }
         }
     }
 
     // Copy the entry at the given index to the new table.
+    //
+    // Returns true if the entry was copied by this thread,
     fn copy_index(&self, i: usize, new_table: Table<K, V>) -> bool {
         let mut entry = unsafe { self.table.entry(i) }.load(Ordering::Acquire);
 
@@ -789,6 +784,7 @@ where
                                 // retire the old value
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
+                                self.table.state().count.get().delete(1);
                                 return Some((&(*entry_ptr).key, &(*entry_ptr).value));
                             },
 
@@ -1025,7 +1021,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     // Returns true if the table was promoted.
     fn try_promote(
         &self,
-        state: &ResizeState,
+        state: &State,
         next: Table<K, V>,
         copied: usize,
         guard: &Guard<'_>,
@@ -1042,6 +1038,14 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         if copied == capacity {
             let root = self.root.load(Ordering::Acquire);
             if self.table.raw == root {
+                let copied = self.len();
+
+                // update the length of the new table
+                let entries = &next.state().count.get().entries;
+                entries
+                    .compare_exchange(0, copied, Ordering::Relaxed, Ordering::Relaxed)
+                    .ok();
+
                 match self.root.compare_exchange(
                     self.table.raw,
                     next.raw,
@@ -1060,7 +1064,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 }
 
                 // wake up anyone waiting for the promotion
-                state.status.store(ResizeState::COMPLETE, Ordering::Release);
+                state.status.store(State::COMPLETE, Ordering::Release);
                 atomic_wait::wake_all(&state.status);
                 return true;
             }
@@ -1069,13 +1073,17 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         false
     }
 
+    // Returns the number of entries in the table.
+    pub fn len<'g>(&self) -> usize {
+        self.table.state().count.sum(Counter::active)
+    }
+
     // Creates a reference to the given table while maintaining the root table pointer.
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'root, K, V, S> {
         HashMapRef {
             table,
             root: self.root,
             collector: self.collector,
-            entries: self.entries,
             hash_builder: self.hash_builder,
         }
     }
