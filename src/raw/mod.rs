@@ -26,6 +26,7 @@ pub struct HashMap<K, V, S> {
 type Table<K, V> = self::alloc::Table<Entry<K, V>>;
 
 // An entry in the hash-table.
+#[repr(C)]
 pub struct Entry<K, V> {
     pub link: Link,
     pub key: K,
@@ -46,7 +47,7 @@ enum ReplaceStatus<V> {
     Replaced(V),
 }
 
-// Safety: seize::Link is the first field
+// Safety: repr(C) and seize::Link is the first field
 unsafe impl<K, V> AsLink for Entry<K, V> {}
 
 impl Entry<(), ()> {
@@ -156,7 +157,7 @@ pub struct HashMapRef<'a, K, V, S> {
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
-    K: Clone + Sync + Send + Hash + Eq,
+    K: Sync + Send + Hash + Eq,
     V: Sync + Send,
     S: BuildHasher,
 {
@@ -782,6 +783,7 @@ where
                         ) {
                             // succesfully deleted
                             Ok(_) => unsafe {
+                                let entry_ptr = entry.mask(Entry::POINTER);
                                 self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
                                 // retire the old value
