@@ -101,12 +101,12 @@ impl<K, V, S> HashMap<K, V, S> {
     /// # Examples
     ///
     /// ```
-    /// use std::collections::HashMap;
+    /// use papaya::HashMap;
     /// use std::hash::RandomState;
     ///
     /// let s = RandomState::new();
     /// let map = HashMap::with_capacity_and_hasher(10, s);
-    /// map.insert(1, 2);
+    /// map.pin().insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
         HashMap {
@@ -152,7 +152,7 @@ impl<K, V, S> HashMap<K, V, S>
 where
     // note not all the methods below actually require thread-safety bounds, but
     // the map is not generally useful without them
-    K: Clone + Sync + Send + Hash + Eq,
+    K: Sync + Send + Hash + Eq,
     V: Sync + Send,
     S: BuildHasher,
 {
@@ -268,8 +268,8 @@ where
     /// let m = map.pin();
     ///
     /// m.insert(37, "b");
-    /// assert_eq!(m.insert(37, "c"), Some("b"));
-    /// assert_eq!(m.get(&37), "c");
+    /// assert_eq!(m.insert(37, "c"), Some(&"b"));
+    /// assert_eq!(m.get(&37), Some(&"c"));
     /// ```
     #[inline]
     pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard<'_>) -> Option<&'g V> {
@@ -294,9 +294,10 @@ where
     /// use papaya::HashMap;
     ///
     /// let mut map = HashMap::new();
-    /// assert_eq!(map.pin().try_insert(37, "a").unwrap(), &"a");
+    /// let m = map.pin();
+    /// assert_eq!(m.try_insert(37, "a").unwrap(), &"a");
     ///
-    /// let err = map.pin().try_insert(37, "b").unwrap_err();
+    /// let err = m.try_insert(37, "b").unwrap_err();
     /// assert_eq!(err.current, &"a");
     /// assert_eq!(err.not_inserted, "b");
     /// ```
@@ -393,11 +394,12 @@ where
     ///
     /// let mut map = HashMap::new();
     /// map.pin().insert(1, "a");
+    /// assert_eq!(map.pin().get(&1), Some(&"a"));
     /// assert_eq!(map.pin().remove_entry(&1), Some((&1, &"a")));
     /// assert_eq!(map.pin().remove(&1), None);
     /// ```
     #[inline]
-    pub fn remove_entry<'g, Q>(&mut self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -520,6 +522,22 @@ where
     V: Sync + Send,
     S: BuildHasher,
 {
+    /// Returns `true` if the map contains a value for the specified key.
+    ///
+    /// See [`HashMap::contains_key`] for details.
+    #[inline]
+    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.table.contains_key(key, &self.guard)
+    }
+
+    /// Returns a reference to the value corresponding to the key.
+    ///
+    /// See [`HashMap::get`] for details.
+    #[inline]
     pub fn get<'g, Q>(&'g self, key: &Q) -> Option<&'g V>
     where
         K: Borrow<Q>,
@@ -528,27 +546,168 @@ where
         self.table.get(key, &self.guard)
     }
 
+    /// Returns the key-value pair corresponding to the supplied key.
+    ///
+    /// See [`HashMap::get_key_value`] for details.
+    #[inline]
+    pub fn get_key_value<'g, Q>(&'g self, key: &Q) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.table.get_key_value(key, &self.guard)
+    }
+
+    /// Inserts a key-value pair into the map.
+    ///
+    /// See [`HashMap::insert`] for details.
+    #[inline]
+    pub fn insert<'g>(&'g self, key: K, value: V) -> Option<&'g V> {
+        self.table.insert(key, value, &self.guard)
+    }
+
+    /// Tries to insert a key-value pair into the map, and returns
+    /// a reference to the value that was inserted.
+    ///
+    /// See [`HashMap::try_insert`] for details.
+    #[inline]
+    pub fn try_insert<'g>(&'g self, key: K, value: V) -> Result<&'g V, OccupiedError<'g, V>> {
+        self.table.try_insert(key, value, &self.guard)
+    }
+
+    // Update an entry with a remapping function.
+    //
+    /// See [`HashMap::update`] for details.
+    pub fn update<'g, F>(&'g self, key: K, update: F) -> Option<&'g V>
+    where
+        F: Fn(&V) -> V,
+    {
+        self.table.update(key, update, &self.guard)
+    }
+
+    /// Removes a key from the map, returning the value at the key if the key
+    /// was previously in the map.
+    ///
+    /// See [`HashMap::remove`] for details.
+    #[inline]
+    pub fn remove<'g, Q>(&'g self, key: &Q) -> Option<&'g V>
+    where
+        K: Borrow<Q> + 'g,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.table.remove(key, &self.guard)
+    }
+
+    /// Removes a key from the map, returning the stored key and value if the
+    /// key was previously in the map.
+    ///
+    /// The key may be any borrowed form of the map's key type, but
+    /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
+    /// the key type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let mut map = HashMap::new();
+    /// map.pin().insert(1, "a");
+    /// assert_eq!(map.pin().remove_entry(&1), Some((&1, &"a")));
+    /// assert_eq!(map.pin().remove(&1), None);
+    /// ```
+    #[inline]
+    pub fn remove_entry<'g, Q>(&'g self, key: &Q) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.table.remove_entry(key, &self.guard)
+    }
+
+    /// Clears the map, removing all key-value pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    ///
+    /// map.pin().insert(1, "a");
+    /// map.pin().clear();
+    /// assert!(map.pin().is_empty());
+    /// ```
+    #[inline]
+    pub fn clear(&self) {
+        self.table.clear(&self.guard)
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    /// The iterator element type is `(&'a K, &'a V)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::from([
+    ///     ("a", 1),
+    ///     ("b", 2),
+    ///     ("c", 3),
+    /// ]);
+    ///
+    /// for (key, val) in map.pin().iter() {
+    ///     println!("key: {key} val: {val}");
+    /// }
+    #[inline]
     pub fn iter(&self) -> Iter<'_, K, V> {
         self.table.iter(&self.guard)
     }
 
-    pub fn insert(&self, key: K, value: V) -> Option<&V> {
-        self.table.insert(key, value, &self.guard)
+    /// An iterator visiting all keys in arbitrary order.
+    /// The iterator element type is `&'a K`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::from([
+    ///     ("a", 1),
+    ///     ("b", 2),
+    ///     ("c", 3),
+    /// ]);
+    ///
+    /// for key in map.pin().keys() {
+    ///     println!("{key}");
+    /// }
+    /// ```
+    #[inline]
+    pub fn keys(&self) -> Keys<'_, K, V> {
+        self.table.keys(&self.guard)
     }
 
-    pub fn update<F>(&self, key: K, f: F) -> Option<&V>
-    where
-        F: Fn(&V) -> V,
-    {
-        self.table.raw.root(&self.guard).update(key, f, &self.guard)
-    }
-
-    pub fn remove<Q: ?Sized>(&self, key: &Q) -> Option<&V>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
-    {
-        self.table.remove(key, &self.guard)
+    /// An iterator visiting all values in arbitrary order.
+    /// The iterator element type is `&'a V`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::from([
+    ///     ("a", 1),
+    ///     ("b", 2),
+    ///     ("c", 3),
+    /// ]);
+    ///
+    /// for value in map.pin().values() {
+    ///     println!("{value}");
+    /// }
+    /// ```
+    #[inline]
+    pub fn values(&self) -> Values<'_, K, V> {
+        self.table.values(&self.guard)
     }
 }
 
