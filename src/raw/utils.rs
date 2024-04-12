@@ -149,9 +149,18 @@ impl<T> Sharded<T> {
     pub fn get(&self, tid: usize) -> &T {
         &self.0[tid & (self.0.len() - 1)].value
     }
+}
 
-    pub fn sum(&self, f: impl Fn(&T) -> usize) -> usize {
-        self.0.iter().map(|c| f(&c.value)).sum()
+impl Sharded<Counter> {
+    pub fn active(&self) -> usize {
+        // acquire ensures entries >= deleted
+        let (deleted, entries) = self.0.iter().fold((0, 0), |(deleted, entries), counter| {
+            let deleted = deleted + counter.value.deleted.load(Ordering::Acquire);
+            let entries = entries + counter.value.entries.load(Ordering::Relaxed);
+            (deleted, entries)
+        });
+
+        entries - deleted
     }
 }
 
@@ -171,19 +180,4 @@ impl Counter {
     pub fn delete(&self, n: usize) {
         self.deleted.fetch_add(n, Ordering::Release);
     }
-
-    pub fn active(&self) -> usize {
-        // acquire ensures entries >= deleted
-        let deleted = self.deleted.load(Ordering::Acquire);
-        self.entries.load(Ordering::Relaxed) - deleted
-    }
-
-    pub fn total(&self) -> usize {
-        self.entries.load(Ordering::Relaxed)
-    }
-}
-
-fn thread_id() -> usize {
-    thread_local!(static BYTE: u8 = 0);
-    BYTE.with(|b| b as *const u8 as usize)
 }
