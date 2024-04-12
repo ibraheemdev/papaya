@@ -357,7 +357,7 @@ where
     // Update an entry with a remapping function.
     //
     // If the value for the specified `key` is present, the new value is computed and stored the
-    // using the provided update function, and the previous value is returned. Otherwise, `None`
+    // using the provided update function, and the new value is returned. Otherwise, `None`
     // is returned.
     //
     // The update function should be pure, as it may be called multiple times if the current value
@@ -628,6 +628,16 @@ where
     }
 }
 
+impl<K, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, RandomState>
+where
+    K: Sync + Send + Clone + Hash + Ord,
+    V: Sync + Send,
+{
+    fn from(arr: [(K, V); N]) -> Self {
+        HashMap::from_iter(arr)
+    }
+}
+
 impl<K, V, S> FromIterator<(K, V)> for HashMap<K, V, S>
 where
     K: Sync + Send + Clone + Hash + Ord,
@@ -665,17 +675,17 @@ where
 {
     fn clone(&self) -> HashMap<K, V, S> {
         let guard = self.guard();
-        let map = Self::with_capacity_and_hasher(self.len(&guard), self.raw.hash_builder.clone())
+        let other = Self::with_capacity_and_hasher(self.len(&guard), self.raw.hash_builder.clone())
             .with_collector(self.raw.collector.clone());
 
         {
-            let guard = map.guard();
+            let other_guard = other.guard();
             for (key, value) in self.iter(&guard) {
-                map.insert(key.clone(), value.clone(), &guard);
+                other.insert(key.clone(), value.clone(), &other_guard);
             }
         }
 
-        map
+        other
     }
 }
 

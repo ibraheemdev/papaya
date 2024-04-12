@@ -9,7 +9,7 @@ use std::sync::atomic::{fence, AtomicPtr, Ordering};
 use std::{hint, ptr};
 
 use self::alloc::{RawTable, State};
-use self::utils::{AtomicPtrFetchOps, Counter, StrictProvenance};
+use self::utils::{AtomicPtrFetchOps, StrictProvenance};
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -144,6 +144,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
 // A reference to the root hash table, or an arbitrarily nested table migration.
 pub struct HashMapRef<'a, K, V, S> {
+    // TODO: make this an Option to avoid null checks
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
     collector: &'a Collector,
@@ -207,6 +208,15 @@ where
 
     // Returns an iterator over the keys and values of this table.
     pub fn iter<'g>(&self, guard: &'g Guard<'_>) -> Iter<'g, K, V> {
+        if self.table.raw.is_null() {
+            return Iter {
+                i: 0,
+                table: self.table,
+                capacity: 0,
+                _guard: guard,
+            };
+        }
+
         Iter {
             i: 0,
             table: self.table,
@@ -240,7 +250,7 @@ where
         guard: &'g Guard<'_>,
     ) -> EntryStatus<'g, V> {
         if self.table.raw.is_null() {
-            self.init();
+            self.init(None);
         }
 
         let new_ref = unsafe { &*new_entry.mask(Entry::POINTER) };
@@ -424,14 +434,13 @@ where
             value: MaybeUninit::uninit(),
         }));
 
-        self.update_with(update, false, f, guard)
+        self.update_with(update, f, guard)
     }
 
     // Update an entry with a remapping function.
     pub fn update_with<'g, F>(
         &self,
         update: *mut Entry<K, MaybeUninit<V>>,
-        mut value_present: bool,
         f: F,
         guard: &'g Guard<'_>,
     ) -> Option<&'g V>
@@ -467,10 +476,8 @@ where
                     continue;
                 }
 
-                let entry_ptr = entry.mask(Entry::POINTER);
-
                 // the key matches, we might be able to perform an update
-                if unsafe { (*entry_ptr).key == (*update).key } {
+                if unsafe { (*entry.mask(Entry::POINTER)).key == (*update).key } {
                     loop {
                         // the entry is being copied to a new table, we have to copy it before we can update it
                         if entry.addr() & Entry::COPYING != 0 {
@@ -480,15 +487,8 @@ where
 
                         // construct the new value
                         unsafe {
-                            let value = f(&(*entry_ptr).value);
-
-                            // drop the old value, if `f` has already been called
-                            if value_present {
-                                (*update).value.assume_init_drop();
-                            }
-
+                            let value = f(&(*entry.mask(Entry::POINTER)).value);
                             (*update).value = MaybeUninit::new(value);
-                            value_present = true;
                         }
 
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
@@ -499,11 +499,12 @@ where
                         ) {
                             // succesful update
                             Ok(_) => unsafe {
+                                // eprintln!("UPDATED {}", guard.thread.id);
                                 let entry_ptr = entry.mask(Entry::POINTER);
 
                                 // retire the old entry
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
-                                return Some(&(*entry_ptr).value);
+                                return Some(&(*update).value.assume_init_ref());
                             },
 
                             // the entry got deleted
@@ -527,15 +528,17 @@ where
             // found a copied entry, finish the resize and update it in the new table
             self.next_table_ref().unwrap();
             let next_table = self.help_copy(guard);
-            return self
-                .as_ref(next_table)
-                .update_with(update, value_present, f, guard);
+            return self.as_ref(next_table).update_with(update, f, guard);
         }
 
         None
     }
 
-    pub fn reserve(&self, additional: usize, guard: &Guard<'_>) {
+    pub fn reserve(&mut self, additional: usize, guard: &Guard<'_>) {
+        if self.table.raw.is_null() && self.init(Some(additional)) {
+            return;
+        }
+
         loop {
             let capacity = (self.len() + additional).next_power_of_two();
             // we have enough capacity
@@ -544,27 +547,36 @@ where
             }
 
             self.get_or_alloc_next(Some(capacity));
-            self.help_copy(guard);
+            self.table = self.help_copy(guard);
         }
     }
 
     // Allocate the inital table.
-    fn init<'g>(&mut self) {
+    fn init<'g>(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
-        const BUFFER: usize = probe_limit!(CAPACITY);
 
-        let table = Table::<K, V>::new(CAPACITY, CAPACITY + BUFFER, self.collector.link());
+        let capacity = capacity.unwrap_or(CAPACITY);
+        let table = Table::<K, V>::new(
+            capacity,
+            capacity + probe_limit!(capacity),
+            self.collector.link(),
+        );
         match self.root.compare_exchange(
             ptr::null_mut(),
             table.raw,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => self.table = table,
+            Ok(_) => {
+                self.table = table;
+                true
+            }
+
             // someone us allocated before us, deallocate our table
             Err(found) => {
                 unsafe { Table::dealloc(table) }
                 self.table = unsafe { Table::from_raw(found) };
+                false
             }
         }
     }
@@ -834,22 +846,22 @@ where
         let mut copying = false;
 
         // drop all the entries
-        for i in 0..(self.table.len + probe_limit!(self.table.len)) {
+        'probe: for i in 0..(self.table.len + probe_limit!(self.table.len)) {
             let mut entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
             loop {
                 // a non-empty entry is being copied. clear every entry in this table that we can, then
                 // deal with the copy
                 if entry.addr() & Entry::COPYING != 0
-                    && entry.addr() != Entry::COPYING
+                    && !entry.mask(Entry::POINTER).is_null()
                     && entry.addr() & Entry::TOMBSTONE == 0
                 {
                     copying = true;
-                    continue;
+                    continue 'probe;
                 }
 
                 // the entry is empty or already deleted
                 if entry.is_null() || entry.addr() & Entry::TOMBSTONE != 0 {
-                    continue;
+                    continue 'probe;
                 }
 
                 let result = unsafe {
@@ -864,6 +876,7 @@ where
                 match result {
                     Ok(entry) => unsafe {
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+                        self.table.state().count.get(guard.thread.id).delete(1);
 
                         // retire the old value
                         let entry_ptr = entry.mask(Entry::POINTER);
@@ -1084,7 +1097,11 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
 
     // Returns the number of entries in the table.
     pub fn len<'g>(&self) -> usize {
-        self.table.state().count.sum(Counter::active)
+        if self.table.raw.is_null() {
+            return 0;
+        }
+
+        self.table.state().count.active()
     }
 
     // Creates a reference to the given table while maintaining the root table pointer.
