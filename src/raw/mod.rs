@@ -16,8 +16,8 @@ use seize::{AsLink, Collector, Guard, Link};
 // A lock-free hash-map.
 pub struct HashMap<K, V, S> {
     pub collector: Collector,
+    pub hash_builder: S,
     table: AtomicPtr<RawTable>,
-    hash_builder: S,
     _kv: PhantomData<(K, V)>,
 }
 
@@ -229,14 +229,7 @@ where
             link: self.collector.link(),
         }));
 
-        let result = self.insert_entry(entry, replace, guard);
-
-        // we inserted a new entry, update the entry count
-        if let EntryStatus::Empty(_) | EntryStatus::Tombstone(_) = result {
-            self.table.state().count.get().insert(1);
-        }
-
-        result
+        self.insert_entry(entry, replace, guard)
     }
 
     // Inserts an entry into the map.
@@ -276,6 +269,9 @@ where
                     // successfully claimed this entry
                     Ok(_) => {
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
+
+                        // we inserted a new entry, update the entry count
+                        self.table.state().count.get(guard.thread.id).insert(1);
                         return EntryStatus::Empty(&new_ref.value);
                     }
                     Err(found) => {
@@ -363,7 +359,7 @@ where
         }
 
         // went over the max probe count or found a copied entry: trigger a resize.
-        self.get_or_alloc_next();
+        self.get_or_alloc_next(None);
         let next_table = self.help_copy(guard);
         self.as_ref(next_table)
             .insert_entry(new_entry, replace, guard)
@@ -539,6 +535,19 @@ where
         None
     }
 
+    pub fn reserve(&self, additional: usize, guard: &Guard<'_>) {
+        loop {
+            let capacity = (self.len() + additional).next_power_of_two();
+            // we have enough capacity
+            if self.table.len >= capacity {
+                return;
+            }
+
+            self.get_or_alloc_next(Some(capacity));
+            self.help_copy(guard);
+        }
+    }
+
     // Allocate the inital table.
     fn init<'g>(&mut self) {
         const CAPACITY: usize = 32;
@@ -575,7 +584,7 @@ where
             // make sure we are at the correct table
             while curr.state().status.load(Ordering::Acquire) == State::ABORTED {
                 curr = next;
-                next = self.as_ref(next).get_or_alloc_next();
+                next = self.as_ref(next).get_or_alloc_next(None);
             }
 
             // the copy already completed
@@ -609,7 +618,7 @@ where
                     if !self.copy_index(i, next) {
                         // abort the copy
                         curr.state().status.store(State::ABORTED, Ordering::Release);
-                        let allocated = self.as_ref(next).get_or_alloc_next();
+                        let allocated = self.as_ref(next).get_or_alloc_next(None);
                         atomic_wait::wake_all(&curr.state().status);
 
                         // retry in a new table
@@ -784,7 +793,7 @@ where
                                 // retire the old value
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
-                                self.table.state().count.get().delete(1);
+                                self.table.state().count.get(guard.thread.id).delete(1);
                                 return Some((&(*entry_ptr).key, &(*entry_ptr).value));
                             },
 
@@ -957,7 +966,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     }
 
     // Returns the next table, allocating it has not already been created.
-    fn get_or_alloc_next(&self) -> Table<K, V> {
+    fn get_or_alloc_next(&self, capacity: Option<usize>) -> Table<K, V> {
         const SPIN_ALLOC: usize = 7;
 
         let state = self.table.state();
@@ -1001,7 +1010,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         }
 
         // double the table's capacity
-        let next_capacity = self.table.len << 1;
+        let next_capacity = capacity.unwrap_or(self.table.len << 1);
         let buffer = probe_limit!(next_capacity);
 
         if next_capacity > isize::MAX as usize {
@@ -1041,7 +1050,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 let copied = self.len();
 
                 // update the length of the new table
-                let entries = &next.state().count.get().entries;
+                let entries = &next.state().count.get(guard.thread.id).entries;
                 entries
                     .compare_exchange(0, copied, Ordering::Relaxed, Ordering::Relaxed)
                     .ok();
