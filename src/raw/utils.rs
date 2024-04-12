@@ -128,7 +128,7 @@ pub struct CachePadded<T> {
     value: T,
 }
 
-pub struct Sharded<T>(Vec<CachePadded<T>>);
+pub struct Sharded<T>(Box<[CachePadded<T>]>);
 
 impl<T> Default for Sharded<T>
 where
@@ -146,8 +146,8 @@ where
 }
 
 impl<T> Sharded<T> {
-    pub fn get(&self) -> &T {
-        &self.0[thread_id() & (self.0.len() - 1)].value
+    pub fn get(&self, tid: usize) -> &T {
+        &self.0[tid & (self.0.len() - 1)].value
     }
 
     pub fn sum(&self, f: impl Fn(&T) -> usize) -> usize {

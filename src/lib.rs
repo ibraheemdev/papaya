@@ -4,6 +4,7 @@ mod map;
 mod raw;
 
 use fxhash::FxBuildHasher;
+use std::hash::RandomState;
 
 pub use map::HashMap;
 
@@ -18,6 +19,15 @@ fn bench() {
     for i in 0..2000 {
         assert_eq!(y.get(&i), Some(&(i + 1)));
     }
+}
+
+#[test]
+fn len() {
+    let map = HashMap::with_hasher(RandomState::default());
+    for i in 0..2000 {
+        map.pin().insert(i, i + 1);
+    }
+    assert_eq!(map.pin().len(), 2000);
 }
 
 #[test]
