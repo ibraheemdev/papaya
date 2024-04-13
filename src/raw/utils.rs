@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 
 // Polyfill for the unstable strict-provenance APIs.
 pub unsafe trait StrictProvenance: Sized {
@@ -38,6 +38,8 @@ impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
     fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T {
         #[cfg(not(miri))]
         {
+            use std::sync::atomic::AtomicUsize;
+
             // mark the entry as copied
             unsafe { &*(self as *const AtomicPtr<T> as *const AtomicUsize) }
                 .fetch_or(value, ordering) as *mut T
