@@ -1,4 +1,3 @@
-// TODO: test u64 no simd
 use std::collections::HashMap;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
@@ -6,9 +5,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 const SIZE: usize = 10_000;
 
 fn compare(c: &mut Criterion) {
-    let mut group = c.benchmark_group("Compare");
+    let mut group = c.benchmark_group("read");
 
-    // A random key iterator.
     #[derive(Clone, Copy)]
     struct RandomKeys {
         state: usize,
@@ -29,8 +27,8 @@ fn compare(c: &mut Criterion) {
         }
     }
 
-    group.bench_function("wip-table-group-8", |b| {
-        let m = the_one::HashMap::<usize, usize>::default();
+    group.bench_function("papaya", |b| {
+        let m = papaya::HashMap::<usize, usize>::default();
         let m = m.pin();
         for i in RandomKeys::new().take(SIZE) {
             m.insert(i, i);
@@ -38,7 +36,7 @@ fn compare(c: &mut Criterion) {
 
         b.iter(|| {
             for i in RandomKeys::new().take(SIZE) {
-                black_box(assert_eq!(m.get_8(&i), Some(&i)));
+                black_box(assert_eq!(m.get(&i), Some(&i)));
             }
         });
     });
@@ -52,34 +50,6 @@ fn compare(c: &mut Criterion) {
         b.iter(|| {
             for i in RandomKeys::new().take(SIZE) {
                 black_box(assert_eq!(m.get(&i), Some(&i)));
-            }
-        });
-    });
-
-    group.bench_function("wip-table-simd-16", |b| {
-        let m = the_one::HashMap::<usize, usize>::default();
-        let m = m.pin();
-        for i in RandomKeys::new().take(SIZE) {
-            m.insert(i, i);
-        }
-
-        b.iter(|| {
-            for i in RandomKeys::new().take(SIZE) {
-                black_box(assert_eq!(m.get(&i), Some(&i)));
-            }
-        });
-    });
-
-    group.bench_function("wip-table-nosimd", |b| {
-        let m = the_one::HashMap::<usize, usize>::default();
-        let m = m.pin();
-        for i in RandomKeys::new().take(SIZE) {
-            m.insert(i, i);
-        }
-
-        b.iter(|| {
-            for i in RandomKeys::new().take(SIZE) {
-                black_box(assert_eq!(m.get_nosimd(&i), Some(&i)));
             }
         });
     });
