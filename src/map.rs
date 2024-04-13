@@ -700,6 +700,9 @@ pub struct OccupiedError<'a, V: 'a> {
     pub not_inserted: V,
 }
 
+/// A pinned reference to a hash table.
+///
+/// See [`HashMap::pin`] for details.
 pub struct HashMapRef<'map, K, V, S> {
     guard: Guard<'map>,
     map: &'map HashMap<K, V, S>,
