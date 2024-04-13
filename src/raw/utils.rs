@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicPtr, AtomicUsize, Ordering};
 
 // Polyfill for the unstable strict-provenance APIs.
 pub unsafe trait StrictProvenance: Sized {
@@ -128,56 +128,34 @@ pub struct CachePadded<T> {
     value: T,
 }
 
-pub struct Sharded<T>(Box<[CachePadded<T>]>);
+// A sharded counter.
+pub struct Counter(Box<[CachePadded<AtomicIsize>]>);
 
-impl<T> Default for Sharded<T>
-where
-    T: Default,
-{
-    fn default() -> Sharded<T> {
+impl Default for Counter {
+    fn default() -> Counter {
         let num_cpus = std::thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
         let shards = (0..num_cpus.next_power_of_two())
             .map(|_| Default::default())
             .collect();
-        Sharded(shards)
+        Counter(shards)
     }
-}
-
-impl<T> Sharded<T> {
-    pub fn get(&self, tid: usize) -> &T {
-        &self.0[tid & (self.0.len() - 1)].value
-    }
-}
-
-impl Sharded<Counter> {
-    pub fn active(&self) -> usize {
-        // acquire ensures entries >= deleted
-        let (deleted, entries) = self.0.iter().fold((0, 0), |(deleted, entries), counter| {
-            let deleted = deleted + counter.value.deleted.load(Ordering::Acquire);
-            let entries = entries + counter.value.entries.load(Ordering::Relaxed);
-            (deleted, entries)
-        });
-
-        entries - deleted
-    }
-}
-
-// A counter that tracks the total number of occupied entries (including tombstones),
-// as well as the number of active entries.
-#[derive(Default)]
-pub struct Counter {
-    pub entries: AtomicUsize,
-    pub deleted: AtomicUsize,
 }
 
 impl Counter {
-    pub fn insert(&self, n: usize) {
-        self.entries.fetch_add(n, Ordering::Relaxed);
+    pub fn get(&self, tid: usize) -> &AtomicIsize {
+        &self.0[tid & (self.0.len() - 1)].value
     }
 
-    pub fn delete(&self, n: usize) {
-        self.deleted.fetch_add(n, Ordering::Release);
+    pub fn active(&self) -> usize {
+        self.0
+            .iter()
+            .map(|x| x.value.load(Ordering::Relaxed))
+            .sum::<isize>()
+            .try_into()
+            // depending on the order of deletion/insertions this might be negative, so assume the
+            // map is empty
+            .unwrap_or(0)
     }
 }

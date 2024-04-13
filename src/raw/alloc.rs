@@ -5,7 +5,7 @@ use std::mem::{self};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
 
-use super::utils::{Counter, Sharded};
+use super::utils::Counter;
 
 // A hash table layed out in a single allocation
 #[repr(transparent)]
@@ -30,7 +30,7 @@ struct TableLayout {
 
 #[derive(Default)]
 pub struct State {
-    pub count: Sharded<Counter>,
+    pub count: Counter,
     pub next: AtomicPtr<RawTable>,
     pub allocating: Mutex<()>,
     pub copied: AtomicUsize,
