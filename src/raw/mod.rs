@@ -135,38 +135,6 @@ pub struct HashMapRef<'a, K, V, S> {
     hash_builder: &'a S,
 }
 
-// Number of linear probes per triangular.
-const GROUP: usize = 16;
-
-// Triangular probe sequence.
-//
-// See https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n for details.
-#[derive(Default)]
-struct Probe {
-    i: usize,
-    length: usize,
-    stride: usize,
-}
-
-impl Probe {
-    fn start() -> Probe {
-        Probe::default()
-    }
-
-    #[inline]
-    fn next(&mut self) {
-        self.length += 1;
-
-        if self.length % GROUP == 0 {
-            self.stride += GROUP;
-            self.i += self.stride;
-            return;
-        }
-
-        self.i += 1;
-    }
-}
-
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
     K: Sync + Send + Hash + Eq,
@@ -312,7 +280,8 @@ where
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
 
                         // we inserted a new entry, update the entry count
-                        self.table.state().count.get(guard.thread.id).insert(1);
+                        let count = self.table.state().count.get(guard.thread.id);
+                        count.fetch_add(1, Ordering::Relaxed);
                         return EntryStatus::Empty(&new_ref.value);
                     }
                     Err(found) => {
@@ -876,7 +845,9 @@ where
                                 // retire the old value
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
-                                self.table.state().count.get(guard.thread.id).delete(1);
+                                let count = self.table.state().count.get(guard.thread.id);
+                                count.fetch_sub(1, Ordering::Relaxed);
+
                                 return Some((&(*entry_ptr).key, &(*entry_ptr).value));
                             },
 
@@ -949,7 +920,9 @@ where
                 match result {
                     Ok(entry) => unsafe {
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
-                        self.table.state().count.get(guard.thread.id).delete(1);
+
+                        let count = self.table.state().count.get(guard.thread.id);
+                        count.fetch_sub(1, Ordering::Relaxed);
 
                         // retire the old value
                         let entry_ptr = entry.mask(Entry::POINTER);
@@ -1131,9 +1104,9 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 let copied = self.len();
 
                 // update the length of the new table
-                let entries = &next.state().count.get(guard.thread.id).entries;
+                let entries = &next.state().count.get(guard.thread.id);
                 entries
-                    .compare_exchange(0, copied, Ordering::Relaxed, Ordering::Relaxed)
+                    .compare_exchange(0, copied as isize, Ordering::Relaxed, Ordering::Relaxed)
                     .ok();
 
                 match self.root.compare_exchange(
@@ -1226,6 +1199,38 @@ fn entries_for(capacity: usize) -> usize {
     // 75% load factor
     let capacity = capacity.checked_mul(8).expect("capacity overflow") / 6;
     capacity.next_power_of_two()
+}
+
+// Number of linear probes per triangular.
+const GROUP: usize = 16;
+
+// Triangular probe sequence.
+//
+// See https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n for details.
+#[derive(Default)]
+struct Probe {
+    i: usize,
+    length: usize,
+    stride: usize,
+}
+
+impl Probe {
+    fn start() -> Probe {
+        Probe::default()
+    }
+
+    #[inline]
+    fn next(&mut self) {
+        self.length += 1;
+
+        if self.length % GROUP == 0 {
+            self.stride += GROUP;
+            self.i += self.stride;
+            return;
+        }
+
+        self.i += 1;
+    }
 }
 
 #[inline(always)]
