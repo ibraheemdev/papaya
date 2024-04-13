@@ -66,14 +66,6 @@ impl Entry<(), ()> {
     }
 }
 
-// The probe-limit for the table.
-macro_rules! probe_limit {
-    ($capacity:expr) => {
-        // 6 * log2(capacity)
-        6 * ((usize::BITS as usize) - ($capacity.leading_zeros() as usize) - 1)
-    };
-}
-
 impl<K, V, S> HashMap<K, V, S> {
     // Creates a table with the given capacity and hasher.
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
@@ -89,14 +81,7 @@ impl<K, V, S> HashMap<K, V, S> {
             };
         }
 
-        // round the capacity to the next power of two based on an estimated load factor
-        // to hold `capacity` elements
-        let capacity = capacity.next_power_of_two();
-
-        // allocate buffer capacity the same length as the probe limit. this allows us to avoid overflow checks
-        let buffer = probe_limit!(capacity);
-
-        let table = Table::<K, V>::new(capacity, capacity + buffer, collector.link());
+        let table = Table::<K, V>::new(entries_for(capacity), collector.link());
 
         HashMap {
             collector,
@@ -144,11 +129,42 @@ impl<K, V, S> HashMap<K, V, S> {
 
 // A reference to the root hash table, or an arbitrarily nested table migration.
 pub struct HashMapRef<'a, K, V, S> {
-    // TODO: make this an Option to avoid null checks
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
     collector: &'a Collector,
     hash_builder: &'a S,
+}
+
+// Number of linear probes per triangular.
+const GROUP: usize = 16;
+
+// Triangular probe sequence.
+//
+// See https://fgiesen.wordpress.com/2015/02/22/triangular-numbers-mod-2n for details.
+#[derive(Default)]
+struct Probe {
+    i: usize,
+    length: usize,
+    stride: usize,
+}
+
+impl Probe {
+    fn start() -> Probe {
+        Probe::default()
+    }
+
+    #[inline]
+    fn next(&mut self) {
+        self.length += 1;
+
+        if self.length % GROUP == 0 {
+            self.stride += GROUP;
+            self.i += self.stride;
+            return;
+        }
+
+        self.i += 1;
+    }
 }
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
@@ -170,10 +186,16 @@ where
         let hash = self.hash(key);
         let h2 = meta::h2(hash);
 
-        let i = h1(hash) & (self.table.len - 1);
-        let limit = i + probe_limit!(self.table.len);
+        let start = h1(hash) & (self.table.len - 1);
+        let limit = probe_limit!(self.table.len);
+        let mut probe = Probe::start();
 
-        for i in i..=limit {
+        loop {
+            let i = (start + probe.i) & (self.table.len - 1);
+            if probe.length > limit {
+                break;
+            }
+
             let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
             if meta == meta::EMPTY {
@@ -182,6 +204,7 @@ where
 
             // the entry is not the table
             if meta == meta::TOMBSTONE {
+                probe.next();
                 continue;
             }
 
@@ -191,6 +214,7 @@ where
 
                 // the entry was deleted
                 if entry.addr() & Entry::TOMBSTONE != 0 {
+                    probe.next();
                     continue;
                 }
 
@@ -201,6 +225,8 @@ where
                     return Some((&entry_ptr.key, &entry_ptr.value));
                 }
             }
+
+            probe.next();
         }
 
         None
@@ -212,7 +238,6 @@ where
             return Iter {
                 i: 0,
                 table: self.table,
-                capacity: 0,
                 _guard: guard,
             };
         }
@@ -220,7 +245,6 @@ where
         Iter {
             i: 0,
             table: self.table,
-            capacity: self.table.len + probe_limit!(self.table.len),
             _guard: guard,
         }
     }
@@ -258,14 +282,21 @@ where
         let hash = self.hash(&new_ref.key);
         let h2 = meta::h2(hash);
 
-        let i = h1(hash) & (self.table.len - 1);
-        let limit = i + probe_limit!(self.table.len);
+        let start = h1(hash) & (self.table.len - 1);
+        let limit = probe_limit!(self.table.len);
+        let mut probe = Probe::start();
 
-        for i in i..=limit {
+        loop {
+            let i = (start + probe.i) & (self.table.len - 1);
+            if probe.length > limit {
+                break;
+            }
+
             let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
             // we can't reuse tombstones
             if meta == meta::TOMBSTONE {
+                probe.next();
                 continue;
             }
 
@@ -291,6 +322,7 @@ where
 
                         // the entry was deleted or copied
                         if found_ptr.is_null() {
+                            probe.next();
                             continue;
                         }
 
@@ -327,6 +359,7 @@ where
                             }
                         }
 
+                        probe.next();
                         continue;
                     }
                 }
@@ -338,6 +371,7 @@ where
 
                 // the entry was deleted
                 if entry.addr() & Entry::TOMBSTONE != 0 {
+                    probe.next();
                     continue;
                 }
 
@@ -366,9 +400,11 @@ where
                     }
                 }
             }
+
+            probe.next();
         }
 
-        // went over the max probe count or found a copied entry: trigger a resize.
+        // went over the max probe count/load factor or found a copied entry: trigger a resize.
         self.get_or_alloc_next(None);
         let next_table = self.help_copy(guard);
         self.as_ref(next_table)
@@ -450,11 +486,17 @@ where
         let hash = unsafe { self.hash(&(*update).key) };
         let h2 = meta::h2(hash);
 
-        let i = h1(hash) & (self.table.len - 1);
-        let limit = i + probe_limit!(self.table.len);
+        let start = h1(hash) & (self.table.len - 1);
+        let limit = probe_limit!(self.table.len);
+        let mut probe = Probe::start();
         let mut copying = false;
 
-        'probe: for i in i..=limit {
+        'probe: loop {
+            let i = (start + probe.i) & (self.table.len - 1);
+            if probe.length > limit {
+                break;
+            }
+
             let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
 
             // the key is not in this table
@@ -464,6 +506,7 @@ where
 
             // the entry was deleted
             if meta == meta::TOMBSTONE {
+                probe.next();
                 continue;
             }
 
@@ -473,6 +516,7 @@ where
 
                 // the entry was deleted
                 if entry.addr() & Entry::TOMBSTONE != 0 {
+                    probe.next();
                     continue;
                 }
 
@@ -499,7 +543,6 @@ where
                         ) {
                             // succesful update
                             Ok(_) => unsafe {
-                                // eprintln!("UPDATED {}", guard.thread.id);
                                 let entry_ptr = entry.mask(Entry::POINTER);
 
                                 // retire the old entry
@@ -522,6 +565,8 @@ where
                     }
                 }
             }
+
+            probe.next();
         }
 
         if copying {
@@ -534,13 +579,14 @@ where
         None
     }
 
+    // Reserve capacity for `additional` more elements.
     pub fn reserve(&mut self, additional: usize, guard: &Guard<'_>) {
-        if self.table.raw.is_null() && self.init(Some(additional)) {
+        if self.table.raw.is_null() && self.init(Some(entries_for(additional))) {
             return;
         }
 
         loop {
-            let capacity = (self.len() + additional).next_power_of_two();
+            let capacity = entries_for(self.len() + additional);
             // we have enough capacity
             if self.table.len >= capacity {
                 return;
@@ -555,12 +601,8 @@ where
     fn init<'g>(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
 
-        let capacity = capacity.unwrap_or(CAPACITY);
-        let table = Table::<K, V>::new(
-            capacity,
-            capacity + probe_limit!(capacity),
-            self.collector.link(),
-        );
+        let table = Table::<K, V>::new(capacity.unwrap_or(CAPACITY), self.collector.link());
+
         match self.root.compare_exchange(
             ptr::null_mut(),
             table.raw,
@@ -582,6 +624,8 @@ where
     }
 
     // Help along the resize operation until it completes.
+    //
+    // Must be called on the root (or ex-root) table, after `get_or_alloc_next`.
     fn help_copy(&self, guard: &Guard<'_>) -> Table<K, V> {
         // while we only copy from the root table, if the new allocation runs out of space the
         // copy must be aborted, so we use the resize state of the aborted table to manage the
@@ -605,12 +649,11 @@ where
             }
 
             // the true table capacity, we have to copy every entry including from the buffer
-            let capacity = self.table.len + probe_limit!(self.table.len);
-            let copy_chunk = capacity.min(1024);
+            let copy_chunk = self.table.len.min(4096);
 
             loop {
                 // every entry has already been claimed
-                if curr.state().claim.load(Ordering::Acquire) >= capacity {
+                if curr.state().claim.load(Ordering::Acquire) >= self.table.len {
                     break;
                 }
 
@@ -621,7 +664,7 @@ where
                 for i in 0..copy_chunk {
                     let i = copy_start + i;
 
-                    if i >= capacity {
+                    if i >= self.table.len {
                         break;
                     }
 
@@ -701,10 +744,16 @@ where
 
         let hash = self.hash(key);
 
-        let i = h1(hash) & (self.table.len - 1);
-        let limit = i + probe_limit!(self.table.len);
+        let start = h1(hash) & (self.table.len - 1);
+        let limit = probe_limit!(self.table.len);
+        let mut probe = Probe::start();
 
-        for i in i..=limit {
+        loop {
+            let i = (start + probe.i) & (self.table.len - 1);
+            if probe.length > limit {
+                break;
+            }
+
             let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
             assert_ne!(meta, meta::TOMBSTONE);
 
@@ -736,6 +785,8 @@ where
                     }
                 }
             }
+
+            probe.next();
         }
 
         false
@@ -754,11 +805,17 @@ where
         let hash = self.hash(key);
         let h2 = meta::h2(hash);
 
-        let i = h1(hash) & (self.table.len - 1);
-        let limit = i + probe_limit!(self.table.len);
+        let start = h1(hash) & (self.table.len - 1);
+        let limit = probe_limit!(self.table.len);
+        let mut probe = Probe::start();
         let mut copying = false;
 
-        'probe: for i in i..=limit {
+        'probe: loop {
+            let i = (start + probe.i) & (self.table.len - 1);
+            if probe.length > limit {
+                break;
+            }
+
             let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
 
             // the key is not in this table
@@ -768,6 +825,7 @@ where
 
             // the entry was deleted
             if meta == meta::TOMBSTONE {
+                probe.next();
                 continue;
             }
 
@@ -776,6 +834,7 @@ where
 
                 // the entry was deleted
                 if entry.addr() & Entry::TOMBSTONE != 0 {
+                    probe.next();
                     continue;
                 }
 
@@ -826,6 +885,8 @@ where
                     }
                 }
             }
+
+            probe.next();
         }
 
         // found a copied entry, we have to finish the resize and delete it in the new table
@@ -846,7 +907,7 @@ where
         let mut copying = false;
 
         // drop all the entries
-        'probe: for i in 0..(self.table.len + probe_limit!(self.table.len)) {
+        'probe: for i in 0..self.table.len {
             let mut entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
             loop {
                 // a non-empty entry is being copied. clear every entry in this table that we can, then
@@ -915,7 +976,6 @@ where
 // An iterator over the keys and values of this table.
 pub struct Iter<'g, K, V> {
     i: usize,
-    capacity: usize,
     table: Table<K, V>,
     _guard: &'g Guard<'g>,
 }
@@ -924,7 +984,6 @@ impl<'g, K, V> Clone for Iter<'g, K, V> {
     fn clone(&self) -> Self {
         Iter {
             table: self.table,
-            capacity: self.capacity,
             _guard: self._guard,
             i: self.i,
         }
@@ -940,7 +999,7 @@ impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
         }
 
         loop {
-            if self.i >= self.capacity {
+            if self.i >= self.table.len {
                 return None;
             }
 
@@ -1024,14 +1083,13 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
 
         // double the table's capacity
         let next_capacity = capacity.unwrap_or(self.table.len << 1);
-        let buffer = probe_limit!(next_capacity);
 
         if next_capacity > isize::MAX as usize {
             panic!("Hash table exceeded maximum capacity");
         }
 
         // allocate the new table
-        let next = Table::new(next_capacity, next_capacity + buffer, self.collector.link());
+        let next = Table::new(next_capacity, self.collector.link());
         state.next.store(next.raw, Ordering::Release);
         drop(_allocating);
 
@@ -1048,8 +1106,6 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         copied: usize,
         guard: &Guard<'_>,
     ) -> bool {
-        let capacity = self.table.len + probe_limit!(self.table.len);
-
         // update the count
         let copied = if copied > 0 {
             state.copied.fetch_add(copied, Ordering::AcqRel) + copied
@@ -1057,7 +1113,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
             state.copied.load(Ordering::Acquire)
         };
 
-        if copied == capacity {
+        if copied == self.table.len {
             let root = self.root.load(Ordering::Acquire);
             if self.table.raw == root {
                 let copied = self.len();
@@ -1126,7 +1182,7 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
         assert!(table.state().next.load(Ordering::Acquire).is_null());
 
         // drop all the entries
-        for i in 0..(table.len + probe_limit!(table.len)) {
+        for i in 0..table.len {
             let entry = unsafe { *table.entry(i).as_ptr() };
             let entry_ptr = entry.mask(Entry::POINTER);
 
@@ -1141,6 +1197,23 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
         // deallocate the table
         unsafe { Table::dealloc(table) };
     }
+}
+
+// The maximum probe length for table operations.
+macro_rules! probe_limit {
+    ($capacity:expr) => {
+        // 5 * log2(capacity): testing shows this gives us a ~75-80% load factor
+        5 * ((usize::BITS as usize) - ($capacity.leading_zeros() as usize) - 1)
+    };
+}
+
+pub(self) use probe_limit;
+
+// Returns an esitmate of he number of entries needed to hold `capacity` elements.
+fn entries_for(capacity: usize) -> usize {
+    // 75% load factor
+    let capacity = capacity.checked_mul(8).expect("capacity overflow") / 6;
+    capacity.next_power_of_two()
 }
 
 #[inline(always)]
