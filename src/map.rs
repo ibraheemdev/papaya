@@ -496,7 +496,7 @@ where
     #[inline]
     pub fn iter<'g>(&self, guard: &'g Guard<'_>) -> Iter<'g, K, V> {
         Iter {
-            raw: self.raw.root(&guard).iter(&guard),
+            raw: self.raw.root(guard).iter(guard),
         }
     }
 
@@ -675,7 +675,7 @@ where
 {
     fn clone(&self) -> HashMap<K, V, S> {
         let guard = self.guard();
-        let other = Self::with_capacity_and_hasher(self.len(&guard), self.raw.hash_builder.clone())
+        let other = Self::with_capacity_and_hasher(self.len(&guard), self.raw.hasher.clone())
             .with_collector(self.raw.collector.clone());
 
         {
@@ -714,7 +714,7 @@ where
     /// Returns a reference to the inner [`HashMap`].
     #[inline]
     pub fn map(&self) -> &'map HashMap<K, V, S> {
-        &self.map
+        self.map
     }
 
     /// Returns the number of entries in the map.
@@ -773,7 +773,7 @@ where
     ///
     /// See [`HashMap::insert`] for details.
     #[inline]
-    pub fn insert<'g>(&'g self, key: K, value: V) -> Option<&'g V> {
+    pub fn insert(&self, key: K, value: V) -> Option<&V> {
         self.map.insert(key, value, &self.guard)
     }
 
@@ -782,7 +782,7 @@ where
     ///
     /// See [`HashMap::try_insert`] for details.
     #[inline]
-    pub fn try_insert<'g>(&'g self, key: K, value: V) -> Result<&'g V, OccupiedError<'g, V>> {
+    pub fn try_insert(&self, key: K, value: V) -> Result<&V, OccupiedError<'_, V>> {
         self.map.try_insert(key, value, &self.guard)
     }
 
@@ -790,7 +790,7 @@ where
     //
     /// See [`HashMap::update`] for details.
     #[inline]
-    pub fn update<'g, F>(&'g self, key: K, update: F) -> Option<&'g V>
+    pub fn update<F>(&self, key: K, update: F) -> Option<&V>
     where
         F: Fn(&V) -> V,
     {

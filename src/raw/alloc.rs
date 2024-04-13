@@ -60,12 +60,7 @@ impl<T> Copy for Table<T> {}
 
 impl<T> Clone for Table<T> {
     fn clone(&self) -> Self {
-        Table {
-            capacity: self.capacity,
-            len: self.len,
-            raw: self.raw,
-            _t: PhantomData,
-        }
+        *self
     }
 }
 

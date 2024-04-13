@@ -2,7 +2,7 @@ mod alloc;
 mod utils;
 
 use std::borrow::Borrow;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{fence, AtomicPtr, Ordering};
@@ -16,7 +16,7 @@ use seize::{AsLink, Collector, Guard, Link};
 // A lock-free hash-map.
 pub struct HashMap<K, V, S> {
     pub collector: Collector,
-    pub hash_builder: S,
+    pub hasher: S,
     table: AtomicPtr<RawTable>,
     _kv: PhantomData<(K, V)>,
 }
@@ -75,7 +75,7 @@ impl<K, V, S> HashMap<K, V, S> {
         if capacity == 0 {
             return HashMap {
                 collector,
-                hash_builder,
+                hasher: hash_builder,
                 table: AtomicPtr::new(ptr::null_mut()),
                 _kv: PhantomData,
             };
@@ -85,15 +85,10 @@ impl<K, V, S> HashMap<K, V, S> {
 
         HashMap {
             collector,
-            hash_builder,
+            hasher: hash_builder,
             table: AtomicPtr::new(table.raw),
             _kv: PhantomData,
         }
-    }
-
-    // Returns the capacity of the table.
-    pub fn capacity<'g>(&self, guard: &'g Guard<'_>) -> usize {
-        self.root(guard).table.len
     }
 
     // Returns a reclamation guard.
@@ -103,7 +98,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
     // Returns a reference to the root hash table.
     #[inline(always)]
-    pub fn root<'g>(&self, guard: &'g Guard<'_>) -> HashMapRef<'_, K, V, S> {
+    pub fn root<'g>(&'g self, guard: &'g Guard<'_>) -> HashMapRef<'g, K, V, S> {
         if let Some(c) = guard.collector() {
             assert!(
                 Collector::ptr_eq(c, &self.collector),
@@ -117,12 +112,12 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     // Returns a reference to the given table.
-    fn as_ref<'a>(&'a self, table: Table<K, V>) -> HashMapRef<'a, K, V, S> {
+    fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'_, K, V, S> {
         HashMapRef {
             table,
             root: &self.table,
             collector: &self.collector,
-            hash_builder: &self.hash_builder,
+            hasher: &self.hasher,
         }
     }
 }
@@ -132,7 +127,7 @@ pub struct HashMapRef<'a, K, V, S> {
     table: Table<K, V>,
     root: &'a AtomicPtr<RawTable>,
     collector: &'a Collector,
-    hash_builder: &'a S,
+    hasher: &'a S,
 }
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
@@ -151,7 +146,7 @@ where
             return None;
         }
 
-        let hash = self.hash(key);
+        let hash = self.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
         let start = h1(hash) & (self.table.len - 1);
@@ -247,7 +242,7 @@ where
 
         let new_ref = unsafe { &*new_entry.mask(Entry::POINTER) };
 
-        let hash = self.hash(&new_ref.key);
+        let hash = self.hasher.hash_one(&new_ref.key);
         let h2 = meta::h2(hash);
 
         let start = h1(hash) & (self.table.len - 1);
@@ -298,7 +293,7 @@ where
                         // ensure the meta table is updated to avoid breaking the probe chain
                         unsafe {
                             if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
-                                let hash = self.hash(&(*found_ptr).key);
+                                let hash = self.hasher.hash_one(&(*found_ptr).key);
                                 self.table.meta(i).store(meta::h2(hash), Ordering::Release);
                             }
                         }
@@ -452,7 +447,7 @@ where
     where
         F: Fn(&V) -> V,
     {
-        let hash = unsafe { self.hash(&(*update).key) };
+        let hash = unsafe { self.hasher.hash_one(&(*update).key) };
         let h2 = meta::h2(hash);
 
         let start = h1(hash) & (self.table.len - 1);
@@ -516,7 +511,7 @@ where
 
                                 // retire the old entry
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
-                                return Some(&(*update).value.assume_init_ref());
+                                return Some((*update).value.assume_init_ref());
                             },
 
                             // the entry got deleted
@@ -567,7 +562,7 @@ where
     }
 
     // Allocate the inital table.
-    fn init<'g>(&mut self, capacity: Option<usize>) -> bool {
+    fn init(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
 
         let table = Table::<K, V>::new(capacity.unwrap_or(CAPACITY), self.collector.link());
@@ -720,10 +715,10 @@ where
     }
 
     // Copy an entry into the table.
-    fn insert_copy<'g>(&self, new_entry: *mut Entry<K, V>) -> bool {
+    fn insert_copy(&self, new_entry: *mut Entry<K, V>) -> bool {
         let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
 
-        let hash = self.hash(key);
+        let hash = self.hasher.hash_one(key);
 
         let start = h1(hash) & (self.table.len - 1);
         let limit = probe_limit!(self.table.len);
@@ -759,7 +754,7 @@ where
                         // ensure the meta table is updated to avoid breaking the probe chain
                         unsafe {
                             if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
-                                let hash = self.hash(&(*found_ptr).key);
+                                let hash = self.hasher.hash_one(&(*found_ptr).key);
                                 self.table.meta(i).store(meta::h2(hash), Ordering::Release);
                             }
                         }
@@ -783,7 +778,7 @@ where
             return None;
         }
 
-        let hash = self.hash(key);
+        let hash = self.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
         let start = h1(hash) & (self.table.len - 1);
@@ -879,7 +874,7 @@ where
             return self.as_ref(next_table).remove(key, guard);
         }
 
-        return None;
+        None
     }
 
     pub fn clear(&self, guard: &Guard<'_>) {
@@ -944,17 +939,6 @@ where
             let next_table = self.help_copy(guard);
             return self.as_ref(next_table).clear(guard);
         }
-    }
-
-    // Returns the hash of a key.
-    #[inline(always)]
-    fn hash<Q>(&self, key: &Q) -> u64
-    where
-        Q: Hash + ?Sized,
-    {
-        let mut h = self.hash_builder.build_hasher();
-        key.hash(&mut h);
-        h.finish()
     }
 }
 
@@ -1109,21 +1093,24 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                     .compare_exchange(0, copied as isize, Ordering::Relaxed, Ordering::Relaxed)
                     .ok();
 
-                match self.root.compare_exchange(
-                    self.table.raw,
-                    next.raw,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => unsafe {
+                if self
+                    .root
+                    .compare_exchange(
+                        self.table.raw,
+                        next.raw,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    unsafe {
                         // retire the old table. not we don't drop any entries because everything was copied
                         guard.defer_retire(self.table.raw, |link| {
                             let raw: *mut RawTable = link.cast();
                             let table: Table<K, V> = Table::from_raw(raw);
                             Table::dealloc(table);
                         })
-                    },
-                    _ => {}
+                    }
                 }
 
                 // wake up anyone waiting for the promotion
@@ -1137,7 +1124,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
     }
 
     // Returns the number of entries in the table.
-    pub fn len<'g>(&self) -> usize {
+    pub fn len(&self) -> usize {
         if self.table.raw.is_null() {
             return 0;
         }
@@ -1151,7 +1138,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
             table,
             root: self.root,
             collector: self.collector,
-            hash_builder: self.hash_builder,
+            hasher: self.hasher,
         }
     }
 }
@@ -1192,7 +1179,7 @@ macro_rules! probe_limit {
     };
 }
 
-pub(self) use probe_limit;
+use probe_limit;
 
 // Returns an esitmate of he number of entries needed to hold `capacity` elements.
 fn entries_for(capacity: usize) -> usize {
