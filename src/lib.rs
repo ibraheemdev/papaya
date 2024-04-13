@@ -3,4 +3,5 @@
 mod map;
 mod raw;
 
-pub use map::HashMap;
+pub use map::{HashMap, HashMapRef};
+pub use seize::Guard;

@@ -5,8 +5,7 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
-# seize = "0.3.1"
-seize = { path = "../../memory-reclamation/seize" } 
+seize = "0.3.2"
 
 [dev-dependencies]
 rand = "0.8"

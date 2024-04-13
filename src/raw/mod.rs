@@ -275,7 +275,7 @@ where
                         unsafe { self.table.meta(i).store(h2, Ordering::Release) };
 
                         // we inserted a new entry, update the entry count
-                        let count = self.table.state().count.get(guard.thread.id);
+                        let count = self.table.state().count.get(guard.thread_id());
                         count.fetch_add(1, Ordering::Relaxed);
                         return EntryStatus::Empty(&new_ref.value);
                     }
@@ -840,7 +840,7 @@ where
                                 // retire the old value
                                 guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
 
-                                let count = self.table.state().count.get(guard.thread.id);
+                                let count = self.table.state().count.get(guard.thread_id());
                                 count.fetch_sub(1, Ordering::Relaxed);
 
                                 return Some((&(*entry_ptr).key, &(*entry_ptr).value));
@@ -916,7 +916,7 @@ where
                     Ok(entry) => unsafe {
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
-                        let count = self.table.state().count.get(guard.thread.id);
+                        let count = self.table.state().count.get(guard.thread_id());
                         count.fetch_sub(1, Ordering::Relaxed);
 
                         // retire the old value
@@ -1088,7 +1088,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                 let copied = self.len();
 
                 // update the length of the new table
-                let entries = &next.state().count.get(guard.thread.id);
+                let entries = &next.state().count.get(guard.thread_id());
                 entries
                     .compare_exchange(0, copied as isize, Ordering::Relaxed, Ordering::Relaxed)
                     .ok();
