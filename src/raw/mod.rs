@@ -692,7 +692,9 @@ where
             }
 
             // we copied all that we can, wait for the table to be promoted
-            loop {
+            for spun in 0.. {
+                const SPIN_WAIT: usize = 7;
+
                 let status = curr.state().status.load(Ordering::Acquire);
 
                 // if this copy was aborted, we have to retry in the new table
@@ -703,6 +705,16 @@ where
                 // the copy is complete
                 if status == State::COMPLETE {
                     return next;
+                }
+
+                // copy chunks are relatively small and we expect to finish quickly,
+                // so spin for a bit before resorting to parking
+                if spun <= SPIN_WAIT {
+                    for _ in 0..(spun * spun) {
+                        hint::spin_loop();
+                    }
+
+                    continue;
                 }
 
                 atomic_wait::wait(&curr.state().status, State::PENDING);
