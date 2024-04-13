@@ -1,9 +1,8 @@
-use std::alloc;
 use std::alloc::Layout;
 use std::marker::PhantomData;
-use std::mem::{self};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
 use std::sync::Mutex;
+use std::{alloc, mem, ptr};
 
 use super::utils::Counter;
 
@@ -15,6 +14,7 @@ pub struct RawTable(u8);
 unsafe impl seize::AsLink for RawTable {}
 
 #[repr(align(16))]
+#[allow(dead_code)]
 struct AtomicU128(u128);
 
 // The table allocation's layout
@@ -155,6 +155,7 @@ impl<T> Table<T> {
 
     pub unsafe fn dealloc(table: Table<T>) {
         let layout = Self::layout(table.capacity);
+        ptr::drop_in_place(table.raw.cast::<TableLayout>());
         unsafe { alloc::dealloc(table.raw.cast::<u8>(), layout) }
     }
 
