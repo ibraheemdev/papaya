@@ -70,13 +70,12 @@ impl<T> Clone for Table<T> {
 }
 
 impl<T> Table<T> {
-    pub fn new(len: usize, mut capacity: usize, link: seize::Link) -> Table<T> {
+    pub fn new(len: usize, link: seize::Link) -> Table<T> {
+        assert!(len.is_power_of_two());
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
-        // pad the meta table to allow one meta group of overflow
-        capacity += ((capacity - len) + 15) & !15;
         // pad the meta table to fulfill the alignment requirement of an entry
-        capacity = (capacity + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
+        let capacity = (len + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
 
         unsafe {
             let layout = Self::layout(capacity);
@@ -177,10 +176,11 @@ fn layout() {
     unsafe {
         let collector = seize::Collector::new();
         let link = collector.link();
-        let table: Table<u8> = Table::new(30, 31, link);
+        let table: Table<u8> = Table::new(4, link);
         let table: Table<u8> = Table::from_raw(table.raw);
-        assert_eq!(table.len, 30);
-        assert_eq!(table.capacity, 48);
+        assert_eq!(table.len, 4);
+        // padded for pointer alignment
+        assert_eq!(table.capacity, 8);
         Table::dealloc(table);
     }
 }
