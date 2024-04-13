@@ -5,13 +5,13 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
-fxhash = "0.2.1"
-rand = "0.8.5"
 # seize = "0.3.1"
 seize = { path = "../../memory-reclamation/seize" } 
-zipf = "7.0.1"
 
 [dev-dependencies]
+rand = "0.8"
+dashmap = "5.5"
+criterion = "0.5"
 
 [[bench]]
 name = "bench"
