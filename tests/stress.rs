@@ -8,18 +8,17 @@ use std::sync::Barrier;
 use std::thread;
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn contains_key_stress() {
-    const NUM_ENTRIES: usize = 160;
-    const ITERATIONS: usize = 256;
-    const ROUNDS: usize = 32;
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 256 };
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 10 };
+    const ROUNDS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let map = HashMap::new();
-    let mut content = [0; NUM_ENTRIES];
+    let mut content = [0; ENTRIES];
 
     {
         let guard = map.guard();
-        for k in 0..NUM_ENTRIES {
+        for k in 0..ENTRIES {
             map.insert(k, k, &guard);
             content[k] = k;
         }
@@ -33,7 +32,7 @@ fn contains_key_stress() {
                 s.spawn(|| {
                     barrier.wait();
                     let guard = map.guard();
-                    for i in 0..NUM_ENTRIES * ROUNDS {
+                    for i in 0..ENTRIES * ROUNDS {
                         let key = content[i % content.len()];
                         assert!(map.contains_key(&key, &guard));
                     }
@@ -45,7 +44,7 @@ fn contains_key_stress() {
 
 #[test]
 fn update_stress() {
-    const ITERATIONS: usize = 64;
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
     let map = HashMap::<usize, usize>::new();
@@ -82,10 +81,9 @@ fn update_stress() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn insert_stress<'g>() {
-    const NUM_ENTRIES: usize = 1024;
-    const ITERATIONS: usize = 64;
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 12 };
 
     #[derive(Hash, PartialEq, Eq, Clone, Copy)]
     struct KeyVal {
@@ -107,7 +105,7 @@ fn insert_stress<'g>() {
             for _ in 0..threads {
                 s.spawn(|| {
                     barrier.wait();
-                    for _ in 0..NUM_ENTRIES {
+                    for _ in 0..ENTRIES {
                         let key = KeyVal::new();
                         map.insert(key, key, &map.guard());
                         assert!(map.contains_key(&key, &map.guard()));
@@ -120,19 +118,21 @@ fn insert_stress<'g>() {
 
 #[test]
 fn mixed_stress() {
+    const CHUNK: usize = if cfg!(miri) { 48 } else { 1 << 14 };
+
     let map = HashMap::<usize, usize>::new();
-    let barrier = Barrier::new(16);
-    let chunk = 1 << 14;
+    let threads = thread::available_parallelism().unwrap().get().min(8);
+    let barrier = Barrier::new(threads);
 
     thread::scope(|s| {
-        for t in 0..16 {
+        for t in 0..threads {
             let map = &map;
             let barrier = &barrier;
 
             s.spawn(move || {
                 barrier.wait();
 
-                let (start, end) = (chunk * t, chunk * (t + 1));
+                let (start, end) = (CHUNK * t, CHUNK * (t + 1));
 
                 for i in start..end {
                     assert_eq!(map.pin().insert(i, i + 1), None);
@@ -163,30 +163,23 @@ fn mixed_stress() {
                 }
 
                 for (&k, &v) in map.pin().iter() {
-                    assert!(k < chunk * 16);
+                    assert!(k < CHUNK * threads);
                     assert!(v == k || v == k + 1);
                 }
             });
         }
     });
 
-    let v: Vec<_> = (0..chunk * 16).map(|i| (i, i + 1)).collect();
+    let v: Vec<_> = (0..CHUNK * threads).map(|i| (i, i + 1)).collect();
     let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
     got.sort();
     assert_eq!(v, got);
 }
 
-#[cfg(not(miri))]
-const SIZE: usize = 50_000;
-#[cfg(miri)]
-const SIZE: usize = 12;
+const SIZE: usize = if cfg!(miri) { 12 } else { 50_000 };
 
 // there must be more things absent than present!
-#[cfg(not(miri))]
-const ABSENT_SIZE: usize = 1 << 17;
-#[cfg(miri)]
-const ABSENT_SIZE: usize = 1 << 5;
-
+const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 5 } else { 1 << 17 };
 const ABSENT_MASK: usize = ABSENT_SIZE - 1;
 
 fn t1<K, V>(map: &HashMap<K, V>, keys: &[K], expect: usize)
