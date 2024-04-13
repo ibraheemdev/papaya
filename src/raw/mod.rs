@@ -1198,12 +1198,12 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
             let entry = unsafe { *table.entry(i).as_ptr() };
             let entry_ptr = entry.mask(Entry::POINTER);
 
-            // nothing to copy
+            // nothing to deallocate
             if entry_ptr.is_null() || entry.addr() & Entry::TOMBSTONE != 0 {
                 continue;
             }
 
-            unsafe { self.collector.retire(entry_ptr, Entry::retire::<K, V>) }
+            unsafe { Entry::retire::<K, V>(entry_ptr as *mut Link) }
         }
 
         // deallocate the table
