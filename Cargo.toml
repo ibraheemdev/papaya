@@ -13,5 +13,9 @@ dashmap = "5.5"
 criterion = "0.5"
 
 [[bench]]
-name = "bench"
+name = "compare"
+harness = false
+
+[[bench]]
+name = "misc"
 harness = false

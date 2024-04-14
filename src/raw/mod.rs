@@ -690,16 +690,12 @@ where
     //
     // Returns true if the entry was copied by this thread,
     fn copy_index(&self, i: usize, new_table: Table<K, V>) -> bool {
-        let mut entry = unsafe { self.table.entry(i) }.load(Ordering::Acquire);
-
-        if entry.addr() & Entry::COPYING == 0 {
-            // mark the entry as copying
-            entry = unsafe {
-                self.table
-                    .entry(i)
-                    .fetch_or(Entry::COPYING, Ordering::AcqRel)
-            };
-        }
+        // mark the entry as copying
+        let entry = unsafe {
+            self.table
+                .entry(i)
+                .fetch_or(Entry::COPYING, Ordering::AcqRel)
+        };
 
         // there is nothing to copy
         if entry.mask(Entry::POINTER).is_null() {
@@ -1210,7 +1206,7 @@ impl Probe {
     fn next(&mut self) {
         self.length += 1;
 
-        if self.length % GROUP == 0 {
+        if self.length & (GROUP - 1) == 0 {
             self.stride += GROUP;
             self.i += self.stride;
             return;
