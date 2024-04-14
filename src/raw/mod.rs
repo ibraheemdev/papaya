@@ -201,14 +201,14 @@ where
             return Iter {
                 i: 0,
                 table: self.table,
-                _guard: guard,
+                guard,
             };
         }
 
         Iter {
             i: 0,
             table: self.table,
-            _guard: guard,
+            guard,
         }
     }
 
@@ -882,7 +882,7 @@ where
 
         // drop all the entries
         'probe: for i in 0..self.table.len {
-            let mut entry = unsafe { self.table.entry(i).load(Ordering::Acquire) };
+            let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
             loop {
                 // a non-empty entry is being copied. clear every entry in this table that we can, then
                 // deal with the copy
@@ -942,14 +942,14 @@ where
 pub struct Iter<'g, K, V> {
     i: usize,
     table: Table<K, V>,
-    _guard: &'g Guard<'g>,
+    guard: &'g Guard<'g>,
 }
 
 impl<'g, K, V> Clone for Iter<'g, K, V> {
     fn clone(&self) -> Self {
         Iter {
             table: self.table,
-            _guard: self._guard,
+            guard: self.guard,
             i: self.i,
         }
     }
@@ -975,7 +975,10 @@ impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
                 continue;
             }
 
-            let entry = unsafe { self.table.entry(self.i) }.load(Ordering::Acquire);
+            let entry = unsafe {
+                self.guard
+                    .protect(self.table.entry(self.i), Ordering::Acquire)
+            };
 
             if entry.addr() & Entry::TOMBSTONE != 0 {
                 self.i += 1;
@@ -1079,7 +1082,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         };
 
         if copied == self.table.len {
-            let root = self.root.load(Ordering::Acquire);
+            let root = guard.protect(&self.root, Ordering::Acquire);
             if self.table.raw == root {
                 let copied = self.len();
 
