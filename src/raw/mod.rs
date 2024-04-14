@@ -1170,7 +1170,7 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
 // The maximum probe length for table operations.
 macro_rules! probe_limit {
     ($capacity:expr) => {
-        // 5 * log2(capacity): testing shows this gives us a ~75-80% load factor
+        // 5 * log2(capacity): testing shows this gives us a ~80% load factor
         5 * ((usize::BITS as usize) - ($capacity.leading_zeros() as usize) - 1)
     };
 }
@@ -1179,13 +1179,13 @@ use probe_limit;
 
 // Returns an esitmate of he number of entries needed to hold `capacity` elements.
 fn entries_for(capacity: usize) -> usize {
-    // 75% load factor
+    // we should rarely resize before 75%
     let capacity = capacity.checked_mul(8).expect("capacity overflow") / 6;
     capacity.next_power_of_two()
 }
 
 // Number of linear probes per triangular.
-const GROUP: usize = 16;
+const GROUP: usize = 8;
 
 // Triangular probe sequence.
 //
