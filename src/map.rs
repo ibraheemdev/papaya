@@ -1,5 +1,5 @@
 use crate::raw::{self, EntryStatus};
-use seize::{Collector, Guard};
+use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
@@ -126,23 +126,52 @@ impl<K, V, S> HashMap<K, V, S> {
         self
     }
 
-    /// Returns a `Guard` for use with this map.
+    /// Returns a guard for use with this map.
     ///
-    /// Note that holding on to a `Guard` pins the current thread, preventing garbage
+    /// Note that holding on to a guard pins the current thread, preventing garbage
     /// collection. See the [crate-level documentation](crate) for details.
     #[inline]
-    pub fn guard(&self) -> Guard<'_> {
+    pub fn guard(&self) -> LocalGuard<'_> {
         self.raw.collector.enter()
+    }
+
+    /// Returns an owned guard for use with this map.
+    ///
+    /// Owned guards implement `Send` and `Sync`, allowing them to be held across
+    /// `.await` points in multi-threaded schedulers. This is especially useful
+    /// for iterators.
+    ///
+    /// Note that holding on to a guard pins the current thread, preventing garbage
+    /// collection. See the [crate-level documentation](crate) for details.
+    #[inline]
+    pub fn owned_guard(&self) -> OwnedGuard<'_> {
+        self.raw.collector.enter_owned()
     }
 
     /// Returns a pinned reference to the map.
     ///
-    /// The returned reference manages a `Guard` internally, preventing garbage collection
+    /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate) for details.
     #[inline]
-    pub fn pin(&self) -> HashMapRef<'_, K, V, S> {
+    pub fn pin(&self) -> HashMapRef<'_, K, V, S, LocalGuard<'_>> {
         HashMapRef {
-            guard: self.raw.guard(),
+            guard: self.guard(),
+            map: self,
+        }
+    }
+
+    /// Returns a pinned reference to the map.
+    ///
+    /// Unlike [`pin`](HashMap::pin), the retured reference implements `Send`
+    /// and `Sync`, allowing it to be held across `.await` points in multi-threaded
+    /// schedulers. This is especially useful for iterators.
+    ///
+    /// The returned reference manages a guard internally, preventing garbage collection
+    /// for as long as it is held. See the [crate-level documentation](crate) for details.
+    #[inline]
+    pub fn pin_owned(&self) -> HashMapRef<'_, K, V, S, OwnedGuard<'_>> {
+        HashMapRef {
+            guard: self.owned_guard(),
             map: self,
         }
     }
@@ -169,7 +198,7 @@ where
     /// map.pin().insert(2, "b");
     /// assert!(map.pin().len() == 2);
     /// ```
-    pub fn len(&self, guard: &Guard<'_>) -> usize {
+    pub fn len(&self, guard: &impl Guard) -> usize {
         self.raw.root(guard).len()
     }
 
@@ -185,7 +214,7 @@ where
     /// map.pin().insert("a", 1);
     /// assert!(!map.pin().is_empty());
     /// ```
-    pub fn is_empty(&self, guard: &Guard<'_>) -> bool {
+    pub fn is_empty(&self, guard: &impl Guard) -> bool {
         self.len(guard) == 0
     }
 
@@ -211,7 +240,7 @@ where
     /// assert_eq!(m.contains_key(&2), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q>(&self, key: &Q, guard: &Guard<'_>) -> bool
+    pub fn contains_key<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -240,7 +269,7 @@ where
     /// assert_eq!(m.get(&2), None);
     /// ```
     #[inline]
-    pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g Guard<'_>) -> Option<&'g V>
+    pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -269,7 +298,7 @@ where
     /// assert_eq!(m.get_key_value(&2), None);
     /// ```
     #[inline]
-    pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
+    pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -305,7 +334,7 @@ where
     /// assert_eq!(m.get(&37), Some(&"c"));
     /// ```
     #[inline]
-    pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g Guard<'_>) -> Option<&'g V> {
+    pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
         match self.raw.root(guard).insert(key, value, true, guard) {
             EntryStatus::Empty(_) | EntryStatus::Tombstone(_) => None,
             EntryStatus::Replaced(value) => Some(value),
@@ -339,7 +368,7 @@ where
         &self,
         key: K,
         value: V,
-        guard: &'g Guard<'_>,
+        guard: &'g impl Guard,
     ) -> Result<&'g V, OccupiedError<'g, V>> {
         match self.raw.root(guard).insert(key, value, false, guard) {
             EntryStatus::Empty(value) | EntryStatus::Tombstone(value) => Ok(value),
@@ -377,7 +406,7 @@ where
     /// map.pin().update("a", |v| v + 1);
     /// assert_eq!(m.get(&"a"), Some(&2));
     // ```
-    pub fn update<'g, F>(&self, key: K, update: F, guard: &'g Guard<'_>) -> Option<&'g V>
+    pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
     {
@@ -402,7 +431,7 @@ where
     /// assert_eq!(map.pin().remove(&1), None);
     /// ```
     #[inline]
-    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<&'g V>
+    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
         K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
@@ -432,7 +461,7 @@ where
     /// assert_eq!(map.pin().remove(&1), None);
     /// ```
     #[inline]
-    pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -454,7 +483,7 @@ where
     ///
     /// map.pin().reserve(10);
     /// ```
-    pub fn reserve(&self, additional: usize, guard: &Guard<'_>) {
+    pub fn reserve(&self, additional: usize, guard: &impl Guard) {
         self.raw.root(guard).reserve(additional, guard);
     }
 
@@ -472,7 +501,7 @@ where
     /// assert!(map.pin().is_empty());
     /// ```
     #[inline]
-    pub fn clear(&self, guard: &Guard<'_>) {
+    pub fn clear(&self, guard: &impl Guard) {
         self.raw.root(guard).clear(guard)
     }
 
@@ -494,7 +523,10 @@ where
     ///     println!("key: {key} val: {val}");
     /// }
     #[inline]
-    pub fn iter<'g>(&self, guard: &'g Guard<'_>) -> Iter<'g, K, V> {
+    pub fn iter<'g, G>(&self, guard: &'g G) -> Iter<'g, K, V, G>
+    where
+        G: Guard,
+    {
         Iter {
             raw: self.raw.root(guard).iter(guard),
         }
@@ -519,7 +551,10 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn keys<'g>(&self, guard: &'g Guard<'_>) -> Keys<'g, K, V> {
+    pub fn keys<'g, G>(&self, guard: &'g G) -> Keys<'g, K, V, G>
+    where
+        G: Guard,
+    {
         Keys {
             iter: self.iter(guard),
         }
@@ -544,7 +579,10 @@ where
     /// }
     /// ```
     #[inline]
-    pub fn values<'g>(&self, guard: &'g Guard<'_>) -> Values<'g, K, V> {
+    pub fn values<'g, G>(&self, guard: &'g G) -> Values<'g, K, V, G>
+    where
+        G: Guard,
+    {
         Values {
             iter: self.iter(guard),
         }
@@ -564,8 +602,8 @@ where
             return false;
         }
 
-        self.iter(guard1)
-            .all(|(key, value)| other.get(key, guard2).map_or(false, |v| *value == *v))
+        let mut iter = self.iter(guard1);
+        iter.all(|(key, value)| other.get(key, guard2).map_or(false, |v| *value == *v))
     }
 }
 
@@ -649,7 +687,7 @@ where
 
         if let Some((key, value)) = iter.next() {
             // safety: we own `map`
-            let guard = unsafe { Guard::unprotected() };
+            let guard = unsafe { seize::unprotected() };
 
             let (lower, _) = iter.size_hint();
             let map = HashMap::with_capacity_and_hasher(lower.saturating_add(1), S::default());
@@ -703,16 +741,17 @@ pub struct OccupiedError<'a, V: 'a> {
 /// A pinned reference to a hash table.
 ///
 /// See [`HashMap::pin`] for details.
-pub struct HashMapRef<'map, K, V, S> {
-    guard: Guard<'map>,
+pub struct HashMapRef<'map, K, V, S, G> {
+    guard: G,
     map: &'map HashMap<K, V, S>,
 }
 
-impl<'map, K, V, S> HashMapRef<'map, K, V, S>
+impl<'map, K, V, S, G> HashMapRef<'map, K, V, S, G>
 where
     K: Clone + Hash + Eq + Send + Sync,
     V: Send + Sync,
     S: BuildHasher,
+    G: Guard,
 {
     /// Returns a reference to the inner [`HashMap`].
     #[inline]
@@ -848,7 +887,7 @@ where
     ///
     /// See [`HashMap::iter`] for details.
     #[inline]
-    pub fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V, G> {
         self.map.iter(&self.guard)
     }
 
@@ -857,7 +896,7 @@ where
     ///
     /// See [`HashMap::keys`] for details.
     #[inline]
-    pub fn keys(&self) -> Keys<'_, K, V> {
+    pub fn keys(&self) -> Keys<'_, K, V, G> {
         self.map.keys(&self.guard)
     }
 
@@ -866,7 +905,7 @@ where
     ///
     /// See [`HashMap::values`] for details.
     #[inline]
-    pub fn values(&self) -> Values<'_, K, V> {
+    pub fn values(&self) -> Values<'_, K, V, G> {
         self.map.values(&self.guard)
     }
 }
@@ -874,11 +913,14 @@ where
 /// An iterator over a map's entries.
 ///
 /// See [`HashMap::iter`](crate::HashMap::iter) for details.
-pub struct Iter<'g, K, V> {
-    raw: raw::Iter<'g, K, V>,
+pub struct Iter<'g, K, V, G> {
+    raw: raw::Iter<'g, K, V, G>,
 }
 
-impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
+impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
+where
+    G: Guard,
+{
     type Item = (&'g K, &'g V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -886,10 +928,11 @@ impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
     }
 }
 
-impl<K, V> fmt::Debug for Iter<'_, K, V>
+impl<K, V, G> fmt::Debug for Iter<'_, K, V, G>
 where
     K: fmt::Debug,
     V: fmt::Debug,
+    G: Guard,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
@@ -903,12 +946,14 @@ where
 /// An iterator over a map's keys.
 ///
 /// See [`HashMap::keys`](crate::HashMap::keys) for details.
-#[derive(Debug)]
-pub struct Keys<'g, K, V> {
-    iter: Iter<'g, K, V>,
+pub struct Keys<'g, K, V, G> {
+    iter: Iter<'g, K, V, G>,
 }
 
-impl<'g, K: 'g, V: 'g> Iterator for Keys<'g, K, V> {
+impl<'g, K: 'g, V: 'g, G> Iterator for Keys<'g, K, V, G>
+where
+    G: Guard,
+{
     type Item = &'g K;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -917,19 +962,43 @@ impl<'g, K: 'g, V: 'g> Iterator for Keys<'g, K, V> {
     }
 }
 
+impl<K, V, G> fmt::Debug for Keys<'_, K, V, G>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+    G: Guard,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Keys").field(&self.iter).finish()
+    }
+}
+
 /// An iterator over a map's values.
 ///
 /// See [`HashMap::values`](crate::HashMap::values) for details.
-#[derive(Debug)]
-pub struct Values<'g, K, V> {
-    iter: Iter<'g, K, V>,
+pub struct Values<'g, K, V, G> {
+    iter: Iter<'g, K, V, G>,
 }
 
-impl<'g, K: 'g, V: 'g> Iterator for Values<'g, K, V> {
+impl<'g, K: 'g, V: 'g, G> Iterator for Values<'g, K, V, G>
+where
+    G: Guard,
+{
     type Item = &'g V;
 
     fn next(&mut self) -> Option<Self::Item> {
         let (_, value) = self.iter.next()?;
         Some(value)
+    }
+}
+
+impl<K, V, G> fmt::Debug for Values<'_, K, V, G>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+    G: Guard,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Values").field(&self.iter).finish()
     }
 }
