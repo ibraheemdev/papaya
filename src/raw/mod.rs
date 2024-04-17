@@ -91,20 +91,13 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    // Returns a reclamation guard.
-    pub fn guard(&self) -> Guard<'_> {
-        self.collector.enter()
-    }
-
     // Returns a reference to the root hash table.
     #[inline(always)]
-    pub fn root<'g>(&'g self, guard: &'g Guard<'_>) -> HashMapRef<'g, K, V, S> {
-        if let Some(c) = guard.collector() {
-            assert!(
-                Collector::ptr_eq(c, &self.collector),
-                "accessed map with incorrect guard"
-            )
-        }
+    pub fn root<'g>(&'g self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
+        assert!(
+            guard.belongs_to(&self.collector),
+            "accessed map with incorrect guard"
+        );
 
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
@@ -137,7 +130,7 @@ where
     S: BuildHasher,
 {
     // Returns a reference to the value corresponding to the key.
-    pub fn get_entry<'g, Q>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
+    pub fn get_entry<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -196,19 +189,22 @@ where
     }
 
     // Returns an iterator over the keys and values of this table.
-    pub fn iter<'g>(&self, guard: &'g Guard<'_>) -> Iter<'g, K, V> {
+    pub fn iter<'g, G>(&self, guard: &'g G) -> Iter<'g, K, V, G>
+    where
+        G: Guard,
+    {
         if self.table.raw.is_null() {
             return Iter {
                 i: 0,
-                table: self.table,
                 guard,
+                table: self.table,
             };
         }
 
         Iter {
             i: 0,
-            table: self.table,
             guard,
+            table: self.table,
         }
     }
 
@@ -218,7 +214,7 @@ where
         key: K,
         value: V,
         replace: bool,
-        guard: &'g Guard<'_>,
+        guard: &'g impl Guard,
     ) -> EntryStatus<'g, V> {
         let entry = Box::into_raw(Box::new(Entry {
             key,
@@ -234,7 +230,7 @@ where
         &mut self,
         new_entry: *mut Entry<K, V>,
         replace: bool,
-        guard: &'g Guard<'_>,
+        guard: &'g impl Guard,
     ) -> EntryStatus<'g, V> {
         if self.table.raw.is_null() {
             self.init(None);
@@ -383,7 +379,7 @@ where
         i: usize,
         mut entry: *mut Entry<K, V>,
         new_entry: *mut Entry<K, V>,
-        guard: &'g Guard<'_>,
+        guard: &'g impl Guard,
     ) -> ReplaceStatus<&'g V> {
         loop {
             // the entry is being copied to a new table, we have to finish the resize before we insert
@@ -420,7 +416,7 @@ where
     }
 
     // Update an entry with a remapping function.
-    pub fn update<'g, F>(&self, key: K, f: F, guard: &'g Guard<'_>) -> Option<&'g V>
+    pub fn update<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
     {
@@ -442,7 +438,7 @@ where
         &self,
         update: *mut Entry<K, MaybeUninit<V>>,
         f: F,
-        guard: &'g Guard<'_>,
+        guard: &'g impl Guard,
     ) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
@@ -544,7 +540,7 @@ where
     }
 
     // Reserve capacity for `additional` more elements.
-    pub fn reserve(&mut self, additional: usize, guard: &Guard<'_>) {
+    pub fn reserve(&mut self, additional: usize, guard: &impl Guard) {
         if self.table.raw.is_null() && self.init(Some(entries_for(additional))) {
             return;
         }
@@ -590,7 +586,7 @@ where
     // Help along the resize operation until it completes.
     //
     // Must be called on the root (or ex-root) table, after `get_or_alloc_next`.
-    fn help_copy(&self, guard: &Guard<'_>) -> Table<K, V> {
+    fn help_copy(&self, guard: &impl Guard) -> Table<K, V> {
         // while we only copy from the root table, if the new allocation runs out of space the
         // copy must be aborted, so we use the resize state of the aborted table to manage the
         // next resize attempt. `curr` represents the root, or last aborted table.
@@ -765,7 +761,7 @@ where
     }
 
     // Removes a key from the map, returning the entry for the key if the key was previously in the map.
-    pub fn remove<'g, Q: ?Sized>(&self, key: &Q, guard: &'g Guard<'_>) -> Option<(&'g K, &'g V)>
+    pub fn remove<'g, Q: ?Sized>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq,
@@ -873,7 +869,7 @@ where
         None
     }
 
-    pub fn clear(&self, guard: &Guard<'_>) {
+    pub fn clear(&self, guard: &impl Guard) {
         if self.table.raw.is_null() {
             return;
         }
@@ -939,23 +935,42 @@ where
 }
 
 // An iterator over the keys and values of this table.
-pub struct Iter<'g, K, V> {
+pub struct Iter<'g, K, V, G> {
     i: usize,
     table: Table<K, V>,
-    guard: &'g Guard<'g>,
+    guard: &'g G,
 }
 
-impl<'g, K, V> Clone for Iter<'g, K, V> {
+unsafe impl<K, V, G> Send for Iter<'_, K, V, G>
+where
+    K: Send,
+    V: Send,
+    G: Sync,
+{
+}
+
+unsafe impl<K, V, G> Sync for Iter<'_, K, V, G>
+where
+    K: Send,
+    V: Send,
+    G: Sync,
+{
+}
+
+impl<K, V, G> Clone for Iter<'_, K, V, G> {
     fn clone(&self) -> Self {
         Iter {
+            i: self.i,
             table: self.table,
             guard: self.guard,
-            i: self.i,
         }
     }
 }
 
-impl<'g, K: 'g, V: 'g> Iterator for Iter<'g, K, V> {
+impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
+where
+    G: Guard,
+{
     type Item = (&'g K, &'g V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1072,7 +1087,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         state: &State,
         next: Table<K, V>,
         copied: usize,
-        guard: &Guard<'_>,
+        guard: &impl Guard,
     ) -> bool {
         // update the count
         let copied = if copied > 0 {
