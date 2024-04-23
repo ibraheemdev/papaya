@@ -96,11 +96,11 @@ fn insert_and_get_key_value() {
     let map = HashMap::<usize, usize>::new();
 
     map.insert(42, 0, &map.guard());
-   // {
-   //     let guard = map.guard();
-   //     let e = map.get_key_value(&42, &guard).unwrap();
-   //     assert_eq!(e, (&42, &0));
-   // }
+    {
+        let guard = map.guard();
+        let e = map.get_key_value(&42, &guard).unwrap();
+        assert_eq!(e, (&42, &0));
+    }
 }
 
 #[test]
