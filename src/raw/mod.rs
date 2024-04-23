@@ -9,7 +9,7 @@ use std::sync::atomic::{fence, AtomicPtr, Ordering};
 use std::{hint, ptr};
 
 use self::alloc::{RawTable, State};
-use self::utils::{AtomicPtrFetchOps, StrictProvenance};
+use self::utils::{AtomicPtrFetchOps, StrictProvenance, Tagged};
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -61,8 +61,8 @@ impl Entry<(), ()> {
 
     // Retires an entry.
     unsafe fn retire<K, V>(link: *mut Link) {
-        let entry_addr: *mut Entry<K, V> = link.cast();
-        let _entry = unsafe { Box::from_raw(entry_addr) };
+        let entry: *mut Entry<K, V> = link.cast();
+        let _entry = unsafe { Box::from_raw(entry) };
     }
 }
 
@@ -166,19 +166,18 @@ where
 
             // potential match
             if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                    .unpack(Entry::POINTER);
 
                 // the entry was deleted
-                if entry.addr() & Entry::TOMBSTONE != 0 {
+                if entry.addr & Entry::TOMBSTONE != 0 {
                     probe.next();
                     continue;
                 }
 
-                let entry_ptr = unsafe { &*entry.mask(Entry::POINTER) };
-
                 // check for a full match
-                if entry_ptr.key.borrow() == key {
-                    return Some((&entry_ptr.key, &entry_ptr.value));
+                if unsafe { (*entry.ptr).key.borrow() } == key {
+                    return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
                 }
             }
 
@@ -236,7 +235,7 @@ where
             self.init(None);
         }
 
-        let new_ref = unsafe { &*new_entry.mask(Entry::POINTER) };
+        let new_ref = unsafe { &*new_entry };
 
         let hash = self.hasher.hash_one(&new_ref.key);
         let h2 = meta::h2(hash);
@@ -276,12 +275,12 @@ where
                         return EntryStatus::Empty(&new_ref.value);
                     }
                     Err(found) => {
+                        let found = found.unpack(Entry::POINTER);
+
                         fence(Ordering::Acquire);
 
-                        let found_ptr = found.mask(Entry::POINTER);
-
                         // the entry was deleted or copied
-                        if found_ptr.is_null() {
+                        if found.ptr.is_null() {
                             probe.next();
                             continue;
                         }
@@ -289,17 +288,17 @@ where
                         // ensure the meta table is updated to avoid breaking the probe chain
                         unsafe {
                             if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
-                                let hash = self.hasher.hash_one(&(*found_ptr).key);
+                                let hash = self.hasher.hash_one(&(*found.ptr).key);
                                 self.table.meta(i).store(meta::h2(hash), Ordering::Release);
                             }
                         }
 
                         // if the same key was just inserted, we might be able to update
-                        if unsafe { (*found_ptr).key == new_ref.key } {
+                        if unsafe { (*found.ptr).key == new_ref.key } {
                             // don't replace the existing value, bail
                             if !replace {
                                 let new_entry = unsafe { Box::from_raw(new_entry) };
-                                let current = unsafe { &(*found_ptr).value };
+                                let current = unsafe { &(*found.ptr).value };
 
                                 return EntryStatus::Error {
                                     current,
@@ -327,22 +326,21 @@ where
 
             // potential match
             if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                    .unpack(Entry::POINTER);
 
                 // the entry was deleted
-                if entry.addr() & Entry::TOMBSTONE != 0 {
+                if entry.addr & Entry::TOMBSTONE != 0 {
                     probe.next();
                     continue;
                 }
 
-                let entry_ptr = entry.mask(Entry::POINTER);
-
                 // if the key matches, we might be able to update
-                if unsafe { (*entry_ptr).key == new_ref.key } {
+                if unsafe { (*entry.ptr).key == new_ref.key } {
                     // don't replace the existing value, bail
                     if !replace {
                         let new_entry = unsafe { Box::from_raw(new_entry) };
-                        let current = unsafe { &(*entry_ptr).value };
+                        let current = unsafe { &(*entry.ptr).value };
 
                         return EntryStatus::Error {
                             current,
@@ -377,29 +375,27 @@ where
     fn replace_entry<'g>(
         &self,
         i: usize,
-        mut entry: *mut Entry<K, V>,
+        mut entry: Tagged<*mut Entry<K, V>>,
         new_entry: *mut Entry<K, V>,
         guard: &'g impl Guard,
     ) -> ReplaceStatus<&'g V> {
         loop {
             // the entry is being copied to a new table, we have to finish the resize before we insert
-            if entry.addr() & Entry::COPYING != 0 {
+            if entry.addr & Entry::COPYING != 0 {
                 return ReplaceStatus::HelpCopy;
             }
 
             match unsafe { self.table.entry(i) }.compare_exchange_weak(
-                entry,
+                entry.raw,
                 new_entry,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 // succesful update
                 Ok(_) => unsafe {
-                    let entry_ptr = entry.mask(Entry::POINTER);
-
                     // retire the old value
-                    guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
-                    return ReplaceStatus::Replaced(&(*entry_ptr).value);
+                    guard.defer_retire(entry.ptr, Entry::retire::<K, V>);
+                    return ReplaceStatus::Replaced(&(*entry.ptr).value);
                 },
 
                 // lost to a delete
@@ -409,7 +405,7 @@ where
 
                 // lost to a concurrent update, retry
                 Err(found) => {
-                    entry = found;
+                    entry = found.unpack(Entry::POINTER);
                 }
             }
         }
@@ -472,41 +468,40 @@ where
 
             // potential match
             if meta == h2 {
-                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                    .unpack(Entry::POINTER);
 
                 // the entry was deleted
-                if entry.addr() & Entry::TOMBSTONE != 0 {
+                if entry.addr & Entry::TOMBSTONE != 0 {
                     probe.next();
                     continue;
                 }
 
                 // the key matches, we might be able to perform an update
-                if unsafe { (*entry.mask(Entry::POINTER)).key == (*update).key } {
+                if unsafe { (*entry.ptr).key == (*update).key } {
                     loop {
                         // the entry is being copied to a new table, we have to copy it before we can update it
-                        if entry.addr() & Entry::COPYING != 0 {
+                        if entry.addr & Entry::COPYING != 0 {
                             copying = true;
                             break 'probe;
                         }
 
                         // construct the new value
                         unsafe {
-                            let value = f(&(*entry.mask(Entry::POINTER)).value);
+                            let value = f(&(*entry.ptr).value);
                             (*update).value = MaybeUninit::new(value);
                         }
 
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
-                            entry,
+                            entry.raw,
                             update as _,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
                             // succesful update
                             Ok(_) => unsafe {
-                                let entry_ptr = entry.mask(Entry::POINTER);
-
                                 // retire the old entry
-                                guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
+                                guard.defer_retire(entry.ptr, Entry::retire::<K, V>);
                                 return Some((*update).value.assume_init_ref());
                             },
 
@@ -519,7 +514,7 @@ where
                             Err(found) => {
                                 // drop the old value
                                 unsafe { (*update).value.assume_init_drop() }
-                                entry = found;
+                                entry = found.unpack(Entry::POINTER);
                             }
                         }
                     }
@@ -691,24 +686,21 @@ where
             self.table
                 .entry(i)
                 .fetch_or(Entry::COPYING, Ordering::AcqRel)
+                .unpack(Entry::POINTER)
         };
 
         // there is nothing to copy
-        if entry.mask(Entry::POINTER).is_null() {
+        if entry.ptr.is_null() {
             unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
             return true;
-        } else if entry.addr() & Entry::TOMBSTONE != 0 {
-            return true;
         }
-
         // otherwise, copy the value
-        let entry = entry.mask(Entry::POINTER);
-        self.as_ref(new_table).insert_copy(entry)
+        self.as_ref(new_table).insert_copy(entry.ptr)
     }
 
     // Copy an entry into the table.
     fn insert_copy(&self, new_entry: *mut Entry<K, V>) -> bool {
-        let key = unsafe { &(*new_entry.mask(Entry::POINTER)).key };
+        let key = unsafe { &(*new_entry).key };
 
         let hash = self.hasher.hash_one(key);
 
@@ -740,13 +732,13 @@ where
                         return true;
                     }
                     Err(found) => {
-                        let found_ptr = found.mask(Entry::POINTER);
-                        assert!(!found_ptr.is_null());
+                        let found = found.unpack(Entry::POINTER);
+                        assert!(!found.ptr.is_null());
 
                         // ensure the meta table is updated to avoid breaking the probe chain
                         unsafe {
                             if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
-                                let hash = self.hasher.hash_one(&(*found_ptr).key);
+                                let hash = self.hasher.hash_one(&(*found.ptr).key);
                                 self.table.meta(i).store(meta::h2(hash), Ordering::Release);
                             }
                         }
@@ -798,20 +790,19 @@ where
             }
 
             if meta == h2 {
-                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                    .unpack(Entry::POINTER);
 
                 // the entry was deleted
-                if entry.addr() & Entry::TOMBSTONE != 0 {
+                if entry.addr & Entry::TOMBSTONE != 0 {
                     probe.next();
                     continue;
                 }
 
-                let entry_ptr = entry.mask(Entry::POINTER);
-
                 // the key matches, we might be able to perform an update
-                if unsafe { (*entry_ptr).key.borrow() == key } {
+                if unsafe { (*entry.ptr).key.borrow() == key } {
                     // the entry is being copied to a new table, we have to finish the resize and delete it in the new table
-                    if entry.addr() & Entry::COPYING != 0 {
+                    if entry.addr & Entry::COPYING != 0 {
                         copying = true;
                         break;
                     }
@@ -819,23 +810,22 @@ where
                     loop {
                         // perform the deletion
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
-                            entry,
+                            entry.raw,
                             Entry::TOMBSTONE as _,
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
                             // succesfully deleted
                             Ok(_) => unsafe {
-                                let entry_ptr = entry.mask(Entry::POINTER);
                                 self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
                                 // retire the old value
-                                guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
+                                guard.defer_retire(entry.ptr, Entry::retire::<K, V>);
 
                                 let count = self.table.state().count.get(guard.thread_id());
                                 count.fetch_sub(1, Ordering::Relaxed);
 
-                                return Some((&(*entry_ptr).key, &(*entry_ptr).value));
+                                return Some((&(*entry.ptr).key, &(*entry.ptr).value));
                             },
 
                             // the entry is being copied to the new table
@@ -850,7 +840,7 @@ where
                             }
 
                             // lost to a concurrent update, retry
-                            Err(found) => entry = found,
+                            Err(found) => entry = found.unpack(Entry::POINTER),
                         }
                     }
                 }
@@ -878,26 +868,25 @@ where
 
         // drop all the entries
         'probe: for i in 0..self.table.len {
-            let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) };
+            let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                .unpack(Entry::POINTER);
+
             loop {
                 // a non-empty entry is being copied. clear every entry in this table that we can, then
                 // deal with the copy
-                if entry.addr() & Entry::COPYING != 0
-                    && !entry.mask(Entry::POINTER).is_null()
-                    && entry.addr() & Entry::TOMBSTONE == 0
-                {
+                if entry.addr & Entry::COPYING != 0 && !entry.ptr.is_null() {
                     copying = true;
                     continue 'probe;
                 }
 
                 // the entry is empty or already deleted
-                if entry.is_null() || entry.addr() & Entry::TOMBSTONE != 0 {
+                if entry.ptr.is_null() {
                     continue 'probe;
                 }
 
                 let result = unsafe {
                     self.table.entry(i).compare_exchange(
-                        entry,
+                        entry.raw,
                         Entry::TOMBSTONE as _,
                         Ordering::AcqRel,
                         Ordering::Acquire,
@@ -905,19 +894,18 @@ where
                 };
 
                 match result {
-                    Ok(entry) => unsafe {
+                    Ok(_) => unsafe {
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
                         let count = self.table.state().count.get(guard.thread_id());
                         count.fetch_sub(1, Ordering::Relaxed);
 
                         // retire the old value
-                        let entry_ptr = entry.mask(Entry::POINTER);
-                        guard.defer_retire(entry_ptr, Entry::retire::<K, V>);
+                        guard.defer_retire(entry.ptr, Entry::retire::<K, V>);
                         break;
                     },
                     Err(found) => {
-                        entry = found;
+                        entry = found.unpack(Entry::POINTER);
                         continue;
                     }
                 }
@@ -993,16 +981,17 @@ where
             let entry = unsafe {
                 self.guard
                     .protect(self.table.entry(self.i), Ordering::Acquire)
+                    .unpack(Entry::POINTER)
             };
 
-            if entry.addr() & Entry::TOMBSTONE != 0 {
+            assert!(!entry.ptr.is_null());
+            if entry.addr & Entry::TOMBSTONE != 0 {
                 self.i += 1;
                 continue;
             }
 
-            let entry = unsafe { &*entry.mask(Entry::POINTER) };
             self.i += 1;
-            return Some((&entry.key, &entry.value));
+            return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
         }
     }
 }
@@ -1169,15 +1158,14 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
 
         // drop all the entries
         for i in 0..table.len {
-            let entry = unsafe { *table.entry(i).as_ptr() };
-            let entry_ptr = entry.mask(Entry::POINTER);
+            let entry = unsafe { (*table.entry(i).as_ptr()).unpack(Entry::POINTER) };
 
             // nothing to deallocate
-            if entry_ptr.is_null() || entry.addr() & Entry::TOMBSTONE != 0 {
+            if entry.ptr.is_null() || entry.addr & Entry::TOMBSTONE != 0 {
                 continue;
             }
 
-            unsafe { Entry::retire::<K, V>(entry_ptr as *mut Link) }
+            unsafe { Entry::retire::<K, V>(entry.ptr as *mut Link) }
         }
 
         // deallocate the table

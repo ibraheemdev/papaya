@@ -3,9 +3,8 @@ use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 // Polyfill for the unstable strict-provenance APIs.
 pub unsafe trait StrictProvenance: Sized {
     fn addr(self) -> usize;
-    fn with_addr(self, addr: usize) -> Self;
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
-    fn mask(self, mask: usize) -> Self;
+    fn unpack(self, mask: usize) -> Tagged<Self>;
 }
 
 unsafe impl<T> StrictProvenance for *mut T {
@@ -15,19 +14,28 @@ unsafe impl<T> StrictProvenance for *mut T {
     }
 
     #[inline(always)]
-    fn with_addr(self, addr: usize) -> Self {
-        addr as Self
-    }
-
-    #[inline(always)]
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self {
-        self.with_addr(f(self.addr()))
+        f(self.addr()) as Self
     }
 
     #[inline(always)]
-    fn mask(self, mask: usize) -> Self {
-        self.map_addr(|addr| addr & mask)
+    fn unpack(self, mask: usize) -> Tagged<Self> {
+        Tagged {
+            raw: self,
+            ptr: self.map_addr(|addr| addr & mask),
+            addr: self.addr() & !mask,
+        }
     }
+}
+
+#[derive(Copy, Clone)]
+pub struct Tagged<T> {
+    // The raw, tagged pointer.
+    pub raw: T,
+    // The untagged pointer.
+    pub ptr: T,
+    // The pointer address.
+    pub addr: usize,
 }
 
 pub trait AtomicPtrFetchOps<T> {
