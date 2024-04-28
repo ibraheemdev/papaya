@@ -69,6 +69,9 @@ impl<T> Table<T> {
         assert!(len.is_power_of_two());
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
+        // group size is 16
+        let len = len.max(16);
+
         // pad the meta table to fulfill the alignment requirement of an entry
         let capacity = (len + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
 
@@ -140,6 +143,15 @@ impl<T> Table<T> {
     }
 
     #[inline(always)]
+    pub unsafe fn meta_group(&self, i: usize) -> *mut u128 {
+        assert!((i + 15) < self.capacity, "{i} {}", self.capacity);
+        self.raw
+            .add(mem::size_of::<TableLayout>())
+            .add(i * mem::size_of::<u8>())
+            .cast::<u128>()
+    }
+
+    #[inline(always)]
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
         let offset = mem::size_of::<TableLayout>()
             + mem::size_of::<u8>() * self.capacity
@@ -172,11 +184,11 @@ fn layout() {
     unsafe {
         let collector = seize::Collector::new();
         let link = collector.link();
-        let table: Table<u8> = Table::new(4, link);
+        let table: Table<u8> = Table::new(16, link);
         let table: Table<u8> = Table::from_raw(table.raw);
-        assert_eq!(table.len, 4);
+        assert_eq!(table.len, 16);
         // padded for pointer alignment
-        assert_eq!(table.capacity, 8);
+        assert_eq!(table.capacity, 16);
         Table::dealloc(table);
     }
 }

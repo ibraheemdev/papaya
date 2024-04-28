@@ -9,7 +9,7 @@ use std::sync::atomic::{fence, AtomicPtr, Ordering};
 use std::{hint, ptr};
 
 use self::alloc::{RawTable, State};
-use self::utils::{AtomicPtrFetchOps, StrictProvenance, Tagged};
+use self::utils::{arch, AtomicPtrFetchOps, StrictProvenance, Tagged};
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -142,7 +142,7 @@ where
         let hash = self.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
+        let start = h1(hash) & (self.table.len - 1) & !(GROUP - 1);
         let limit = probe_limit!(self.table.len);
         let mut probe = Probe::start();
 
@@ -152,26 +152,15 @@ where
                 break;
             }
 
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+            let group = unsafe { arch::load_128(self.table.meta_group(i)) };
+            for bit in arch::match_byte(group, h2) {
+                let i = i + bit;
 
-            if meta == meta::EMPTY {
-                return None;
-            }
-
-            // the entry is not the table
-            if meta == meta::TOMBSTONE {
-                probe.next();
-                continue;
-            }
-
-            // potential match
-            if meta == h2 {
                 let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
                     .unpack(Entry::POINTER);
 
                 // the entry was deleted
                 if entry.addr & Entry::TOMBSTONE != 0 {
-                    probe.next();
                     continue;
                 }
 
@@ -181,7 +170,11 @@ where
                 }
             }
 
-            probe.next();
+            if arch::match_byte(group, meta::EMPTY).any_set() {
+                return None;
+            }
+
+            probe.next_group();
         }
 
         None
@@ -240,7 +233,8 @@ where
         let hash = self.hasher.hash_one(&new_ref.key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
+        let start = h1(hash) & (self.table.len - 1) & !(GROUP - 1);
+
         let limit = probe_limit!(self.table.len);
         let mut probe = Probe::start();
 
@@ -250,15 +244,46 @@ where
                 break;
             }
 
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+            let group = unsafe { arch::load_128(self.table.meta_group(i)) };
 
-            // we can't reuse tombstones
-            if meta == meta::TOMBSTONE {
-                probe.next();
-                continue;
+            for bit in arch::match_byte(group, h2) {
+                let i = i + bit;
+
+                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                    .unpack(Entry::POINTER);
+
+                // the entry was deleted
+                if entry.addr & Entry::TOMBSTONE != 0 {
+                    continue;
+                }
+
+                // if the key matches, we might be able to update
+                if unsafe { (*entry.ptr).key == new_ref.key } {
+                    // don't replace the existing value, bail
+                    if !replace {
+                        let new_entry = unsafe { Box::from_raw(new_entry) };
+                        let current = unsafe { &(*entry.ptr).value };
+
+                        return EntryStatus::Error {
+                            current,
+                            not_inserted: new_entry.value,
+                        };
+                    }
+
+                    match self.replace_entry(i, entry, new_entry, guard) {
+                        // the entry was deleted before we could update it, keep probing
+                        ReplaceStatus::Removed => {}
+                        // the entry is being copied
+                        ReplaceStatus::HelpCopy => break,
+                        // successful update
+                        ReplaceStatus::Replaced(value) => return EntryStatus::Replaced(value),
+                    }
+                }
             }
 
-            if meta == meta::EMPTY {
+            for bit in arch::match_byte(group, meta::EMPTY) {
+                let i = i + bit;
+
                 match unsafe { self.table.entry(i) }.compare_exchange(
                     ptr::null_mut(),
                     new_entry,
@@ -281,7 +306,6 @@ where
 
                         // the entry was deleted or copied
                         if found.ptr.is_null() {
-                            probe.next();
                             continue;
                         }
 
@@ -318,48 +342,12 @@ where
                             }
                         }
 
-                        probe.next();
                         continue;
                     }
                 }
             }
 
-            // potential match
-            if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
-                    .unpack(Entry::POINTER);
-
-                // the entry was deleted
-                if entry.addr & Entry::TOMBSTONE != 0 {
-                    probe.next();
-                    continue;
-                }
-
-                // if the key matches, we might be able to update
-                if unsafe { (*entry.ptr).key == new_ref.key } {
-                    // don't replace the existing value, bail
-                    if !replace {
-                        let new_entry = unsafe { Box::from_raw(new_entry) };
-                        let current = unsafe { &(*entry.ptr).value };
-
-                        return EntryStatus::Error {
-                            current,
-                            not_inserted: new_entry.value,
-                        };
-                    }
-
-                    match self.replace_entry(i, entry, new_entry, guard) {
-                        // the entry was deleted before we could update it, keep probing
-                        ReplaceStatus::Removed => {}
-                        // the entry is being copied
-                        ReplaceStatus::HelpCopy => break,
-                        // successful update
-                        ReplaceStatus::Replaced(value) => return EntryStatus::Replaced(value),
-                    }
-                }
-            }
-
-            probe.next();
+            probe.next_group();
         }
 
         // went over the max probe count/load factor or found a copied entry: trigger a resize.
@@ -442,7 +430,7 @@ where
         let hash = unsafe { self.hasher.hash_one(&(*update).key) };
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
+        let start = h1(hash) & (self.table.len - 1) & !(GROUP - 1);
         let limit = probe_limit!(self.table.len);
         let mut probe = Probe::start();
         let mut copying = false;
@@ -453,27 +441,16 @@ where
                 break;
             }
 
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+            let group = unsafe { arch::load_128(self.table.meta_group(i)) };
 
-            // the key is not in this table
-            if meta == meta::EMPTY {
-                return None;
-            }
+            for bit in arch::match_byte(group, h2) {
+                let i = i + bit;
 
-            // the entry was deleted
-            if meta == meta::TOMBSTONE {
-                probe.next();
-                continue;
-            }
-
-            // potential match
-            if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
                     .unpack(Entry::POINTER);
 
                 // the entry was deleted
                 if entry.addr & Entry::TOMBSTONE != 0 {
-                    probe.next();
                     continue;
                 }
 
@@ -521,7 +498,7 @@ where
                 }
             }
 
-            probe.next();
+            probe.next_group();
         }
 
         if copying {
@@ -704,7 +681,7 @@ where
 
         let hash = self.hasher.hash_one(key);
 
-        let start = h1(hash) & (self.table.len - 1);
+        let start = h1(hash) & (self.table.len - 1) & !(GROUP - 1);
         let limit = probe_limit!(self.table.len);
         let mut probe = Probe::start();
 
@@ -714,10 +691,11 @@ where
                 break;
             }
 
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
-            assert_ne!(meta, meta::TOMBSTONE);
+            let group = unsafe { arch::load_128(self.table.meta_group(i)) };
 
-            if meta == meta::EMPTY {
+            for bit in arch::match_byte(group, meta::EMPTY) {
+                let i = i + bit;
+
                 let entry = unsafe { self.table.entry(i) };
 
                 // try to claim the entry
@@ -746,7 +724,7 @@ where
                 }
             }
 
-            probe.next();
+            probe.next_group();
         }
 
         false
@@ -765,7 +743,7 @@ where
         let hash = self.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
+        let start = h1(hash) & (self.table.len - 1) & !(GROUP - 1);
         let limit = probe_limit!(self.table.len);
         let mut probe = Probe::start();
         let mut copying = false;
@@ -776,26 +754,16 @@ where
                 break;
             }
 
-            let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
+            let group = unsafe { arch::load_128(self.table.meta_group(i)) };
 
-            // the key is not in this table
-            if meta == meta::EMPTY {
-                return None;
-            }
+            for bit in arch::match_byte(group, h2) {
+                let i = i + bit;
 
-            // the entry was deleted
-            if meta == meta::TOMBSTONE {
-                probe.next();
-                continue;
-            }
-
-            if meta == h2 {
                 let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
                     .unpack(Entry::POINTER);
 
                 // the entry was deleted
                 if entry.addr & Entry::TOMBSTONE != 0 {
-                    probe.next();
                     continue;
                 }
 
@@ -846,7 +814,11 @@ where
                 }
             }
 
-            probe.next();
+            if arch::match_byte(group, meta::EMPTY).any_set() {
+                return None;
+            }
+
+            probe.next_group();
         }
 
         // found a copied entry, we have to finish the resize and delete it in the new table
@@ -1191,7 +1163,7 @@ fn entries_for(capacity: usize) -> usize {
 }
 
 // Number of linear probes per triangular.
-const GROUP: usize = 8;
+const GROUP: usize = 16;
 
 // Triangular probe sequence.
 //
@@ -1209,16 +1181,10 @@ impl Probe {
     }
 
     #[inline]
-    fn next(&mut self) {
-        self.length += 1;
-
-        if self.length & (GROUP - 1) == 0 {
-            self.stride += GROUP;
-            self.i += self.stride;
-            return;
-        }
-
-        self.i += 1;
+    fn next_group(&mut self) {
+        self.length += GROUP;
+        self.stride += GROUP;
+        self.i += self.stride;
     }
 }
 

@@ -169,3 +169,55 @@ impl Counter {
             .unwrap_or(0)
     }
 }
+
+pub mod arch {
+    use std::arch::{asm, x86_64};
+    use std::num::NonZeroU16;
+
+    #[cfg(miri)]
+    pub unsafe fn load_128(src: *mut u128) -> x86_64::__m128i {
+        mem::transmute((*src).to_ne_bytes())
+    }
+
+    #[cfg(not(miri))]
+    pub unsafe fn load_128(src: *mut u128) -> x86_64::__m128i {
+        debug_assert!(src as usize % 16 == 0);
+
+        unsafe {
+            let out: x86_64::__m128i;
+            asm!(
+                concat!("vmovdqa {out}, xmmword ptr [{src}]"),
+                src = in(reg) src,
+                out = out(xmm_reg) out,
+                options(nostack, preserves_flags),
+            );
+            out
+        }
+    }
+
+    pub fn match_byte(group: x86_64::__m128i, byte: u8) -> BitIter {
+        unsafe {
+            let cmp = x86_64::_mm_cmpeq_epi8(group, x86_64::_mm_set1_epi8(byte as i8));
+            BitIter(x86_64::_mm_movemask_epi8(cmp) as u16)
+        }
+    }
+
+    pub struct BitIter(u16);
+
+    impl BitIter {
+        pub fn any_set(self) -> bool {
+            self.0 != 0
+        }
+    }
+
+    impl Iterator for BitIter {
+        type Item = usize;
+
+        #[inline]
+        fn next(&mut self) -> Option<usize> {
+            let bit = NonZeroU16::new(self.0)?.trailing_zeros() as usize;
+            self.0 = self.0 & (self.0 - 1);
+            Some(bit)
+        }
+    }
+}
