@@ -3,5 +3,5 @@
 mod map;
 mod raw;
 
-pub use map::{HashMap, HashMapRef, Iter, Keys, Values};
+pub use map::{HashMap, HashMapRef, Iter, Keys, Values, ResizeMode};
 pub use seize::{Guard, OwnedGuard};

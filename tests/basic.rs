@@ -22,7 +22,7 @@ fn clear() {
         map.insert(4, 1, &guard);
     }
     map.clear(&guard);
-    assert!(map.is_empty(&guard));
+    assert!(map.is_empty());
 }
 
 #[test]
@@ -375,12 +375,10 @@ fn different_values_not_equal() {
 #[test]
 fn clone_map_empty() {
     let map = HashMap::<&'static str, u32>::new();
-    let guard = map.guard();
     let cloned_map = map.clone();
-    let cloned_guard = cloned_map.guard();
-    assert_eq!(map.len(&guard), cloned_map.len(&cloned_guard));
+    assert_eq!(map.len(), cloned_map.len());
     assert_eq!(&map, &cloned_map);
-    assert_eq!(cloned_map.len(&cloned_guard), 0);
+    assert_eq!(cloned_map.len(), 0);
 }
 
 #[test]
@@ -390,9 +388,7 @@ fn clone_map_filled() {
     map.insert("FooKey", 0, &map.guard());
     map.insert("BarKey", 10, &map.guard());
     let cloned_map = map.clone();
-    let guard = map.guard();
-    let cloned_guard = cloned_map.guard();
-    assert_eq!(map.len(&guard), cloned_map.len(&cloned_guard));
+    assert_eq!(map.len(), cloned_map.len());
     assert_eq!(&map, &cloned_map);
 
     // test that we are not mapping the same tables
@@ -465,9 +461,8 @@ fn from_iter_empty() {
 
     let entries: Vec<(usize, usize)> = Vec::new();
     let map: HashMap<usize, usize> = HashMap::from_iter(entries.into_iter());
-    let guard = map.guard();
 
-    assert_eq!(map.len(&guard), 0)
+    assert_eq!(map.len(), 0)
 }
 
 #[test]
@@ -518,35 +513,35 @@ fn mixed() {
     assert!(map.pin().get(&200).is_none());
     assert!(map.pin().get(&300).is_none());
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().get(&i), Some(&(i + 1)));
     }
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().update(i, |i| i - 1), Some(&i));
     }
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().get(&i), Some(&i));
     }
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().remove(&i), Some(&i));
     }
 
-    for i in 0..64 {
+    for i in 0..1024 {
         assert_eq!(map.pin().get(&i), None);
     }
 
-    for i in 0..256 {
+    for i in 0..2048 {
         assert_eq!(map.pin().insert(i, i + 1), None);
     }
 
-    for i in 0..256 {
+    for i in 0..2048 {
         assert_eq!(map.pin().get(&i), Some(&(i + 1)));
     }
 }

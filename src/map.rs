@@ -13,6 +13,28 @@ use std::hash::{BuildHasher, Hash};
 /// for details.
 pub struct HashMap<K, V, S = RandomState> {
     pub raw: raw::HashMap<K, V, S>,
+    pub initial: *mut u8,
+}
+
+unsafe impl<K, V, S: Send> Send for HashMap<K, V, S> {}
+unsafe impl<K, V, S: Sync> Sync for HashMap<K, V, S> {}
+
+pub enum ResizeMode {
+    /// All writes to the map must wait till the resize completes before making progress.
+    ///
+    /// Blocking resizes tend to be better in terms of throughput, especially in setups with
+    /// multiple writers that can perform the resize in parallel. However, they can lead to latency
+    /// spikes for write operations that have to resize large tables.
+    Blocking,
+    /// Writers copy a constant number of key/value pairs to the new table before making
+    /// progress.
+    ///
+    /// Incremental resizes avoids latency spikes that can occur for write operations have
+    /// to resize a large table. However, they reduce parallelism during the resize and so can reduce
+    /// overall throughput. Incremental resizing also means all reads or write operations during an
+    /// in-progress resize may have to search both the current and new table before succeeding, trading
+    /// off median latency during a resize for tail latency.
+    Incremental(usize),
 }
 
 impl<K, V> HashMap<K, V> {
@@ -109,8 +131,10 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.pin().insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
+        let raw = raw::HashMap::with_capacity_and_hasher(capacity, hash_builder);
         HashMap {
-            raw: raw::HashMap::with_capacity_and_hasher(capacity, hash_builder),
+            initial: raw.root_ptr(),
+            raw,
         }
     }
 
@@ -123,6 +147,20 @@ impl<K, V, S> HashMap<K, V, S> {
     /// `collector`.
     pub fn with_collector(mut self, collector: Collector) -> Self {
         self.raw.collector = collector;
+        self
+    }
+
+    /// Configures the resizing mode for this map.
+    ///
+    /// See [`ResizeMode`] for details.
+    pub fn resize_mode(mut self, resize: ResizeMode) -> Self {
+        assert_eq!(
+            self.raw.root_ptr(),
+            self.initial,
+            "cannot change resize mode after initialization"
+        );
+
+        self.raw.resize = resize;
         self
     }
 
@@ -196,10 +234,10 @@ where
     ///
     /// map.pin().insert(1, "a");
     /// map.pin().insert(2, "b");
-    /// assert!(map.pin().len() == 2);
+    /// assert!(map.len() == 2);
     /// ```
-    pub fn len(&self, guard: &impl Guard) -> usize {
-        self.raw.root(guard).len()
+    pub fn len(&self) -> usize {
+        self.raw.len()
     }
 
     /// Returns `true` if the map is empty. Otherwise returns `false`.
@@ -210,12 +248,12 @@ where
     /// use papaya::HashMap;
     ///
     /// let map = HashMap::new();
-    /// assert!(map.pin().is_empty());
+    /// assert!(map.is_empty());
     /// map.pin().insert("a", 1);
-    /// assert!(!map.pin().is_empty());
+    /// assert!(!map.is_empty());
     /// ```
-    pub fn is_empty(&self, guard: &impl Guard) -> bool {
-        self.len(guard) == 0
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -596,11 +634,11 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        let (guard1, guard2) = (&self.guard(), &other.guard());
-
-        if self.len(guard1) != other.len(guard2) {
+        if self.len() != other.len() {
             return false;
         }
+
+        let (guard1, guard2) = (&self.guard(), &other.guard());
 
         let mut iter = self.iter(guard1);
         iter.all(|(key, value)| other.get(key, guard2).map_or(false, |v| *value == *v))
@@ -639,14 +677,14 @@ where
         // Reserve the entire hint lower bound if the map is empty.
         // Otherwise reserve half the hint (rounded up), so the map
         // will only resize twice in the worst case.
-        let guard = self.guard();
         let iter = iter.into_iter();
-        let reserve = if self.is_empty(&guard) {
+        let reserve = if self.is_empty() {
             iter.size_hint().0
         } else {
             (iter.size_hint().0 + 1) / 2
         };
 
+        let guard = self.guard();
         self.reserve(reserve, &guard);
 
         for (key, value) in iter {
@@ -712,14 +750,13 @@ where
     S: BuildHasher + Clone,
 {
     fn clone(&self) -> HashMap<K, V, S> {
-        let guard = self.guard();
-        let other = Self::with_capacity_and_hasher(self.len(&guard), self.raw.hasher.clone())
+        let other = Self::with_capacity_and_hasher(self.len(), self.raw.hasher.clone())
             .with_collector(self.raw.collector.clone());
 
         {
-            let other_guard = other.guard();
-            for (key, value) in self.iter(&guard) {
-                other.insert(key.clone(), value.clone(), &other_guard);
+            let (guard1, guard2) = (&self.guard(), &other.guard());
+            for (key, value) in self.iter(guard1) {
+                other.insert(key.clone(), value.clone(), guard2);
             }
         }
 
@@ -764,7 +801,7 @@ where
     /// See [`HashMap::len`] for details.
     #[inline]
     pub fn len(&self) -> usize {
-        self.map.len(&self.guard)
+        self.map.len()
     }
 
     /// Returns `true` if the map is empty. Otherwise returns `false`.
@@ -772,7 +809,7 @@ where
     /// See [`HashMap::is_empty`] for details.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty(&self.guard)
+        self.map.is_empty()
     }
 
     /// Returns `true` if the map contains a value for the specified key.

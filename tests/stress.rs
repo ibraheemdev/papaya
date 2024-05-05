@@ -60,7 +60,7 @@ fn update_stress() {
         let threads = thread::available_parallelism().unwrap().get().min(8);
         let barrier = std::sync::Barrier::new(threads);
 
-        std::thread::scope(|s| {
+        thread::scope(|s| {
             for _ in 0..threads {
                 s.spawn(|| {
                     barrier.wait();
