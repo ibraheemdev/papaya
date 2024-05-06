@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 
 // Polyfill for the unstable strict-provenance APIs.
+#[allow(clippy::missing_safety_doc)]
 pub unsafe trait StrictProvenance: Sized {
     fn addr(self) -> usize;
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;

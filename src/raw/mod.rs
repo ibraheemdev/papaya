@@ -153,7 +153,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
     // Returns a reference to the given table.
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'_, K, V, S> {
-        HashMapRef { table, root: &self }
+        HashMapRef { table, root: self }
     }
 }
 
