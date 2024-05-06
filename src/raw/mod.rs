@@ -602,7 +602,7 @@ where
 
                         match unsafe { self.table.entry(i) }.compare_exchange_weak(
                             entry.raw,
-                            new_entry as _,
+                            new_entry.cast(),
                             Ordering::AcqRel,
                             Ordering::Acquire,
                         ) {
@@ -963,13 +963,13 @@ where
             }
         }
 
-        let mut next = None;
+        let mut next: Option<(Table<K, V>, usize)> = None;
 
         loop {
             // the entry was deleted
             if entry.addr & Entry::TOMBSTONE != 0 {
                 // if we already inserted into the new table, we have to delete the copy
-                if let Some(next) = next {
+                if let Some((next_table, next)) = next {
                     unsafe {
                         // delete the entry we inserted
                         next_table
@@ -999,7 +999,7 @@ where
             match next {
                 // we already inserted into the table but the entry changed,
                 // so we just update the copy
-                Some(next) => unsafe {
+                Some((next_table, next)) => unsafe {
                     next_table.entry(next).store(
                         entry.ptr.map_addr(|addr| addr | Entry::BORROWED),
                         Ordering::Release,
@@ -1047,7 +1047,11 @@ where
     //
     // If `abort` is `true`, this method returns `None` if the table is full.
     // Otherwise, it will recursively try to allocate and insert into a resize.
-    fn insert_copy(&self, new_entry: Tagged<*mut Entry<K, V>>, abort: bool) -> Option<usize> {
+    fn insert_copy(
+        &self,
+        new_entry: Tagged<*mut Entry<K, V>>,
+        abort: bool,
+    ) -> Option<(Table<K, V>, usize)> {
         let key = unsafe { &(*new_entry.ptr).key };
 
         let hash = self.root.hasher.hash_one(key);
@@ -1076,7 +1080,7 @@ where
                 ) {
                     Ok(_) => {
                         unsafe { self.table.meta(i).store(meta::h2(hash), Ordering::Release) };
-                        return Some(i);
+                        return Some((self.table, i));
                     }
                     Err(found) => {
                         fence(Ordering::Acquire);
@@ -1093,7 +1097,7 @@ where
                                 meta::h2(hash)
                             };
 
-                            if self.table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
+                            if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
                                 self.table.meta(i).store(meta, Ordering::Release);
                             }
                         }
