@@ -730,13 +730,13 @@ where
     // Should only be called on the root table.
     fn help_copy_blocking(&self, guard: &impl Guard) -> Table<K, V> {
         // make sure we are copying from the root (or ex-root) table
-        assert_eq!(
+        debug_assert_eq!(
             self.table.state().status.load(Ordering::Relaxed),
             State::PROMOTED
         );
 
         let next = self.table.state().next.load(Ordering::Acquire);
-        assert!(!next.is_null());
+        debug_assert!(!next.is_null());
         let mut next = unsafe { Table::<K, V>::from_raw(next) };
 
         'copy: loop {
@@ -857,7 +857,7 @@ where
     // Help along an in-progress resize incrementally by copying a chunk of entries.
     fn help_copy_incremental(&self, chunk: usize, block: bool, guard: &impl Guard) {
         let root = self.root.root(guard);
-        assert!(!root.table.raw.is_null());
+        debug_assert!(!root.table.raw.is_null());
 
         // always help the highest priority root resize
         if self.table.raw != root.table.raw {
@@ -1416,7 +1416,7 @@ where
                 continue;
             }
 
-            assert!(!entry.ptr.is_null());
+            debug_assert!(!entry.ptr.is_null());
 
             self.i += 1;
             return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
