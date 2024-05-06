@@ -1,6 +1,6 @@
 // adapted from: https://github.com/jonhoo/flurry/blob/main/tests/cuckoo/stress.rs
 
-use papaya::HashMap;
+use papaya::{HashMap, ResizeMode};
 
 use rand::distributions::{Distribution, Uniform};
 
@@ -169,6 +169,19 @@ fn stress_find_thread(env: Arc<Environment>) {
 #[cfg_attr(miri, ignore)]
 fn stress_test() {
     let root = Arc::new(Environment::new());
+    run(root);
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stress_test_incremental() {
+    let mut root = Environment::new();
+    root.table1 = root.table1.resize_mode(ResizeMode::Incremental(1));
+    root.table2 = root.table2.resize_mode(ResizeMode::Incremental(1));
+    run(Arc::new(root));
+}
+
+fn run(root: Arc<Environment>) {
     let mut threads = Vec::new();
     for _ in 0..NUM_THREADS {
         let env = Arc::clone(&root);
