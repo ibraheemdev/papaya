@@ -73,7 +73,9 @@ impl<T> Table<T> {
 
         unsafe {
             let layout = Self::layout(capacity);
-            let ptr = alloc::alloc(layout);
+
+            // allocate the table, with the entry pointers zeroed
+            let ptr = alloc::alloc_zeroed(layout);
 
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
@@ -93,10 +95,6 @@ impl<T> Table<T> {
             ptr.add(mem::size_of::<TableLayout>())
                 .cast::<u8>()
                 .write_bytes(super::meta::EMPTY, capacity);
-
-            // zero the entries table
-            let offset = mem::size_of::<TableLayout>() + mem::size_of::<u8>() * capacity;
-            ptr.add(offset).cast::<usize>().write_bytes(0, capacity);
 
             Table {
                 len,
