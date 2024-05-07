@@ -19,22 +19,40 @@ pub struct HashMap<K, V, S = RandomState> {
 unsafe impl<K, V, S: Send> Send for HashMap<K, V, S> {}
 unsafe impl<K, V, S: Sync> Sync for HashMap<K, V, S> {}
 
+/// Resize behavior for a [`HashMap`].
+///
+/// Hash maps must resize when the underlying table becomes full, migrating all key and value pairs
+/// to a new allocation. This type allows you to configure the resizing behavior when passed to
+/// [`HashMap::resize_mode`].
 pub enum ResizeMode {
-    /// All writes to the map must wait till the resize completes before making progress.
-    ///
-    /// Blocking resizes tend to be better in terms of throughput, especially in setups with
-    /// multiple writers that can perform the resize in parallel. However, they can lead to latency
-    /// spikes for write operations that have to resize large tables.
-    Blocking,
     /// Writers copy a constant number of key/value pairs to the new table before making
     /// progress.
     ///
-    /// Incremental resizes avoids latency spikes that can occur for write operations have
+    /// Incremental resizes avoids latency spikes that can occur when insert operations have
     /// to resize a large table. However, they reduce parallelism during the resize and so can reduce
     /// overall throughput. Incremental resizing also means all reads or write operations during an
     /// in-progress resize may have to search both the current and new table before succeeding, trading
     /// off median latency during a resize for tail latency.
+    ///
+    /// This is the default resize mode, with a chunk size of `1024`.
     Incremental(usize),
+    /// All writes to the map must wait till the resize completes before making progress.
+    ///
+    /// Blocking resizes tend to be better in terms of throughput, especially in setups with
+    /// multiple writers that can perform the resize in parallel. However, they can lead to latency
+    /// spikes for insert operations that have to resize large tables.
+    ///
+    /// If insert latency is not a concern, such as if the keys in your map are stable, enabling blocking
+    /// resizes may yield better performance.
+    Blocking,
+}
+
+impl Default for ResizeMode {
+    fn default() -> Self {
+        // incremental resizing is a good default for most workloads as it avoids
+        // unexpected latency spikes.
+        ResizeMode::Incremental(1024)
+    }
 }
 
 impl<K, V> HashMap<K, V> {

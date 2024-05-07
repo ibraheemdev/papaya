@@ -94,7 +94,7 @@ impl<K, V, S> HashMap<K, V, S> {
             return HashMap {
                 collector,
                 hasher: hash_builder,
-                resize: ResizeMode::Blocking,
+                resize: ResizeMode::default(),
                 table: AtomicPtr::new(ptr::null_mut()),
                 count: Counter::default(),
                 _kv: PhantomData,
@@ -109,7 +109,7 @@ impl<K, V, S> HashMap<K, V, S> {
         HashMap {
             collector,
             hasher: hash_builder,
-            resize: ResizeMode::Blocking,
+            resize: ResizeMode::default(),
             table: AtomicPtr::new(table.raw),
             count: Counter::default(),
             _kv: PhantomData,
