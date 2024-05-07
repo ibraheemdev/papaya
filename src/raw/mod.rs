@@ -182,17 +182,9 @@ where
         let hash = self.root.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
-        let limit = probe_limit!(self.table.len);
-        let mut probe = Probe::start();
-
-        loop {
-            let i = (start + probe.i) & (self.table.len - 1);
-            if probe.length > limit {
-                break;
-            }
-
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+        let (mut probe, limit) = Probe::start(h1(hash), self.table.len);
+        while probe.len <= limit {
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             // the entry is not in the table. it cannot be in the next table either
             // because we have not went over the probe limit
@@ -202,7 +194,7 @@ where
 
             // potential match
             if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                let entry = unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }
                     .unpack(Entry::MASK);
 
                 // the entry was deleted
@@ -279,24 +271,15 @@ where
         }
 
         let new_ref = unsafe { &*new_entry };
-
         let hash = self.root.hasher.hash_one(&new_ref.key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
-        let limit = probe_limit!(self.table.len);
-        let mut probe = Probe::start();
-
-        loop {
-            let i = (start + probe.i) & (self.table.len - 1);
-            if probe.length > limit {
-                break;
-            }
-
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
+        while probe.len <= end {
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             if meta == meta::EMPTY {
-                let entry = unsafe { self.table.entry(i) };
+                let entry = unsafe { self.table.entry(probe.i) };
 
                 match entry.compare_exchange(
                     ptr::null_mut(),
@@ -306,7 +289,7 @@ where
                 ) {
                     // successfully claimed this entry
                     Ok(_) => {
-                        unsafe { self.table.meta(i).store(h2, Ordering::Release) };
+                        unsafe { self.table.meta(probe.i).store(h2, Ordering::Release) };
                         return EntryStatus::Empty(&new_ref.value);
                     }
                     // lost to a concurrent insert
@@ -328,8 +311,8 @@ where
                                 meta::h2(hash)
                             };
 
-                            if self.table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
-                                self.table.meta(i).store(meta, Ordering::Release);
+                            if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
+                                self.table.meta(probe.i).store(meta, Ordering::Release);
                             }
                         }
 
@@ -352,10 +335,12 @@ where
                                 };
                             }
 
-                            match self.replace_entry(i, found, new_entry, guard) {
+                            match self.replace_entry(probe.i, found, new_entry, guard) {
                                 // the entry was deleted before we could update it, keep probing
                                 ReplaceStatus::Removed => unsafe {
-                                    self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+                                    self.table
+                                        .meta(probe.i)
+                                        .store(meta::TOMBSTONE, Ordering::Release);
                                 },
                                 // the entry is being copied
                                 ReplaceStatus::HelpCopy => break,
@@ -374,7 +359,7 @@ where
 
             // potential match
             if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
+                let entry = unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }
                     .unpack(Entry::MASK);
 
                 // the entry was deleted
@@ -396,7 +381,7 @@ where
                         };
                     }
 
-                    match self.replace_entry(i, entry, new_entry, guard) {
+                    match self.replace_entry(probe.i, entry, new_entry, guard) {
                         // the entry was deleted before we could update it, keep probing
                         ReplaceStatus::Removed => {}
                         // the entry is being copied
@@ -557,17 +542,13 @@ where
         let hash = unsafe { self.root.hasher.hash_one(&(*new_entry).key) };
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
-        let limit = probe_limit!(self.table.len);
-        let mut probe = Probe::start();
-
+        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
         let copying = 'probe: loop {
-            let i = (start + probe.i) & (self.table.len - 1);
-            if probe.length > limit {
+            if probe.len > end {
                 break false;
             }
 
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             // the entry is not in the table. it cannot be in the next table either
             // because we have not went over the probe limit
@@ -577,8 +558,9 @@ where
 
             // potential match
             if meta == h2 {
-                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
-                    .unpack(Entry::MASK);
+                let mut entry =
+                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }
+                        .unpack(Entry::MASK);
 
                 // the entry was deleted
                 if entry.addr & Entry::TOMBSTONE != 0 {
@@ -600,7 +582,7 @@ where
                             (*new_entry).value = MaybeUninit::new(value);
                         }
 
-                        match unsafe { self.table.entry(i) }.compare_exchange_weak(
+                        match unsafe { self.table.entry(probe.i) }.compare_exchange_weak(
                             entry.raw,
                             new_entry.cast(),
                             Ordering::AcqRel,
@@ -1053,23 +1035,14 @@ where
         abort: bool,
     ) -> Option<(Table<K, V>, usize)> {
         let key = unsafe { &(*new_entry.ptr).key };
-
         let hash = self.root.hasher.hash_one(key);
 
-        let start = h1(hash) & (self.table.len - 1);
-        let limit = probe_limit!(self.table.len);
-        let mut probe = Probe::start();
-
-        loop {
-            let i = (start + probe.i) & (self.table.len - 1);
-            if probe.length > limit {
-                break;
-            }
-
-            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
+        while probe.len <= end {
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             if meta == meta::EMPTY {
-                let entry = unsafe { self.table.entry(i) };
+                let entry = unsafe { self.table.entry(probe.i) };
 
                 // try to claim the entry
                 match entry.compare_exchange(
@@ -1079,8 +1052,12 @@ where
                     Ordering::Acquire,
                 ) {
                     Ok(_) => {
-                        unsafe { self.table.meta(i).store(meta::h2(hash), Ordering::Release) };
-                        return Some((self.table, i));
+                        unsafe {
+                            self.table
+                                .meta(probe.i)
+                                .store(meta::h2(hash), Ordering::Release)
+                        };
+                        return Some((self.table, probe.i));
                     }
                     Err(found) => {
                         fence(Ordering::Acquire);
@@ -1097,8 +1074,8 @@ where
                                 meta::h2(hash)
                             };
 
-                            if self.table.meta(i).load(Ordering::Acquire) == meta::EMPTY {
-                                self.table.meta(i).store(meta, Ordering::Release);
+                            if self.table.meta(probe.i).load(Ordering::Acquire) == meta::EMPTY {
+                                self.table.meta(probe.i).store(meta, Ordering::Release);
                             }
                         }
                     }
@@ -1145,17 +1122,13 @@ where
         let hash = self.root.hasher.hash_one(key);
         let h2 = meta::h2(hash);
 
-        let start = h1(hash) & (self.table.len - 1);
-        let limit = probe_limit!(self.table.len);
-        let mut probe = Probe::start();
-
+        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
         let copying = 'probe: loop {
-            let i = (start + probe.i) & (self.table.len - 1);
-            if probe.length > limit {
+            if probe.len > end {
                 break false;
             }
 
-            let meta = unsafe { self.table.meta(i).load(Ordering::Acquire) };
+            let meta = unsafe { self.table.meta(probe.i).load(Ordering::Acquire) };
 
             // the key is not in this table
             if meta == meta::EMPTY {
@@ -1163,8 +1136,9 @@ where
             }
 
             if meta == h2 {
-                let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }
-                    .unpack(Entry::MASK);
+                let mut entry =
+                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }
+                        .unpack(Entry::MASK);
 
                 // the entry was deleted
                 if entry.addr & Entry::TOMBSTONE != 0 {
@@ -1181,7 +1155,7 @@ where
                         }
 
                         // perform the deletion
-                        match unsafe { self.table.entry(i) }.compare_exchange_weak(
+                        match unsafe { self.table.entry(probe.i) }.compare_exchange_weak(
                             entry.raw,
                             Entry::TOMBSTONE as _,
                             Ordering::AcqRel,
@@ -1193,7 +1167,9 @@ where
                                 // note this might end up being overwritten by a slow h2 store,
                                 // but we avoid the RMW and sacrifice extra reads in that extremely
                                 // rare case
-                                self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+                                self.table
+                                    .meta(probe.i)
+                                    .store(meta::TOMBSTONE, Ordering::Release);
 
                                 // safety: the old value is now unreachable in this table
                                 self.defer_retire(entry, guard);
@@ -1642,26 +1618,36 @@ const GROUP: usize = 8;
 #[derive(Default)]
 struct Probe {
     i: usize,
-    length: usize,
+    len: usize,
+    mask: usize,
     stride: usize,
 }
 
 impl Probe {
-    fn start() -> Probe {
-        Probe::default()
+    fn start(hash: usize, len: usize) -> (Probe, usize) {
+        let i = hash & (len - 1);
+        let probe = Probe {
+            i,
+            len: 0,
+            stride: 0,
+            mask: len - 1,
+        };
+
+        (probe, probe_limit!(len))
     }
 
     #[inline]
     fn next(&mut self) {
-        self.length += 1;
+        self.len += 1;
 
-        if self.length & (GROUP - 1) == 0 {
+        if self.len & (GROUP - 1) == 0 {
             self.stride += GROUP;
             self.i += self.stride;
-            return;
+        } else {
+            self.i += 1;
         }
 
-        self.i += 1;
+        self.i &= self.mask;
     }
 }
 
