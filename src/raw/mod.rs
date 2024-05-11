@@ -1612,7 +1612,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
                             let raw: *mut RawTable = link.cast();
                             let table = Table::<K, V>::from_raw(raw);
                             drop_table::<K, V>(table);
-                        })
+                        });
                     }
                 }
 
@@ -1647,6 +1647,11 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
         let mut raw = *self.table.get_mut();
 
+        // make sure everything is reclaimed before the collector is dropped,
+        // because reclaiming a table depends on accessing the collector
+        // through a shared pointer
+        unsafe { self.collector.reclaim_all() };
+
         while !raw.is_null() {
             let mut table = unsafe { Table::<K, V>::from_raw(raw) };
             let next = *table.state_mut().next.get_mut();
@@ -1675,11 +1680,13 @@ unsafe fn drop_entries<K, V>(table: Table<K, V>) {
 }
 
 unsafe fn drop_table<K, V>(mut table: Table<K, V>) {
-    // safety: `drop_table` is being called from `Drop` or from the reclaimer,
-    // both cases in which the collector is still alive
+    // safety: `drop_table` is being called from `reclaim_all` in `Drop`, or
+    // a table is being reclaimed by our thread, both cases in which the collector
+    // is still alive and safe to access through the stable pointer
     let collector = unsafe { &*table.state().collector };
 
     // drop any entries deferred during an incremental resize
+    //
     // safety: a deferred entry was retired after it was made unreachable
     // from the next table during a resize. because our table was still accessible
     // for this entry to be deferred, our table must have been retired *after* the

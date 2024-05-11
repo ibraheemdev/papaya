@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
-seize = "0.4.1"
+seize = { git = "https://github.com/ibraheemdev/seize", branch = "reclaim-all" }
 
 [dev-dependencies]
 rand = "0.8.5"

@@ -191,3 +191,9 @@ impl<T> Deref for AliasableBox<T> {
         unsafe { &*self.0.as_ptr() }
     }
 }
+
+impl<T> Drop for AliasableBox<T> {
+    fn drop(&mut self) {
+        let _ = unsafe { Box::from_raw(self.0.as_ptr()) };
+    }
+}
