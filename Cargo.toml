@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 atomic-wait = "1.1.0"
-seize = "0.4.0"
+seize = "0.4.1"
 
 [dev-dependencies]
 rand = "0.8.5"

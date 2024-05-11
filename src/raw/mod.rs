@@ -1,31 +1,82 @@
 mod alloc;
-mod utils;
+pub(crate) mod utils;
 
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{fence, AtomicPtr, Ordering};
+use std::sync::atomic::{fence, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::{hint, ptr};
 
-use self::alloc::{RawTable, State};
-use self::utils::{AtomicPtrFetchOps, Counter, StrictProvenance, Tagged};
+use self::alloc::RawTable;
+use self::utils::{AliasableBox, AtomicPtrFetchOps, Counter, StrictProvenance, Tagged};
 use super::map::ResizeMode;
 
 use seize::{AsLink, Collector, Guard, Link};
 
 // A lock-free hash-map.
 pub struct HashMap<K, V, S> {
-    pub collector: Collector,
+    // Hasher for keys.
     pub hasher: S,
-    pub resize: ResizeMode,
+    // Collector for memory reclamation.
+    //
+    // The collector is allocated as it's aliased by each table,
+    // in case it needs to accessed during reclamation.
+    collector: AliasableBox<Collector>,
+    // The resize mode, either blocking or incremental.
+    resize: ResizeMode,
+    // A pointer to the root table.
     table: AtomicPtr<RawTable>,
+    // The number of keys in the table.
     count: Counter,
     _kv: PhantomData<(K, V)>,
 }
 
 // The hash-table allocation.
 type Table<K, V> = self::alloc::Table<Entry<K, V>>;
+
+// Table state.
+pub struct State {
+    // The next table.
+    pub next: AtomicPtr<RawTable>,
+    // A lock acquired to allocate the next table.
+    pub allocating: Mutex<()>,
+    // The number of entries that have been copied.
+    pub copied: AtomicUsize,
+    // The number of entries that have been uniquely claimed, but
+    // not necessarily copied.
+    pub claim: AtomicUsize,
+    // The status of the resize.
+    pub status: AtomicU32,
+    // Entries whos retirement has been deferred by later tables.
+    pub deferred: seize::Deferred,
+    // A pointer to the root collector, valid as long as the map is alive.
+    pub collector: *const Collector,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            next: AtomicPtr::new(ptr::null_mut()),
+            allocating: Mutex::new(()),
+            copied: AtomicUsize::new(0),
+            claim: AtomicUsize::new(0),
+            status: AtomicU32::new(State::PENDING),
+            deferred: seize::Deferred::new(),
+            collector: ptr::null(),
+        }
+    }
+}
+
+impl State {
+    // A resize is in-progress.
+    pub const PENDING: u32 = 0;
+    // The resize has been aborted, continue to the next table.
+    pub const ABORTED: u32 = 1;
+    // The resize was complete and the table promoted to the root.
+    pub const PROMOTED: u32 = 2;
+}
 
 // An entry in the hash-table.
 #[repr(C)]
@@ -38,7 +89,6 @@ pub struct Entry<K, V> {
 // The state of an entry we attempted to update.
 pub enum EntryStatus<'g, V> {
     Empty(&'g V),
-    Tombstone(&'g V),
     Replaced(&'g V),
     Error { current: &'g V, not_inserted: V },
 }
@@ -85,31 +135,36 @@ impl Entry<(), ()> {
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-    // Creates a table with the given capacity and hasher.
-    pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        let collector = Collector::new().epoch_frequency(None);
+    // Creates new hash-map with the given options.
+    pub fn new(
+        capacity: usize,
+        hasher: S,
+        collector: Collector,
+        resize: ResizeMode,
+    ) -> HashMap<K, V, S> {
+        let collector = AliasableBox::from(collector);
 
         // the table is lazily allocated
         if capacity == 0 {
             return HashMap {
                 collector,
-                hasher: hash_builder,
-                resize: ResizeMode::default(),
+                resize,
+                hasher,
                 table: AtomicPtr::new(ptr::null_mut()),
                 count: Counter::default(),
                 _kv: PhantomData,
             };
         }
 
-        let mut table = Table::<K, V>::new(entries_for(capacity), collector.link());
+        let mut table = Table::<K, V>::new(entries_for(capacity), &collector);
 
         // mark this table as the root
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
         HashMap {
+            hasher,
+            resize,
             collector,
-            hasher: hash_builder,
-            resize: ResizeMode::default(),
             table: AtomicPtr::new(table.raw),
             count: Counter::default(),
             _kv: PhantomData,
@@ -129,9 +184,9 @@ impl<K, V, S> HashMap<K, V, S> {
         self.as_ref(table)
     }
 
-    // Returns a pointer to the root table.
-    pub fn root_ptr(&self) -> *mut u8 {
-        self.table.load(Ordering::Relaxed).cast()
+    // Returns a reference to the collector.
+    pub fn collector(&self) -> &Collector {
+        &self.collector
     }
 
     // Returns the number of entries in the table.
@@ -473,20 +528,20 @@ where
             // in incremental mode, the entry may be accessible in previous tables if the
             // current table is not the root
             ResizeMode::Incremental(_) => {
+                // if the entry is not borrowed, meaning it is not in any previous tables,
+                // it is inaccessible even if we are not the root, so we can safely retire
                 if entry.addr & Entry::BORROWED == 0 {
-                    // this entry is not borrowed, meaning it is not in any previous tables,
-                    // so it is inaccessible even if we are not the root
                     unsafe { guard.defer_retire(entry.ptr, Entry::retire::<K, V>) };
                     return;
                 }
 
                 let root = self.root.table.load(Ordering::Relaxed);
 
+                // if the root is our table or any table that precedes ours, the entry is
+                // inaccessible and we can safely retire it
                 let mut next = Some(self.clone());
                 while let Some(map) = next {
                     if map.table.raw == root {
-                        // safety: if the root is our table or any table that precedes ours,
-                        // the entry is not accessible from the root
                         unsafe { guard.defer_retire(entry.ptr, Entry::retire::<K, V>) };
                         return;
                     }
@@ -494,7 +549,7 @@ where
                     next = map.next_table_ref();
                 }
 
-                // if not, we have to wait for the previous table to be retired before
+                // if not, we have to wait for the previous table to be reclaimed before
                 // dropping this entry
                 fence(Ordering::Acquire);
                 let mut prev = self.as_ref(unsafe { Table::<K, V>::from_raw(root) });
@@ -502,9 +557,8 @@ where
                     let next = prev.next_table_ref().unwrap();
 
                     if next.table.raw == self.table.raw {
-                        // defer this entry
-                        let mut deferred = prev.table.state().deferred.lock().unwrap();
-                        deferred.push(entry.ptr.cast());
+                        // defer this entry to be retired by the previous table
+                        prev.table.state().deferred.defer(entry.ptr);
                         return;
                     }
 
@@ -678,8 +732,8 @@ where
     fn init(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
 
-        let mut table =
-            Table::<K, V>::new(capacity.unwrap_or(CAPACITY), self.root.collector.link());
+        let mut table = Table::<K, V>::new(capacity.unwrap_or(CAPACITY), &self.root.collector);
+
         // mark this table as the root
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
@@ -1514,7 +1568,7 @@ impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
         }
 
         // allocate the new table
-        let next = Table::new(next_capacity, self.root.collector.link());
+        let next = Table::new(next_capacity, &self.root.collector);
         state.next.store(next.raw, Ordering::Release);
         drop(_allocating);
 
@@ -1621,17 +1675,21 @@ unsafe fn drop_entries<K, V>(table: Table<K, V>) {
 }
 
 unsafe fn drop_table<K, V>(mut table: Table<K, V>) {
+    // safety: `drop_table` is being called from `Drop` or from the reclaimer,
+    // both cases in which the collector is still alive
+    let collector = unsafe { &*table.state().collector };
+
     // drop any entries deferred during an incremental resize
-    let deferred = table.state_mut().deferred.get_mut().unwrap();
-    for entry in deferred {
-        // safety: a deferred entry was retired after it was made unreachable
-        // from the next table during a resize. because our table was still accessible
-        // for this entry to be deferred, our table must have been retired *after* the
-        // entry was made accessible in the next table. additionally, any previous tables
-        // must have been retired *before* our resize was promoted and we were retired.
-        // thus that no threads that were active to access this entry in the next table,
-        // nor previous tables, can be active now
-        unsafe { Entry::retire::<K, V>((*entry).cast()) }
+    // safety: a deferred entry was retired after it was made unreachable
+    // from the next table during a resize. because our table was still accessible
+    // for this entry to be deferred, our table must have been retired *after* the
+    // entry was made accessible in the next table. now that our table is being reclaimed,
+    // the entry has thus been totally removed from the map, and can be safely retired
+    unsafe {
+        table
+            .state_mut()
+            .deferred
+            .retire_all(collector, Entry::retire::<K, V>)
     }
 
     // deallocate the table

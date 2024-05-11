@@ -5,6 +5,7 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
+use std::marker::PhantomData;
 
 /// A concurrent hash table.
 ///
@@ -12,12 +13,115 @@ use std::hash::{BuildHasher, Hash};
 /// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate)
 /// for details.
 pub struct HashMap<K, V, S = RandomState> {
-    pub raw: raw::HashMap<K, V, S>,
-    pub initial: *mut u8,
+    raw: raw::HashMap<K, V, S>,
 }
 
 unsafe impl<K, V, S: Send> Send for HashMap<K, V, S> {}
 unsafe impl<K, V, S: Sync> Sync for HashMap<K, V, S> {}
+
+/// A builder for a [`HashMap`].
+///
+/// # Examples
+///
+/// ```rust
+/// use papaya::{HashMap, ResizeMode};
+/// use seize::Collector;
+/// use std::collections::hash_map::RandomState;
+///
+/// let map: HashMap<i32, i32> = HashMap::builder()
+///     // set the inital capacity
+///     .capacity(2048)
+///     // set the hasher
+///     .hasher(RandomState::new())
+///     // set the resize mode
+///     .resize_mode(ResizeMode::Blocking)
+///     // set a custom collector
+///     .collector(Collector::new().batch_size(128))
+///     // construct the hash map
+///     .build();
+/// ```
+pub struct HashMapBuilder<K, V, S = RandomState> {
+    hasher: S,
+    capacity: usize,
+    collector: Collector,
+    resize_mode: ResizeMode,
+    _kv: PhantomData<(K, V)>,
+}
+
+impl<K, V> HashMapBuilder<K, V> {
+    /// Set the hash builder used to hash keys.
+    ///
+    /// Warning: `hash_builder` is normally randomly generated, and is designed
+    /// to allow HashMaps to be resistant to attacks that cause many collisions
+    /// and very poor performance. Setting it manually using this function can
+    /// expose a DoS attack vector.
+    ///
+    /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
+    /// the HashMap to be useful, see its documentation for details.
+    pub fn hasher<S>(self, hasher: S) -> HashMapBuilder<K, V, S> {
+        HashMapBuilder {
+            hasher,
+            capacity: self.capacity,
+            collector: self.collector,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+}
+
+impl<K, V, S> HashMapBuilder<K, V, S> {
+    /// Set the initial capacity of the map.
+    ///
+    /// Note the table should be able to hold at least `capacity` elements before
+    /// resizing, but may prematurely resize due to poor hash distribution. If `capacity`
+    /// is 0, the hash map will not allocate.
+    pub fn capacity(self, capacity: usize) -> HashMapBuilder<K, V, S> {
+        HashMapBuilder {
+            capacity,
+            hasher: self.hasher,
+            collector: self.collector,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+
+    /// Set the resizing mode of the map.
+    ///
+    /// See [`ResizeMode`] for details.
+    pub fn resize_mode(self, resize_mode: ResizeMode) -> Self {
+        HashMapBuilder {
+            resize_mode,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            collector: self.collector,
+            _kv: PhantomData,
+        }
+    }
+
+    /// Set the [`seize::Collector`] used for memory reclamation.
+    ///
+    /// This method may be useful when you want more control over memory reclamation.
+    /// See [`seize::Collector`] for details.
+    ///
+    /// Note that all `Guard` references used to access the map must be produced by
+    /// the provided `collector`.
+    pub fn collector(self, collector: Collector) -> Self {
+        HashMapBuilder {
+            collector,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+
+    /// Construct a [`HashMap`] from the builder, using the configured options.
+    pub fn build(self) -> HashMap<K, V, S> {
+        HashMap {
+            raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
+        }
+    }
+}
 
 /// Resize behavior for a [`HashMap`].
 ///
@@ -86,6 +190,20 @@ impl<K, V> HashMap<K, V> {
     pub fn with_capacity(capacity: usize) -> HashMap<K, V> {
         HashMap::with_capacity_and_hasher(capacity, RandomState::new())
     }
+
+    /// Returns a builder for a `HashMap`.
+    ///
+    /// The builder can be used for more complex configuration, such as using
+    /// a custom [`Collector`], or [`ResizeMode`].
+    pub fn builder() -> HashMapBuilder<K, V> {
+        HashMapBuilder {
+            capacity: 0,
+            hasher: RandomState::default(),
+            collector: Collector::new(),
+            resize_mode: ResizeMode::default(),
+            _kv: PhantomData,
+        }
+    }
 }
 
 impl<K, V, S> Default for HashMap<K, V, S>
@@ -149,37 +267,14 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.pin().insert(1, 2);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
-        let raw = raw::HashMap::with_capacity_and_hasher(capacity, hash_builder);
         HashMap {
-            initial: raw.root_ptr(),
-            raw,
+            raw: raw::HashMap::new(
+                capacity,
+                hash_builder,
+                Collector::default(),
+                ResizeMode::default(),
+            ),
         }
-    }
-
-    /// Associate a custom [`seize::Collector`] with this map.
-    ///
-    /// This method may be useful when you want more control over memory reclamation.
-    /// See [`seize::Collector`] for details.
-    ///
-    /// Note that all `Guard` references used to access the map must be produced by
-    /// `collector`.
-    pub fn with_collector(mut self, collector: Collector) -> Self {
-        self.raw.collector = collector;
-        self
-    }
-
-    /// Configures the resizing mode for this map.
-    ///
-    /// See [`ResizeMode`] for details.
-    pub fn resize_mode(mut self, resize: ResizeMode) -> Self {
-        assert_eq!(
-            self.raw.root_ptr(),
-            self.initial,
-            "cannot change resize mode after initialization"
-        );
-
-        self.raw.resize = resize;
-        self
     }
 
     /// Returns a guard for use with this map.
@@ -188,7 +283,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// collection. See the [crate-level documentation](crate) for details.
     #[inline]
     pub fn guard(&self) -> LocalGuard<'_> {
-        self.raw.collector.enter()
+        self.raw.collector().enter()
     }
 
     /// Returns an owned guard for use with this map.
@@ -201,7 +296,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// collection. See the [crate-level documentation](crate) for details.
     #[inline]
     pub fn owned_guard(&self) -> OwnedGuard<'_> {
-        self.raw.collector.enter_owned()
+        self.raw.collector().enter_owned()
     }
 
     /// Returns a pinned reference to the map.
@@ -392,7 +487,7 @@ where
     #[inline]
     pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
         match self.raw.root(guard).insert(key, value, true, guard) {
-            EntryStatus::Empty(_) | EntryStatus::Tombstone(_) => None,
+            EntryStatus::Empty(_) => None,
             EntryStatus::Replaced(value) => Some(value),
             EntryStatus::Error { .. } => unreachable!(),
         }
@@ -427,7 +522,7 @@ where
         guard: &'g impl Guard,
     ) -> Result<&'g V, OccupiedError<'g, V>> {
         match self.raw.root(guard).insert(key, value, false, guard) {
-            EntryStatus::Empty(value) | EntryStatus::Tombstone(value) => Ok(value),
+            EntryStatus::Empty(value) => Ok(value),
             EntryStatus::Error {
                 current,
                 not_inserted,
@@ -768,8 +863,11 @@ where
     S: BuildHasher + Clone,
 {
     fn clone(&self) -> HashMap<K, V, S> {
-        let other = Self::with_capacity_and_hasher(self.len(), self.raw.hasher.clone())
-            .with_collector(self.raw.collector.clone());
+        let other = HashMap::builder()
+            .capacity(self.len())
+            .hasher(self.raw.hasher.clone())
+            .collector(self.raw.collector().clone())
+            .build();
 
         {
             let (guard1, guard2) = (&self.guard(), &other.guard());

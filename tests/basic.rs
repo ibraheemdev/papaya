@@ -6,9 +6,17 @@ use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 fn with_map<K, V>(test: impl Fn(HashMap<K, V>)) {
-    test(HashMap::new().resize_mode(ResizeMode::Blocking));
-    test(HashMap::new().resize_mode(ResizeMode::Incremental(1)));
-    test(HashMap::new().resize_mode(ResizeMode::Incremental(128)));
+    test(HashMap::builder().resize_mode(ResizeMode::Blocking).build());
+    test(
+        HashMap::builder()
+            .resize_mode(ResizeMode::Incremental(1))
+            .build(),
+    );
+    test(
+        HashMap::builder()
+            .resize_mode(ResizeMode::Incremental(128))
+            .build(),
+    );
 }
 
 #[test]

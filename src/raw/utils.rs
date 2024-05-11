@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
+use std::{
+    ops::Deref,
+    ptr::NonNull,
+    sync::atomic::{AtomicIsize, AtomicPtr, Ordering},
+};
 
 // Polyfill for the unstable strict-provenance APIs.
 #[allow(clippy::missing_safety_doc)]
@@ -168,5 +172,22 @@ impl Counter {
             // depending on the order of deletion/insertions this might be negative, so assume the
             // map is empty
             .unwrap_or(0)
+    }
+}
+
+// `Box<T>` but aliasable.
+pub struct AliasableBox<T>(NonNull<T>);
+
+impl<T> From<T> for AliasableBox<T> {
+    fn from(value: T) -> AliasableBox<T> {
+        AliasableBox(unsafe { NonNull::new_unchecked(Box::into_raw(Box::new(value))) })
+    }
+}
+
+impl<T> Deref for AliasableBox<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.0.as_ptr() }
     }
 }

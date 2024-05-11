@@ -1,8 +1,11 @@
 use std::alloc::Layout;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU8, AtomicUsize};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, AtomicU8};
 use std::{alloc, mem, ptr};
+
+use seize::Collector;
+
+use super::State;
 
 // A hash table layed out in a single allocation
 #[repr(transparent)]
@@ -26,23 +29,6 @@ struct TableLayout {
     entries: [AtomicPtr<()>; 0],
 }
 
-#[derive(Default)]
-pub struct State {
-    pub next: AtomicPtr<RawTable>,
-    pub allocating: Mutex<()>,
-    pub copied: AtomicUsize,
-    pub claim: AtomicUsize,
-    pub status: AtomicU32,
-    // todo: use seize linked lists here
-    pub deferred: Mutex<Vec<*mut ()>>,
-}
-
-impl State {
-    pub const PENDING: u32 = 0;
-    pub const ABORTED: u32 = 1;
-    pub const PROMOTED: u32 = 2;
-}
-
 // Manages a table allocation.
 #[repr(C)]
 pub struct Table<T> {
@@ -64,7 +50,7 @@ impl<T> Clone for Table<T> {
 }
 
 impl<T> Table<T> {
-    pub fn new(len: usize, link: seize::Link) -> Table<T> {
+    pub fn new(len: usize, collector: &Collector) -> Table<T> {
         assert!(len.is_power_of_two());
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
@@ -83,10 +69,13 @@ impl<T> Table<T> {
 
             // write the table layout state
             ptr.cast::<TableLayout>().write(TableLayout {
-                link,
+                link: collector.link(),
                 len,
                 capacity,
-                state: State::default(),
+                state: State {
+                    collector,
+                    ..State::default()
+                },
                 meta: [],
                 entries: [],
             });
@@ -172,8 +161,7 @@ impl<T> Table<T> {
 fn layout() {
     unsafe {
         let collector = seize::Collector::new();
-        let link = collector.link();
-        let table: Table<u8> = Table::new(4, link);
+        let table: Table<u8> = Table::new(4, &collector);
         let table: Table<u8> = Table::from_raw(table.raw);
         assert_eq!(table.len, 4);
         // padded for pointer alignment

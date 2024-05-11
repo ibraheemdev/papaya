@@ -167,17 +167,36 @@ fn stress_find_thread(env: Arc<Environment>) {
 
 #[test]
 #[cfg_attr(miri, ignore)]
-fn stress_test() {
-    let root = Arc::new(Environment::new());
-    run(root);
+fn stress_test_blocking() {
+    let mut root = Environment::new();
+    root.table1 = HashMap::builder().resize_mode(ResizeMode::Blocking).build();
+    root.table2 = HashMap::builder().resize_mode(ResizeMode::Blocking).build();
+    run(Arc::new(root));
 }
 
 #[test]
 #[cfg_attr(miri, ignore)]
 fn stress_test_incremental() {
     let mut root = Environment::new();
-    root.table1 = root.table1.resize_mode(ResizeMode::Incremental(1));
-    root.table2 = root.table2.resize_mode(ResizeMode::Incremental(1));
+    root.table1 = HashMap::builder()
+        .resize_mode(ResizeMode::Incremental(1024))
+        .build();
+    root.table2 = HashMap::builder()
+        .resize_mode(ResizeMode::Incremental(1024))
+        .build();
+    run(Arc::new(root));
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn stress_test_incremental_slow() {
+    let mut root = Environment::new();
+    root.table1 = HashMap::builder()
+        .resize_mode(ResizeMode::Incremental(1))
+        .build();
+    root.table2 = HashMap::builder()
+        .resize_mode(ResizeMode::Incremental(1))
+        .build();
     run(Arc::new(root));
 }
 
