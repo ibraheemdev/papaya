@@ -27,9 +27,8 @@ fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
 
 #[test]
 fn contains_key_stress() {
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 256 };
-    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 10 };
-    const ROUNDS: usize = if cfg!(miri) { 1 } else { 32 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
     with_map(|map| {
         let map = map();
@@ -51,7 +50,7 @@ fn contains_key_stress() {
                     s.spawn(|| {
                         barrier.wait();
                         let guard = map.guard();
-                        for i in 0..ENTRIES * ROUNDS {
+                        for i in 0..ENTRIES {
                             let key = content[i % content.len()];
                             assert!(map.contains_key(&key, &guard));
                         }
@@ -64,7 +63,7 @@ fn contains_key_stress() {
 
 #[test]
 fn update_stress() {
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
     with_map(|map| {
@@ -104,8 +103,8 @@ fn update_stress() {
 
 #[test]
 fn insert_stress<'g>() {
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
-    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 12 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
     #[derive(Hash, PartialEq, Eq, Clone, Copy)]
     struct KeyVal {
@@ -136,12 +135,13 @@ fn insert_stress<'g>() {
                     });
                 }
             });
+            assert_eq!(map.len(), ENTRIES * threads);
         }
     });
 }
 
 #[test]
-fn mixed_stress() {
+fn mixed_chunk_stress() {
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
     const CHUNK: usize = if cfg!(miri) { 48 } else { 1 << 14 };
 
@@ -203,15 +203,110 @@ fn mixed_stress() {
             let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
             got.sort();
             assert_eq!(v, got);
+
+            assert_eq!(map.len(), CHUNK * threads);
         }
     });
 }
 
-const SIZE: usize = if cfg!(miri) { 12 } else { 50_000 };
+#[test]
+fn mixed_entry_stress() {
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 24 };
+    const OPERATIONS: usize = if cfg!(miri) { 1 } else { 72 };
+    const CHUNK: usize = if cfg!(miri) { 100 } else { 1 << 10 };
 
-// there must be more things absent than present!
-const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 5 } else { 1 << 17 };
-const ABSENT_MASK: usize = ABSENT_SIZE - 1;
+    let run = |barrier: &Barrier, t: usize, map: &HashMap<usize, usize>, threads: usize| {
+        barrier.wait();
+
+        let (start, end) = (CHUNK * t, CHUNK * (t + 1));
+
+        for i in start..end {
+            for _ in 0..OPERATIONS {
+                assert_eq!(map.pin().insert(i, i + 1), None);
+                assert_eq!(map.pin().get(&i), Some(&(i + 1)));
+                assert_eq!(map.pin().update(i, |i| i + 1), Some(&(i + 2)));
+                assert_eq!(map.pin().remove(&i), Some(&(i + 2)));
+                assert_eq!(map.pin().get(&i), None);
+                assert_eq!(map.pin().update(i, |i| i + 1), None);
+            }
+        }
+
+        for i in start..end {
+            assert_eq!(map.pin().get(&i), None);
+        }
+
+        for (&k, &v) in map.pin().iter() {
+            assert!(k < CHUNK * threads);
+            assert!(v == k + 1 || v == k + 2);
+        }
+    };
+
+    with_map(|map| {
+        for _ in 0..ITERATIONS {
+            let map = map();
+            let threads = thread::available_parallelism().unwrap().get().min(8);
+            let barrier = Barrier::new(threads);
+
+            thread::scope(|s| {
+                for t in 0..threads {
+                    let map = &map;
+                    let barrier = &barrier;
+
+                    s.spawn(move || run(barrier, t, map, threads));
+                }
+            });
+
+            let got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
+            assert_eq!(got, []);
+            assert_eq!(map.len(), 0);
+        }
+    });
+}
+
+#[test]
+fn everything() {
+    const SIZE: usize = if cfg!(miri) { 12 } else { 50_000 };
+    // there must be more things absent than present!
+    const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 5 } else { 1 << 17 };
+    const ABSENT_MASK: usize = ABSENT_SIZE - 1;
+
+    let mut rng = rand::thread_rng();
+
+    with_map(|map| {
+        let map = map();
+        let mut keys: Vec<_> = (0..ABSENT_SIZE + SIZE).collect();
+        keys.shuffle(&mut rng);
+        let absent_keys = &keys[0..ABSENT_SIZE];
+        let keys = &keys[ABSENT_SIZE..];
+
+        // put (absent)
+        t3(&map, keys, SIZE);
+        // put (present)
+        t3(&map, keys, 0);
+        // contains_key (present & absent)
+        t7(&map, keys, absent_keys);
+        // contains_key (present)
+        t4(&map, keys, SIZE);
+        // contains_key (absent)
+        t4(&map, absent_keys, 0);
+        // get
+        t6(&map, keys, absent_keys, SIZE, ABSENT_MASK);
+        // get (present)
+        t1(&map, keys, SIZE);
+        // get (absent)
+        t1(&map, absent_keys, 0);
+        // remove (absent)
+        t2(&map, absent_keys, 0);
+        // remove (present)
+        t5(&map, keys, SIZE / 2);
+        // put (half present)
+        t3(&map, keys, SIZE / 2);
+        // iter, keys, values (present)
+        ittest1(&map, SIZE);
+        ittest2(&map, SIZE);
+        ittest3(&map, SIZE);
+    });
+}
 
 fn t1<K, V>(map: &HashMap<K, V>, keys: &[K], expect: usize)
 where
@@ -289,7 +384,7 @@ where
     assert_eq!(sum, expect);
 }
 
-fn t6<K, V>(map: &HashMap<K, V>, keys1: &[K], keys2: &[K], expect: usize)
+fn t6<K, V>(map: &HashMap<K, V>, keys1: &[K], keys2: &[K], expect: usize, mask: usize)
 where
     K: Sync + Send + Clone + Hash + Ord,
     V: Sync + Send,
@@ -300,7 +395,7 @@ where
         if map.get(&keys1[i], &guard).is_some() {
             sum += 1;
         }
-        if map.get(&keys2[i & ABSENT_MASK], &guard).is_some() {
+        if map.get(&keys2[i & mask], &guard).is_some() {
             sum += 1;
         }
     }
@@ -358,44 +453,4 @@ where
         sum += 1;
     }
     assert_eq!(sum, expect);
-}
-
-#[test]
-fn everything() {
-    let mut rng = rand::thread_rng();
-
-    with_map(|map| {
-        let map = map();
-        let mut keys: Vec<_> = (0..ABSENT_SIZE + SIZE).collect();
-        keys.shuffle(&mut rng);
-        let absent_keys = &keys[0..ABSENT_SIZE];
-        let keys = &keys[ABSENT_SIZE..];
-
-        // put (absent)
-        t3(&map, keys, SIZE);
-        // put (present)
-        t3(&map, keys, 0);
-        // contains_key (present & absent)
-        t7(&map, keys, absent_keys);
-        // contains_key (present)
-        t4(&map, keys, SIZE);
-        // contains_key (absent)
-        t4(&map, absent_keys, 0);
-        // get
-        t6(&map, keys, absent_keys, SIZE);
-        // get (present)
-        t1(&map, keys, SIZE);
-        // get (absent)
-        t1(&map, absent_keys, 0);
-        // remove (absent)
-        t2(&map, absent_keys, 0);
-        // remove (present)
-        t5(&map, keys, SIZE / 2);
-        // put (half present)
-        t3(&map, keys, SIZE / 2);
-        // iter, keys, values (present)
-        ittest1(&map, SIZE);
-        ittest2(&map, SIZE);
-        ittest3(&map, SIZE);
-    });
 }

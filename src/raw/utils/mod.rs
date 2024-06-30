@@ -1,8 +1,9 @@
-use std::{
-    ops::Deref,
-    ptr::NonNull,
-    sync::atomic::{AtomicIsize, AtomicPtr, Ordering},
-};
+mod parker;
+pub use parker::Parker;
+
+use std::ops::Deref;
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 
 // Polyfill for the unstable strict-provenance APIs.
 #[allow(clippy::missing_safety_doc)]

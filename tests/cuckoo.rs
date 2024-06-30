@@ -10,11 +10,11 @@ use std::sync::{atomic::AtomicBool, Arc};
 use std::thread;
 
 /// Number of keys and values to work with.
-const NUM_KEYS: usize = 1 << 12;
+const NUM_KEYS: usize = 1 << 14;
 /// Number of threads that should be started.
 const NUM_THREADS: usize = 4;
 /// How long the stress test will run (in milliseconds).
-const TEST_LEN: u64 = 5000;
+const TEST_LEN: u64 = 10_000;
 
 type Key = usize;
 type Value = usize;
