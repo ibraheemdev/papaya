@@ -643,7 +643,14 @@ where
             value: MaybeUninit::uninit(),
         }));
 
-        self.update_with(update, f, true, guard)
+        match self.update_with(update, f, true, guard) {
+            Some(value) => Some(value),
+            None => {
+                // safety: we allocated this box above, and it was not inserted into the map
+                let _ = unsafe { Box::from_raw(update) };
+                None
+            }
+        }
     }
 
     // Update an entry with a remapping function.
