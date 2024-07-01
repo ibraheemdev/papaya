@@ -16,8 +16,11 @@ pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
 }
 
-unsafe impl<K, V, S: Send> Send for HashMap<K, V, S> {}
-unsafe impl<K, V, S: Sync> Sync for HashMap<K, V, S> {}
+// Safety: We only ever hand out &K/V through shared references to the map,
+// so normal Send/Sync rules apply. We never expose owned or mutable references
+// to keys or values.
+unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
+unsafe impl<K: Sync, V: Sync, S: Sync> Sync for HashMap<K, V, S> {}
 
 /// A builder for a [`HashMap`].
 ///
@@ -127,7 +130,7 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
 ///
 /// Hash maps must resize when the underlying table becomes full, migrating all key and value pairs
 /// to a new allocation. This type allows you to configure the resizing behavior when passed to
-/// [`HashMap::resize_mode`].
+/// [`HashMapBuilder::resize_mode`].
 pub enum ResizeMode {
     /// Writers copy a constant number of key/value pairs to the new table before making
     /// progress.
@@ -330,10 +333,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
 impl<K, V, S> HashMap<K, V, S>
 where
-    // note not all the methods below actually require thread-safety bounds, but
-    // the map is not generally useful without them
-    K: Send + Sync + Hash + Eq,
-    V: Send + Sync,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     /// Returns the number of entries in the map.
@@ -420,9 +420,9 @@ where
     /// assert_eq!(m.get(&2), None);
     /// ```
     #[inline]
-    pub fn get<'g, Q>(&'g self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q>,
+        K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
     {
         self.raw.root(guard).get_entry(key, guard).map(|(_, v)| v)
@@ -485,7 +485,7 @@ where
     /// assert_eq!(m.get(&37), Some(&"c"));
     /// ```
     #[inline]
-    pub fn insert<'g>(&'g self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
+    pub fn insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
         match self.raw.root(guard).insert(key, value, true, guard) {
             EntryStatus::Empty(_) => None,
             EntryStatus::Replaced(value) => Some(value),
@@ -612,7 +612,7 @@ where
     /// assert_eq!(map.pin().remove(&1), None);
     /// ```
     #[inline]
-    pub fn remove_entry<'g, Q>(&'g self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -742,8 +742,8 @@ where
 
 impl<K, V, S> PartialEq for HashMap<K, V, S>
 where
-    K: Hash + Eq + Send + Sync,
-    V: PartialEq + Send + Sync,
+    K: Hash + Eq,
+    V: PartialEq,
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
@@ -760,16 +760,16 @@ where
 
 impl<K, V, S> Eq for HashMap<K, V, S>
 where
-    K: Hash + Eq + Send + Sync,
-    V: Eq + Send + Sync,
+    K: Hash + Eq,
+    V: Eq,
     S: BuildHasher,
 {
 }
 
 impl<K, V, S> fmt::Debug for HashMap<K, V, S>
 where
-    K: Hash + Eq + Send + Sync + fmt::Debug,
-    V: Send + Sync + fmt::Debug,
+    K: Hash + Eq + fmt::Debug,
+    V: fmt::Debug,
     S: BuildHasher,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -780,8 +780,7 @@ where
 
 impl<K, V, S> Extend<(K, V)> for &HashMap<K, V, S>
 where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
@@ -808,8 +807,8 @@ where
 
 impl<'a, K, V, S> Extend<(&'a K, &'a V)> for &HashMap<K, V, S>
 where
-    K: Sync + Send + Copy + Hash + Ord,
-    V: Sync + Send + Copy,
+    K: Copy + Hash + Eq,
+    V: Copy,
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: T) {
@@ -819,8 +818,7 @@ where
 
 impl<K, V, const N: usize> From<[(K, V); N]> for HashMap<K, V, RandomState>
 where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send,
+    K: Hash + Eq,
 {
     fn from(arr: [(K, V); N]) -> Self {
         HashMap::from_iter(arr)
@@ -829,8 +827,7 @@ where
 
 impl<K, V, S> FromIterator<(K, V)> for HashMap<K, V, S>
 where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send,
+    K: Hash + Eq,
     S: BuildHasher + Default,
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
@@ -858,8 +855,8 @@ where
 
 impl<K, V, S> Clone for HashMap<K, V, S>
 where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send + Clone,
+    K: Clone + Hash + Eq,
+    V: Clone,
     S: BuildHasher + Clone,
 {
     fn clone(&self) -> HashMap<K, V, S> {
@@ -901,8 +898,7 @@ pub struct HashMapRef<'map, K, V, S, G> {
 
 impl<'map, K, V, S, G> HashMapRef<'map, K, V, S, G>
 where
-    K: Clone + Hash + Eq + Send + Sync,
-    V: Send + Sync,
+    K: Hash + Eq,
     S: BuildHasher,
     G: Guard,
 {
@@ -944,7 +940,7 @@ where
     ///
     /// See [`HashMap::get`] for details.
     #[inline]
-    pub fn get<'g, Q>(&'g self, key: &Q) -> Option<&'g V>
+    pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -956,7 +952,7 @@ where
     ///
     /// See [`HashMap::get_key_value`] for details.
     #[inline]
-    pub fn get_key_value<'g, Q>(&'g self, key: &Q) -> Option<(&'g K, &'g V)>
+    pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -997,9 +993,9 @@ where
     ///
     /// See [`HashMap::remove`] for details.
     #[inline]
-    pub fn remove<'g, Q>(&'g self, key: &Q) -> Option<&'g V>
+    pub fn remove<Q>(&self, key: &Q) -> Option<&V>
     where
-        K: Borrow<Q> + 'g,
+        K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
         self.map.remove(key, &self.guard)
@@ -1010,7 +1006,7 @@ where
     ///
     /// See [`HashMap::remove_entry`] for details.
     #[inline]
-    pub fn remove_entry<'g, Q>(&'g self, key: &Q) -> Option<(&'g K, &'g V)>
+    pub fn remove_entry<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,

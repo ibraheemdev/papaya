@@ -4,7 +4,7 @@ pub(crate) mod utils;
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
-use std::mem::MaybeUninit;
+use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{fence, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{hint, ptr};
@@ -206,7 +206,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
     // Returns a reference to the root hash table.
     #[inline(always)]
-    pub fn root<'g>(&'g self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
+    pub fn root<'g>(&self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
         assert!(
             guard.belongs_to(&self.collector),
             "accessed map with incorrect guard"
@@ -214,7 +214,12 @@ impl<K, V, S> HashMap<K, V, S> {
 
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
-        self.as_ref(table)
+
+        // safety: we verified above that the guard belongs to our collector, so
+        // &'g Guard implies &'g self. this makes bounds a little nicer for users
+        unsafe {
+            mem::transmute::<HashMapRef<'_, K, V, S>, HashMapRef<'g, K, V, S>>(self.as_ref(table))
+        }
     }
 
     // Returns a reference to the collector.
@@ -253,8 +258,7 @@ pub struct HashMapRef<'a, K, V, S> {
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
-    K: Sync + Send + Hash + Eq,
-    V: Sync + Send,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     // Returns a reference to the value corresponding to the key.
@@ -1434,8 +1438,7 @@ pub struct Iter<'g, K, V, G> {
 
 impl<K, V, S> HashMapRef<'_, K, V, S>
 where
-    K: Sync + Send + Hash + Eq,
-    V: Sync + Send,
+    K: Hash + Eq,
     S: BuildHasher,
 {
     // Returns an iterator over the keys and values of this table.
@@ -1462,18 +1465,21 @@ where
     }
 }
 
+// Safety: An iterator holds a shared reference to the HashMap
+// and Guard, and outputs shared references to keys and values.
+// Thus everything must be Sync for the iterator to be Send/Sync.
 unsafe impl<K, V, G> Send for Iter<'_, K, V, G>
 where
-    K: Send,
-    V: Send,
+    K: Sync,
+    V: Sync,
     G: Sync,
 {
 }
 
 unsafe impl<K, V, G> Sync for Iter<'_, K, V, G>
 where
-    K: Send,
-    V: Send,
+    K: Sync,
+    V: Sync,
     G: Sync,
 {
 }
