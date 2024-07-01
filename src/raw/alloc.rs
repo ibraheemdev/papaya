@@ -7,7 +7,7 @@ use seize::Collector;
 
 use super::State;
 
-// A hash table layed out in a single allocation
+// A hash table laid out in a single allocation
 #[repr(transparent)]
 pub struct RawTable(u8);
 

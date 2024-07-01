@@ -29,7 +29,7 @@ unsafe impl<K, V, S: Sync> Sync for HashMap<K, V, S> {}
 /// use std::collections::hash_map::RandomState;
 ///
 /// let map: HashMap<i32, i32> = HashMap::builder()
-///     // set the inital capacity
+///     // set the initial capacity
 ///     .capacity(2048)
 ///     // set the hasher
 ///     .hasher(RandomState::new())
@@ -162,7 +162,7 @@ impl Default for ResizeMode {
 impl<K, V> HashMap<K, V> {
     /// Creates an empty `HashMap`.
     ///
-    /// The hash map is initally crated with a capacity of 0, so it will not allocate
+    /// The hash map is initially crated with a capacity of 0, so it will not allocate
     /// until it is first inserted into.
     ///
     /// # Examples
@@ -313,7 +313,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
     /// Returns a pinned reference to the map.
     ///
-    /// Unlike [`pin`](HashMap::pin), the retured reference implements `Send`
+    /// Unlike [`pin`](HashMap::pin), the returned reference implements `Send`
     /// and `Sync`, allowing it to be held across `.await` points in multi-threaded
     /// schedulers. This is especially useful for iterators.
     ///

@@ -51,7 +51,7 @@ pub struct State {
     pub status: AtomicU32,
     // A thread parker for incremental reclamation.
     pub parker: Parker,
-    // Entries whos retirement has been deferred by later tables.
+    // Entries whose retirement has been deferred by later tables.
     pub deferred: seize::Deferred,
     // A pointer to the root collector, valid as long as the map is alive.
     pub collector: *const Collector,
@@ -502,35 +502,20 @@ where
             probe.next();
         }
 
-        match self.root.resize {
-            ResizeMode::Incremental(_) => {
-                // went over the probe limit or found a copied entry, trigger a resize
-                let next_table = self.get_or_alloc_next(None);
+        // went over the probe limit or found a copied entry, trigger a resize
+        let next_table = self.get_or_alloc_next(None);
 
-                // help out with the resize
-                if help_copy {
-                    self.help_copy(guard, false);
-                }
-
-                // insert into the next table, racing with the copy of this entry
-                // TOOD: do we have to mark the entry as copied?
-                //
-                // make sure not to help copy again to keep resizing costs constant
-                self.as_ref(next_table)
-                    .insert_entry(new_entry, replace, false, guard)
-            }
-            ResizeMode::Blocking => {
-                // went over the probe limit or found a copied entry, trigger a resize
-                self.get_or_alloc_next(None);
-
-                // complete the copy
-                let next_table = self.help_copy(guard, false);
-
-                // insert into the next table
-                self.as_ref(next_table)
-                    .insert_entry(new_entry, replace, help_copy, guard)
-            }
+        // help out with the resize, or complete the copy if in blocking mode
+        if self.root.is_blocking() || help_copy {
+            self.help_copy(guard, false);
         }
+
+        // insert into the next table, racing with the copy of this entry
+        //
+        // make sure not to help copy again to keep resizing costs constant in
+        // incremental mode
+        self.as_ref(next_table)
+            .insert_entry(new_entry, replace, false, guard)
     }
 
     // Replaces the value of an existing entry, returning the previous value if successful.
@@ -555,7 +540,7 @@ where
                 Ordering::Release,
                 Ordering::Relaxed,
             ) {
-                // succesful update
+                // successful update
                 Ok(_) => unsafe {
                     // safety: the old value is now unreachable in this table
                     self.defer_retire(entry, guard);
@@ -714,7 +699,7 @@ where
                             Ordering::Release,
                             Ordering::Relaxed,
                         ) {
-                            // succesful update
+                            // successful update
                             Ok(_) => unsafe {
                                 // safety: the old value is now unreachable in this table
                                 self.defer_retire(entry, guard);
@@ -771,7 +756,7 @@ where
                     }
 
                     // wait for the copy to complete
-                    // TODO: race and try to insert our entry in the table based on the entry being copied
+                    // TODO: update the copied entry and race to insert into the table
                     self.wait_copied(i);
 
                     // retry in the new table
@@ -860,7 +845,7 @@ where
                             Ordering::Relaxed,
                             Ordering::Relaxed,
                         ) {
-                            // succesfully deleted
+                            // successfully deleted
                             Ok(_) => unsafe {
                                 // mark the key as a tombstone to avoid unnecessary reads
                                 // note this might end up being overwritten by a slow h2 store,
@@ -1410,7 +1395,7 @@ where
         }
     }
 
-    // Allocate the inital table.
+    // Allocate the initial table.
     fn init(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
 
@@ -1756,7 +1741,7 @@ macro_rules! probe_limit {
 
 use probe_limit;
 
-// Returns an esitmate of he number of entries needed to hold `capacity` elements.
+// Returns an estimate of the number of entries needed to hold `capacity` elements.
 fn entries_for(capacity: usize) -> usize {
     // we should rarely resize before 75%
     let capacity = capacity.checked_mul(8).expect("capacity overflow") / 6;
