@@ -1384,7 +1384,8 @@ where
         }
 
         loop {
-            let capacity = entries_for(self.root.count.active() + additional);
+            let active = self.root.count.active();
+            let capacity = entries_for(active.checked_add(additional).unwrap());
 
             // we have enough capacity
             if self.table.len >= capacity {

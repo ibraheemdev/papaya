@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 /// A concurrent hash table.
 ///
 /// Most hash table operations require a [`Guard`](crate::Guard), which can be acquired through
-/// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate)
+/// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
 pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
@@ -32,15 +32,15 @@ unsafe impl<K: Sync, V: Sync, S: Sync> Sync for HashMap<K, V, S> {}
 /// use std::collections::hash_map::RandomState;
 ///
 /// let map: HashMap<i32, i32> = HashMap::builder()
-///     // set the initial capacity
+///     // Set the initial capacity.
 ///     .capacity(2048)
-///     // set the hasher
+///     // Set the hasher.
 ///     .hasher(RandomState::new())
-///     // set the resize mode
+///     // Set the resize mode.
 ///     .resize_mode(ResizeMode::Blocking)
-///     // set a custom collector
+///     // Set a custom garbage collector.
 ///     .collector(Collector::new().batch_size(128))
-///     // construct the hash map
+///     // Construct the hash map.
 ///     .build();
 /// ```
 pub struct HashMapBuilder<K, V, S = RandomState> {
@@ -76,7 +76,7 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
     /// Set the initial capacity of the map.
     ///
     /// Note the table should be able to hold at least `capacity` elements before
-    /// resizing, but may prematurely resize due to poor hash distribution. If `capacity`
+    /// resizing, but may prematurely resize due to poor hash distributions. If `capacity`
     /// is 0, the hash map will not allocate.
     pub fn capacity(self, capacity: usize) -> HashMapBuilder<K, V, S> {
         HashMapBuilder {
@@ -88,9 +88,7 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
         }
     }
 
-    /// Set the resizing mode of the map.
-    ///
-    /// See [`ResizeMode`] for details.
+    /// Set the resizing mode of the map. See [`ResizeMode`] for details.
     pub fn resize_mode(self, resize_mode: ResizeMode) -> Self {
         HashMapBuilder {
             resize_mode,
@@ -101,9 +99,9 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
         }
     }
 
-    /// Set the [`seize::Collector`] used for memory reclamation.
+    /// Set the [`seize::Collector`] used for garbage collection.
     ///
-    /// This method may be useful when you want more control over memory reclamation.
+    /// This method may be useful when you want more control over garbage collection.
     /// See [`seize::Collector`] for details.
     ///
     /// Note that all `Guard` references used to access the map must be produced by
@@ -137,7 +135,7 @@ pub enum ResizeMode {
     ///
     /// Incremental resizes avoids latency spikes that can occur when insert operations have
     /// to resize a large table. However, they reduce parallelism during the resize and so can reduce
-    /// overall throughput. Incremental resizing also means all reads or write operations during an
+    /// overall throughput. Incremental resizing also means reads or write operations during an
     /// in-progress resize may have to search both the current and new table before succeeding, trading
     /// off median latency during a resize for tail latency.
     ///
@@ -280,32 +278,10 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    /// Returns a guard for use with this map.
-    ///
-    /// Note that holding on to a guard pins the current thread, preventing garbage
-    /// collection. See the [crate-level documentation](crate) for details.
-    #[inline]
-    pub fn guard(&self) -> LocalGuard<'_> {
-        self.raw.collector().enter()
-    }
-
-    /// Returns an owned guard for use with this map.
-    ///
-    /// Owned guards implement `Send` and `Sync`, allowing them to be held across
-    /// `.await` points in multi-threaded schedulers. This is especially useful
-    /// for iterators.
-    ///
-    /// Note that holding on to a guard pins the current thread, preventing garbage
-    /// collection. See the [crate-level documentation](crate) for details.
-    #[inline]
-    pub fn owned_guard(&self) -> OwnedGuard<'_> {
-        self.raw.collector().enter_owned()
-    }
-
     /// Returns a pinned reference to the map.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
-    /// for as long as it is held. See the [crate-level documentation](crate) for details.
+    /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn pin(&self) -> HashMapRef<'_, K, V, S, LocalGuard<'_>> {
         HashMapRef {
@@ -316,18 +292,40 @@ impl<K, V, S> HashMap<K, V, S> {
 
     /// Returns a pinned reference to the map.
     ///
-    /// Unlike [`pin`](HashMap::pin), the returned reference implements `Send`
-    /// and `Sync`, allowing it to be held across `.await` points in multi-threaded
+    /// Unlike [`HashMap::pin`], the returned reference implements `Send` and `Sync`,
+    /// allowing it to be held across `.await` points in multi-threaded
     /// schedulers. This is especially useful for iterators.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
-    /// for as long as it is held. See the [crate-level documentation](crate) for details.
+    /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn pin_owned(&self) -> HashMapRef<'_, K, V, S, OwnedGuard<'_>> {
         HashMapRef {
             guard: self.owned_guard(),
             map: self,
         }
+    }
+
+    /// Returns a guard for use with this map.
+    ///
+    /// Note that holding on to a guard prevents garbage collection.
+    /// See the [crate-level documentation](crate#usage) for details.
+    #[inline]
+    pub fn guard(&self) -> LocalGuard<'_> {
+        self.raw.collector().enter()
+    }
+
+    /// Returns an owned guard for use with this map.
+    ///
+    /// Owned guards implement `Send` and `Sync`, allowing them to be held across
+    /// `.await` points in work-stealing schedulers. This is especially useful
+    /// for iterators.
+    ///
+    /// Note that holding on to a guard prevents garbage collection.
+    /// See the [crate-level documentation](crate#usage) for details.
+    #[inline]
+    pub fn owned_guard(&self) -> OwnedGuard<'_> {
+        self.raw.collector().enter_owned()
     }
 }
 
@@ -464,7 +462,7 @@ where
     /// If the map did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though; this matters for
     /// types that can be `==` without being identical. See the [standard library
-    /// documentation] for more.
+    /// documentation] for details.
     ///
     /// [standard library documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
     ///
@@ -501,8 +499,6 @@ where
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```
     /// use papaya::HashMap;
     ///
@@ -534,29 +530,30 @@ where
         }
     }
 
-    // Update an entry with a remapping function.
-    //
-    // If the value for the specified `key` is present, the new value is computed and stored the
-    // using the provided update function, and the new value is returned. Otherwise, `None`
-    // is returned.
-    //
-    // The update function should be pure, as it may be called multiple times if the current value
-    // changes during the execution of this function. However, the update is performed atomically,
-    // meaning the value is only updated from it's previous value using the call to `update` with that
-    // value.
-    //
-    // # Examples
-    //
-    // ```
-    // use papaya::HashMap;
-    //
-    // let mut map = HashMap::new();
+    /// Update an entry atomically.
+    ///
+    /// If the value for the specified `key` is present, the new value is computed and stored the
+    /// using the provided update function, and the new value is returned. Otherwise, `None`
+    /// is returned.
+    ///
+    /// The update function should be pure, as it may be called multiple times if the current value
+    /// changes during the execution of this function. However, the update is performed atomically,
+    /// meaning the value is only updated using the call to `update` with the previous value —
+    /// similar to a traditional [compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap)
+    /// operation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let mut map = HashMap::new();
     /// map.pin().insert("a", 1);
     /// assert_eq!(m.get(&"a"), Some(&1));
     ///
     /// map.pin().update("a", |v| v + 1);
     /// assert_eq!(m.get(&"a"), Some(&2));
-    // ```
+    /// ```
     pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
@@ -625,13 +622,16 @@ where
     ///
     /// The collection may reserve more space to avoid frequent reallocations.
     ///
+    /// # Panics
+    ///
+    /// Panics if the new allocation size overflows `usize`.
+    ///
     /// # Examples
     ///
     /// ```
     /// use papaya::HashMap;
     ///
     /// let map: HashMap<&str, i32> = HashMap::new();
-    ///
     /// map.pin().reserve(10);
     /// ```
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
@@ -657,7 +657,7 @@ where
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
-    /// The iterator element type is `(&'a K, &'a V)`.
+    /// The iterator element type is `(&K, &V)`.
     ///
     /// # Examples
     ///
@@ -684,7 +684,7 @@ where
     }
 
     /// An iterator visiting all keys in arbitrary order.
-    /// The iterator element type is `&'a K`.
+    /// The iterator element type is `&K`.
     ///
     /// # Examples
     ///
@@ -712,7 +712,7 @@ where
     }
 
     /// An iterator visiting all values in arbitrary order.
-    /// The iterator element type is `&'a V`.
+    /// The iterator element type is `&V`.
     ///
     /// # Examples
     ///
@@ -888,8 +888,9 @@ pub struct OccupiedError<'a, V: 'a> {
     pub not_inserted: V,
 }
 
-/// A pinned reference to a hash table.
+/// A pinned reference to a [`HashMap`].
 ///
+/// This type can be used to easily access a [`HashMap`] without explicitly managing a guard.
 /// See [`HashMap::pin`] for details.
 pub struct HashMapRef<'map, K, V, S, G> {
     guard: G,
@@ -1032,7 +1033,7 @@ where
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
-    /// The iterator element type is `(&'a K, &'a V)`.
+    /// The iterator element type is `(&K, &V)`.
     ///
     /// See [`HashMap::iter`] for details.
     #[inline]
@@ -1041,7 +1042,7 @@ where
     }
 
     /// An iterator visiting all keys in arbitrary order.
-    /// The iterator element type is `&'a K`.
+    /// The iterator element type is `&K`.
     ///
     /// See [`HashMap::keys`] for details.
     #[inline]
@@ -1050,7 +1051,7 @@ where
     }
 
     /// An iterator visiting all values in arbitrary order.
-    /// The iterator element type is `&'a V`.
+    /// The iterator element type is `&V`.
     ///
     /// See [`HashMap::values`] for details.
     #[inline]
@@ -1059,9 +1060,23 @@ where
     }
 }
 
+impl<'a, K, V, S, G> IntoIterator for &'a HashMapRef<'_, K, V, S, G>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+    G: Guard,
+{
+    type Item = (&'a K, &'a V);
+    type IntoIter = Iter<'a, K, V, G>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// An iterator over a map's entries.
 ///
-/// See [`HashMap::iter`](crate::HashMap::iter) for details.
+/// This struct is created by the [`iter`](HashMap::iter) method on [`HashMap`]. See its documentation for details.
 pub struct Iter<'g, K, V, G> {
     raw: raw::Iter<'g, K, V, G>,
 }
@@ -1094,7 +1109,7 @@ where
 
 /// An iterator over a map's keys.
 ///
-/// See [`HashMap::keys`](crate::HashMap::keys) for details.
+/// This struct is created by the [`keys`](HashMap::keys) method on [`HashMap`]. See its documentation for details.
 pub struct Keys<'g, K, V, G> {
     iter: Iter<'g, K, V, G>,
 }
@@ -1124,7 +1139,7 @@ where
 
 /// An iterator over a map's values.
 ///
-/// See [`HashMap::values`](crate::HashMap::values) for details.
+/// This struct is created by the [`values`](HashMap::values) method on [`HashMap`]. See its documentation for details.
 pub struct Values<'g, K, V, G> {
     iter: Iter<'g, K, V, G>,
 }

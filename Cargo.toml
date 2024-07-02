@@ -11,6 +11,7 @@ seize = "0.4.2"
 rand = "0.8.5"
 dashmap = "5.5.3"
 criterion = "0.5.1"
+tokio = { version = "1.38.0", features = ["fs", "rt"] }
 
 [[bench]]
 name = "compare"
