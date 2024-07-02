@@ -1,4 +1,4 @@
-// adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
+// Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
 use papaya::{HashMap, ResizeMode};
 

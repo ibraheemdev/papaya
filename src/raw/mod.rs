@@ -1,5 +1,6 @@
 mod alloc;
-pub(crate) mod utils;
+mod probe;
+mod utils;
 
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
@@ -10,46 +11,47 @@ use std::sync::Mutex;
 use std::{hint, ptr};
 
 use self::alloc::RawTable;
-use self::utils::{AliasableBox, AtomicPtrFetchOps, Counter, Parker, StrictProvenance, Tagged};
-use super::map::ResizeMode;
+use self::probe::Probe;
+use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, Shared, StrictProvenance, Tagged};
+use crate::map::ResizeMode;
 
 use seize::{AsLink, Collector, Guard, Link};
 
-// A lock-free hash-map.
+// A lock-free hash-table.
 pub struct HashMap<K, V, S> {
-    // Hasher for keys.
-    pub hasher: S,
+    // A pointer to the root table.
+    table: AtomicPtr<RawTable>,
     // Collector for memory reclamation.
     //
     // The collector is allocated as it's aliased by each table,
-    // in case it needs to accessed during reclamation.
-    collector: AliasableBox<Collector>,
+    // in case it needs to be accessed during reclamation.
+    collector: Shared<Collector>,
     // The resize mode, either blocking or incremental.
     resize: ResizeMode,
-    // A pointer to the root table.
-    table: AtomicPtr<RawTable>,
     // The number of keys in the table.
     count: Counter,
+    // Hasher for keys.
+    pub hasher: S,
     _kv: PhantomData<(K, V)>,
 }
 
 // The hash-table allocation.
 type Table<K, V> = self::alloc::Table<Entry<K, V>>;
 
-// Table state.
+// Hash-table state.
 pub struct State {
-    // The next table.
+    // The next table used for resizing.
     pub next: AtomicPtr<RawTable>,
     // A lock acquired to allocate the next table.
     pub allocating: Mutex<()>,
-    // The number of entries that have been copied.
+    // The number of entries that have been copied to the next table.
     pub copied: AtomicUsize,
-    // The number of entries that have been uniquely claimed, but
-    // not necessarily copied.
+    // The number of entries that have been claimed by copiers,
+    // but not necessarily copied.
     pub claim: AtomicUsize,
     // The status of the resize.
     pub status: AtomicU32,
-    // A thread parker for incremental reclamation.
+    // A thread parker for blocking on copy operations.
     pub parker: Parker,
     // Entries whose retirement has been deferred by later tables.
     pub deferred: seize::Deferred,
@@ -77,8 +79,31 @@ impl State {
     pub const PENDING: u32 = 0;
     // The resize has been aborted, continue to the next table.
     pub const ABORTED: u32 = 1;
-    // The resize was complete and the table promoted to the root.
+    // The resize was complete and the table was promoted.
     pub const PROMOTED: u32 = 2;
+}
+
+// The result of an insert operation.
+pub enum InsertResult<'g, V> {
+    // Inserted the given value.
+    Inserted(&'g V),
+    // Replaced the given value.
+    Replaced(&'g V),
+    // Error returned by `try_insert`.
+    Error { current: &'g V, not_inserted: V },
+}
+
+// The raw result of an insert operation.
+pub enum RawInsertResult<'g, K, V> {
+    // Inserted the given value.
+    Inserted(&'g V),
+    // Replaced the given value.
+    Replaced(&'g V),
+    // Error returned by `try_insert`.
+    Error {
+        current: Tagged<Entry<K, V>>,
+        not_inserted: *mut Entry<K, V>,
+    },
 }
 
 // An entry in the hash-table.
@@ -89,95 +114,107 @@ pub struct Entry<K, V> {
     pub value: V,
 }
 
-// The state of an entry we attempted to update.
-pub enum EntryStatus<'g, V> {
-    Empty(&'g V),
-    Replaced(&'g V),
-    Error { current: &'g V, not_inserted: V },
-}
-
-// The raw state of an entry we attempted to update.
-pub enum EntryStatusRaw<'g, K, V> {
-    Empty(&'g V),
-    Replaced(&'g V),
-    Error {
-        current: *mut Entry<K, V>,
-        not_inserted: *mut Entry<K, V>,
-    },
-}
-
-/// The state of an entry we attempted to replace.
-enum ReplaceStatus<V> {
-    HelpCopy,
-    Removed,
-    Replaced(V),
-}
-
 // Safety: repr(C) and seize::Link is the first field
 unsafe impl<K, V> AsLink for Entry<K, V> {}
 
 impl Entry<(), ()> {
     // The entry is being copied to the new table, no updates are allowed on the old table.
     //
-    // The COPYING bit is put down to initiate a copy, forcing all writers to complete the resize
-    // before making progress. Readers can ignore this.
+    // This bit is put down to initiate a copy, forcing all writers to complete the resize
+    // before making progress.
     const COPYING: usize = 0b001;
 
     // The entry has been copied to the new table.
     //
-    // The COPIED bit is put down after a copy completes. Both readers and writers must go to
+    // This bit is put down after a copy completes. Both readers and writers must go to
     // the new table to see the new state of the entry.
     //
-    // In blocking mode this is not necessary.
+    // In blocking mode this is unused.
     const COPIED: usize = 0b010;
 
     // The entry was copied from a previous table.
     //
-    // A borrowed entry may still be accessible from previous tables if the resize has not been
-    // promoted, and so are unsafe to drop.
+    // This bit indicates that an entry may still be accessible from previous tables
+    // because the resize is still in progress, and so it is unsafe to reclaim.
     //
-    // In blocking mode this is not necessary.
+    // In blocking mode this is unused.
     const BORROWED: usize = 0b100;
 
-    // Mask for entry pointer, ignoring tag bits.
-    const MASK: usize = !(Entry::COPYING | Entry::COPIED | Entry::BORROWED);
-
-    // Retires an entry.
-    unsafe fn retire<K, V>(link: *mut Link) {
+    // Reclaims an entry.
+    unsafe fn reclaim<K, V>(link: *mut Link) {
         let entry: *mut Entry<K, V> = link.cast();
         let _entry = unsafe { Box::from_raw(entry) };
     }
 }
 
+impl<K, V> utils::Unpack for Entry<K, V> {
+    // Mask for an entry pointer, ignoring any tag bits.
+    const MASK: usize = !(Entry::COPYING | Entry::COPIED | Entry::BORROWED);
+}
+
 impl<K, V> Entry<K, V> {
-    // Sentinel value for a deleted entry.
-    fn tombstone() -> *mut Entry<K, V> {
-        static TOMBSTONE: u64 = 0;
-        &TOMBSTONE as *const u64 as *mut Entry<K, V>
+    // Checks whether this entry represents a tombstone.
+    fn is_tombstone(entry: Tagged<Entry<K, V>>) -> bool {
+        // Null pointers are never copied to the new table, so this state is safe to use.
+        entry.ptr.is_null() && (entry.tag() & Entry::COPIED != 0)
     }
 
-    // Returns true if the pointer represents a tombstone.
-    fn is_tombstone(ptr: *mut Entry<K, V>) -> bool {
-        ptr::eq(ptr, Entry::tombstone())
-    }
-
-    // Returns true if the pointer is null or a tombstone.
-    fn is_sentinel(ptr: *mut Entry<K, V>) -> bool {
-        ptr.is_null() || ptr::eq(ptr, Entry::tombstone())
+    // Return a sentinel pointer for a deleted entry.
+    const fn tombstone() -> *mut Entry<K, V> {
+        // Null pointers are never copied to the new table, so this state is safe to use.
+        Entry::COPIED as _
     }
 }
 
+/// The status of an entry.
+enum EntryStatus<K, V> {
+    // The entry is being copied.
+    Copied,
+    // The entry is a tombstone.
+    Removed,
+    // A valid entry.
+    Value(Tagged<Entry<K, V>>),
+}
+
+impl<K, V> From<Tagged<Entry<K, V>>> for EntryStatus<K, V> {
+    fn from(entry: Tagged<Entry<K, V>>) -> Self {
+        if Entry::is_tombstone(entry) {
+            EntryStatus::Removed
+        } else if entry.tag() & Entry::COPYING != 0 {
+            EntryStatus::Copied
+        } else {
+            EntryStatus::Value(entry)
+        }
+    }
+}
+
+/// The state of an entry we attempted to update.
+enum UpdateStatus<K, V> {
+    // Successfully replaced the given key and value.
+    Replaced(Tagged<Entry<K, V>>),
+    // A new entry was written before we could update.
+    Found(EntryStatus<K, V>),
+}
+
+/// The state of an entry we attempted to insert into.
+enum InsertStatus<'g, K, V> {
+    // Successfully inserted the given value.
+    Inserted(&'g V),
+    // A new entry was written before we could update.
+    Found(EntryStatus<K, V>),
+}
+
 impl<K, V, S> HashMap<K, V, S> {
-    // Creates new hash-map with the given options.
+    // Creates new hash-table with the given options.
     pub fn new(
         capacity: usize,
         hasher: S,
         collector: Collector,
         resize: ResizeMode,
     ) -> HashMap<K, V, S> {
-        let collector = AliasableBox::from(collector);
+        let collector = Shared::from(collector);
 
-        // the table is lazily allocated
+        // The table is lazily allocated.
         if capacity == 0 {
             return HashMap {
                 collector,
@@ -189,9 +226,8 @@ impl<K, V, S> HashMap<K, V, S> {
             };
         }
 
-        let mut table = Table::<K, V>::new(entries_for(capacity), &collector);
-
-        // mark this table as the root
+        // Initialize the table and mark it as the root.
+        let mut table = Table::<K, V>::alloc(probe::entries_for(capacity), &collector);
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
         HashMap {
@@ -204,7 +240,7 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    // Returns a reference to the root hash table.
+    // Returns a reference to the root hash-table.
     #[inline(always)]
     pub fn root<'g>(&self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
         assert!(
@@ -215,8 +251,8 @@ impl<K, V, S> HashMap<K, V, S> {
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
 
-        // safety: we verified above that the guard belongs to our collector, so
-        // &'g Guard implies &'g self. this makes bounds a little nicer for users
+        // Safety: We verified above that the guard belongs to our collector, so
+        // &'g Guard implies &'g self. This makes bounds a little nicer for users.
         unsafe {
             mem::transmute::<HashMapRef<'_, K, V, S>, HashMapRef<'g, K, V, S>>(self.as_ref(table))
         }
@@ -229,7 +265,7 @@ impl<K, V, S> HashMap<K, V, S> {
 
     // Returns the number of entries in the table.
     pub fn len(&self) -> usize {
-        self.count.active()
+        self.count.sum()
     }
 
     // Returns true if incremental resizing is enabled.
@@ -245,6 +281,7 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     // Returns a reference to the given table.
+    #[inline(always)]
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'_, K, V, S> {
         HashMapRef { table, root: self }
     }
@@ -256,56 +293,62 @@ pub struct HashMapRef<'a, K, V, S> {
     root: &'a HashMap<K, V, S>,
 }
 
-impl<K, V, S> HashMapRef<'_, K, V, S>
+// Hash-table operations.
+impl<'root, K, V, S> HashMapRef<'root, K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    // Returns a reference to the value corresponding to the key.
-    pub fn get_entry<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
+    // Returns a reference to the entry corresponding to the key.
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        // The table has not yet been allocated.
         if self.table.raw.is_null() {
             return None;
         }
 
-        let hash = self.root.hasher.hash_one(key);
-        let h2 = meta::h2(hash);
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
 
-        let (mut probe, limit) = Probe::start(h1(hash), self.table.len);
+        // Probe until we reach the limit.
         while probe.len <= limit {
+            // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
-            // the entry is not in the table. it cannot be in the next table either
-            // because we have not went over the probe limit
+            // The key is not in the table.
+            // It also cannot be in the next table because we have not went over the probe limit.
             if meta == meta::EMPTY {
                 return None;
             }
 
-            // potential match
+            // Found a potential match.
             if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }
-                    .unpack(Entry::MASK);
+                // Load the full entry.
+                let entry =
+                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
-                // the entry was deleted
-                if Entry::is_tombstone(entry.ptr) {
+                // The entry was deleted, keep probing.
+                if Entry::is_tombstone(entry) {
                     probe.next();
                     continue;
                 }
 
-                // check for a full match
+                // Check for a full match.
                 fence(Ordering::Acquire);
                 if unsafe { (*entry.ptr).key.borrow() } == key {
-                    // the entry was copied to the new table
+                    // The entry was copied to the new table.
                     //
-                    // in blocking mode we can ignore this, because writes block until resizes
-                    // complete, so the root table is always the source of truth
-                    if self.root.is_incremental() && entry.addr & Entry::COPIED != 0 {
+                    // In blocking resize mode we do not need to perform this check as all writes block
+                    // until any resizes are complete, making the root table the source of truth for readers.
+                    if self.root.is_incremental() && entry.tag() & Entry::COPIED != 0 {
                         break;
                     }
 
+                    // Found the correct entry, return the key and value.
                     return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
                 }
             }
@@ -313,52 +356,59 @@ where
             probe.next();
         }
 
-        // in incremental mode, we have to check the next table if we found a
-        // copied entry or went over the probe limit
+        // In incremental resize mode, we have to check the next table if we found
+        // a copied entry or went over the probe limit.
         if self.root.is_incremental() {
             if let Some(next) = self.next_table_ref() {
-                return next.get_entry(key, guard);
+                // Retry in the new table.
+                return next.get(key, guard);
             }
         }
 
+        // Otherwise, the key is not in the table.
         None
     }
 
-    // Inserts a key-value pair into the map.
+    // Inserts a key-value pair into the table.
     pub fn insert<'g>(
         &mut self,
         key: K,
         value: V,
         replace: bool,
         guard: &'g impl Guard,
-    ) -> EntryStatus<'g, V> {
+    ) -> InsertResult<'g, V> {
+        // Allocate the entry to be inserted.
         let entry = Box::into_raw(Box::new(Entry {
             key,
             value,
             link: self.root.collector.link(),
         }));
 
-        let result = match self.insert_entry(entry, replace, true, guard) {
-            EntryStatusRaw::Empty(value) => EntryStatus::Empty(value),
-            EntryStatusRaw::Replaced(value) => EntryStatus::Replaced(value),
-            EntryStatusRaw::Error {
+        // Perform the insert.
+        //
+        // Safety: We just allocated the entry above.
+        let result = unsafe { self.insert_with(untagged(entry), replace, true, guard) };
+        let result = match result {
+            RawInsertResult::Inserted(value) => InsertResult::Inserted(value),
+            RawInsertResult::Replaced(value) => InsertResult::Replaced(value),
+            RawInsertResult::Error {
                 current,
                 not_inserted,
             } => {
-                let current = unsafe { &(*current).value };
+                let current = unsafe { &(*current.ptr).value };
 
-                // safety: we allocated this box above, and it was not inserted into the map
+                // Safety: We allocated this box above and it was not inserted into the table.
                 let not_inserted = unsafe { Box::from_raw(not_inserted) };
 
-                EntryStatus::Error {
+                InsertResult::Error {
                     current,
                     not_inserted: not_inserted.value,
                 }
             }
         };
 
-        // update the length if we inserted a new entry
-        if matches!(result, EntryStatus::Empty(_)) {
+        // Increment the length if we inserted a new entry.
+        if matches!(result, InsertResult::Inserted(_)) {
             self.root
                 .count
                 .get(guard.thread_id())
@@ -369,281 +419,160 @@ where
     }
 
     // Inserts an entry into the map.
-    fn insert_entry<'g>(
+    //
+    // # Safety
+    //
+    // The new entry must be a valid pointer.
+    unsafe fn insert_with<'g>(
         &mut self,
-        new_entry: *mut Entry<K, V>,
-        replace: bool,
+        new_entry: Tagged<Entry<K, V>>,
+        should_replace: bool,
         help_copy: bool,
         guard: &'g impl Guard,
-    ) -> EntryStatusRaw<'g, K, V> {
+    ) -> RawInsertResult<'g, K, V> {
+        // Allocate the table if it has not been initialized yet.
         if self.table.raw.is_null() {
             self.init(None);
         }
 
-        let new_ref = unsafe { &*(new_entry).unpack(Entry::MASK).ptr };
-        let hash = self.root.hasher.hash_one(&new_ref.key);
-        let h2 = meta::h2(hash);
+        // Safety: The new entry is guaranteed to be valid by the caller.
+        let new_ref = unsafe { &*(new_entry).ptr };
 
-        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
-        loop {
-            if probe.len > end {
-                break;
-            }
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(&new_ref.key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
 
+        // Probe until we reach the limit.
+        while probe.len <= limit {
+            // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
-
-            if meta == meta::EMPTY {
-                let entry = unsafe { self.table.entry(probe.i) };
-
-                match entry.compare_exchange(
-                    ptr::null_mut(),
-                    new_entry,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    // successfully claimed this entry
-                    Ok(_) => {
-                        unsafe { self.table.meta(probe.i).store(h2, Ordering::Release) };
-                        return EntryStatusRaw::Empty(&new_ref.value);
-                    }
-                    // lost to a concurrent insert
-                    Err(found) => {
-                        let found = found.unpack(Entry::MASK);
-
-                        // ensure the meta table is updated to keep the probe chain alive
-                        unsafe {
-                            // the entry was deleted or copied
-                            let meta = if Entry::is_sentinel(found.ptr) {
-                                // even if an empty entry was copied, we still mark it as a
-                                // tombstone so readers know to continue
-                                // TODO: could go to the new table here (phantom bit)
-                                meta::TOMBSTONE
-                            } else {
-                                fence(Ordering::Acquire);
-
-                                // make sure the meta is visible to readers
-                                let hash = self.root.hasher.hash_one(&(*found.ptr).key);
-                                meta::h2(hash)
-                            };
-
-                            if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
-                                self.table.meta(probe.i).store(meta, Ordering::Release);
-                            }
-                        }
-
-                        // the entry was deleted or copied
-                        if Entry::is_sentinel(found.ptr) {
-                            probe.next();
-                            continue;
-                        }
-
-                        // if the same key was just inserted, we might be able to update
-                        if unsafe { (*found.ptr).key == new_ref.key } {
-                            // we aren't replacing existing values, return an error
-                            if !replace {
-                                return EntryStatusRaw::Error {
-                                    current: found.ptr,
-                                    not_inserted: new_entry,
-                                };
-                            }
-
-                            match self.replace_entry(probe.i, found, new_entry, guard) {
-                                // the entry was deleted before we could update it, keep probing
-                                ReplaceStatus::Removed => unsafe {
-                                    // ensure the meta table is updated to keep the probe chain alive
-                                    self.table
-                                        .meta(probe.i)
-                                        .store(meta::TOMBSTONE, Ordering::Release);
-                                },
-                                // the entry is being copied
-                                ReplaceStatus::HelpCopy => break,
-                                // successful update
-                                ReplaceStatus::Replaced(value) => {
-                                    return EntryStatusRaw::Replaced(value)
-                                }
-                            }
-                        }
-
+            let mut entry = match meta {
+                // The entry is empty, try to insert.
+                meta::EMPTY => match self.insert_at(probe.i, h2, new_entry, guard) {
+                    // Successfully inserted.
+                    InsertStatus::Inserted(value) => return RawInsertResult::Inserted(value),
+                    // Lost to a concurrent insert.
+                    // If the key matches, we might be able to update the value.
+                    InsertStatus::Found(EntryStatus::Value(found)) => found,
+                    // Otherwise, continue probing.
+                    _ => {
                         probe.next();
                         continue;
                     }
+                },
+                // Found a potential match.
+                _ if meta == h2 => {
+                    // Load the full entry.
+                    let entry = self.table.entry(probe.i);
+                    let found = guard.protect(entry, Ordering::Relaxed).unpack();
+
+                    // The entry was deleted, keep probing.
+                    if Entry::is_tombstone(found) {
+                        probe.next();
+                        continue;
+                    }
+
+                    // If the key matches, we might be able to update the value.
+                    found
                 }
-            }
-
-            // potential match
-            if meta == h2 {
-                let entry = unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }
-                    .unpack(Entry::MASK);
-
-                // the entry was deleted
-                if Entry::is_tombstone(entry.ptr) {
+                // Otherwise, continue probing.
+                _ => {
                     probe.next();
                     continue;
                 }
+            };
 
-                // if the key matches, we might be able to update
-                fence(Ordering::Acquire);
-                if unsafe { (*entry.ptr).key == new_ref.key } {
-                    // we aren't replacing existing values, return an error
-                    if !replace {
-                        return EntryStatusRaw::Error {
-                            current: entry.ptr,
-                            not_inserted: new_entry,
-                        };
-                    }
+            // Check for a full match.
+            fence(Ordering::Acquire);
+            if unsafe { (*entry.ptr).key == new_ref.key } {
+                // The entry is being copied to the new table.
+                if entry.tag() & Entry::COPYING != 0 {
+                    break;
+                }
 
-                    match self.replace_entry(probe.i, entry, new_entry, guard) {
-                        // the entry was deleted before we could update it, keep probing
-                        ReplaceStatus::Removed => {}
-                        // the entry is being copied
-                        ReplaceStatus::HelpCopy => break,
-                        // successful update
-                        ReplaceStatus::Replaced(value) => return EntryStatusRaw::Replaced(value),
+                // Return an error for calls to `try_insert`.
+                if !should_replace {
+                    return RawInsertResult::Error {
+                        current: entry,
+                        not_inserted: new_entry.ptr,
+                    };
+                }
+
+                loop {
+                    // Try to update the value.
+                    match self.update_at(probe.i, entry, new_entry.raw, guard) {
+                        // Successfully updated.
+                        UpdateStatus::Replaced(entry) => {
+                            return RawInsertResult::Replaced(&(*entry.ptr).value)
+                        }
+                        // The entry is being copied.
+                        UpdateStatus::Found(EntryStatus::Copied) => break,
+                        // The entry was deleted before we could update it, continue probing.
+                        UpdateStatus::Found(EntryStatus::Removed) => {}
+                        // Someone else beat us to the update, retry.
+                        UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
                     }
                 }
             }
 
+            // Continue probing.
             probe.next();
         }
 
-        // went over the probe limit or found a copied entry, trigger a resize
+        // If went over the probe limit or found a copied entry, trigger a resize.
         let next_table = self.get_or_alloc_next(None);
 
-        // help out with the resize, or complete the copy if in blocking mode
+        // Help out with the resize.
         if self.root.is_blocking() || help_copy {
             self.help_copy(guard, false);
         }
 
-        // insert into the next table, racing with the copy of this entry
-        //
-        // make sure not to help copy again to keep resizing costs constant in
-        // incremental mode
+        // Make sure not to do any more copying to keep resizing costs constant in
+        // incremental mode.
+        let help_copy = false;
+
+        // Insert into the next table, racing with the copy of this entry.
         self.as_ref(next_table)
-            .insert_entry(new_entry, replace, false, guard)
-    }
-
-    // Replaces the value of an existing entry, returning the previous value if successful.
-    //
-    // Inserts into the new table if the entry is being copied.
-    fn replace_entry<'g>(
-        &self,
-        i: usize,
-        mut entry: Tagged<*mut Entry<K, V>>,
-        new_entry: *mut Entry<K, V>,
-        guard: &'g impl Guard,
-    ) -> ReplaceStatus<&'g V> {
-        loop {
-            // the entry is being copied to a new table, we have to retry there
-            if entry.addr & Entry::COPYING != 0 {
-                return ReplaceStatus::HelpCopy;
-            }
-
-            match unsafe { self.table.entry(i) }.compare_exchange_weak(
-                entry.raw,
-                new_entry,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                // successful update
-                Ok(_) => unsafe {
-                    // safety: the old value is now unreachable in this table
-                    self.defer_retire(entry, guard);
-                    return ReplaceStatus::Replaced(&(*entry.ptr).value);
-                },
-
-                // lost to a concurrent update, retry
-                Err(found) => {
-                    entry = found.unpack(Entry::MASK);
-
-                    // the entry was deleted
-                    if Entry::is_tombstone(entry.ptr) {
-                        return ReplaceStatus::Removed;
-                    }
-
-                    fence(Ordering::Acquire);
-                }
-            }
-        }
-    }
-
-    unsafe fn defer_retire(&self, entry: Tagged<*mut Entry<K, V>>, guard: &impl Guard) {
-        match self.root.resize {
-            // safety: in blocking mode, we only ever write to the root table, so the entry
-            // is already inaccessible. any threads that enter after we retire will load
-            // the root table
-            ResizeMode::Blocking => unsafe {
-                guard.defer_retire(entry.ptr, Entry::retire::<K, V>);
-            },
-            // in incremental mode, the entry may be accessible in previous tables if the
-            // current table is not the root
-            ResizeMode::Incremental(_) => {
-                // if the entry is not borrowed, meaning it is not in any previous tables,
-                // it is inaccessible even if we are not the root, so we can safely retire
-                if entry.addr & Entry::BORROWED == 0 {
-                    unsafe { guard.defer_retire(entry.ptr, Entry::retire::<K, V>) };
-                    return;
-                }
-
-                let root = self.root.table.load(Ordering::Relaxed);
-
-                // if the root is our table or any table that precedes ours, the entry is
-                // inaccessible and we can safely retire it
-                let mut next = Some(self.clone());
-                while let Some(map) = next {
-                    if map.table.raw == root {
-                        unsafe { guard.defer_retire(entry.ptr, Entry::retire::<K, V>) };
-                        return;
-                    }
-
-                    next = map.next_table_ref();
-                }
-
-                // if not, we have to wait for the previous table to be reclaimed before
-                // dropping this entry
-                fence(Ordering::Acquire);
-                let mut prev = self.as_ref(unsafe { Table::<K, V>::from_raw(root) });
-                loop {
-                    let next = prev.next_table_ref().unwrap();
-
-                    if next.table.raw == self.table.raw {
-                        // defer this entry to be retired by the previous table
-                        prev.table.state().deferred.defer(entry.ptr);
-                        return;
-                    }
-
-                    prev = next;
-                }
-            }
-        }
+            .insert_with(new_entry, should_replace, help_copy, guard)
     }
 
     // Update an entry with a remapping function.
-    pub fn update<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> Option<&'g V>
+    pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
     {
+        // The table has not yet been allocated.
         if self.table.raw.is_null() {
             return None;
         }
 
-        let update = Box::into_raw(Box::new(Entry {
+        // Initialize the entry we will be inserting.
+        let entry = Box::into_raw(Box::new(Entry {
             key,
             link: self.root.collector.link(),
             value: MaybeUninit::uninit(),
         }));
 
-        match self.update_with(update, f, true, guard) {
+        // Perform the update.
+        //
+        // Safety: We just allocated the entry above.
+        let result = unsafe { self.update_with(entry, update, true, guard) };
+        match result {
             Some(value) => Some(value),
             None => {
-                // safety: we allocated this box above, and it was not inserted into the map
-                let _ = unsafe { Box::from_raw(update) };
+                // Safety: We allocated this box above, and it was not inserted into the map.
+                let _ = unsafe { Box::from_raw(entry) };
                 None
             }
         }
     }
 
     // Update an entry with a remapping function.
-    pub fn update_with<'g, F>(
+    //
+    // # Safety
+    //
+    // The new entry must be a valid pointer.
+    unsafe fn update_with<'g, F>(
         &self,
         new_entry: *mut Entry<K, MaybeUninit<V>>,
         update: F,
@@ -653,80 +582,81 @@ where
     where
         F: Fn(&V) -> V,
     {
-        let hash = unsafe { self.root.hasher.hash_one(&(*new_entry).key) };
-        let h2 = meta::h2(hash);
+        // Safety: The new entry is guaranteed to be valid by the caller.
+        let new_ref = unsafe { &*(new_entry).unpack().ptr };
 
-        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(&new_ref.key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
+
+        // Probe until we reach the limit.
         let copying = 'probe: loop {
-            if probe.len > end {
+            if probe.len > limit {
                 break None;
             }
 
+            // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
-            // the entry is not in the table. it cannot be in the next table either
-            // because we have not went over the probe limit
+            // The key is not in the table.
+            // It also cannot be in the next table because we have not went over the probe limit.
             if meta == meta::EMPTY {
                 return None;
             }
 
-            // potential match
+            // Found a potential match.
             if meta == h2 {
+                // Load the full entry.
                 let mut entry =
-                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }
-                        .unpack(Entry::MASK);
+                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
-                // the entry was deleted
-                if Entry::is_tombstone(entry.ptr) {
+                // The entry was deleted, keep probing.
+                if Entry::is_tombstone(entry) {
                     probe.next();
                     continue;
                 }
 
-                // the key matches, we might be able to perform an update
+                // Check for a full match.
                 fence(Ordering::Acquire);
-                if unsafe { (*entry.ptr).key == (*new_entry).key } {
+                if unsafe { (*entry.ptr).key == new_ref.key } {
+                    // The entry is being copied to the new table, we have to complete the copy before
+                    // we can update.
+                    if entry.tag() & Entry::COPYING != 0 {
+                        break 'probe Some(probe.i);
+                    }
+
                     loop {
-                        // the entry is being copied to a new table, we have to copy it before we can update it
-                        if entry.addr & Entry::COPYING != 0 {
-                            break 'probe Some(probe.i);
-                        }
+                        // Initialize the value to insert.
+                        let value = update(&(*entry.ptr).value);
+                        (*new_entry).value = MaybeUninit::new(value);
 
-                        // construct the new value
-                        unsafe {
-                            let value = update(&(*entry.ptr).value);
-                            (*new_entry).value = MaybeUninit::new(value);
-                        }
-
-                        match unsafe { self.table.entry(probe.i) }.compare_exchange_weak(
-                            entry.raw,
-                            new_entry.cast(),
-                            Ordering::Release,
-                            Ordering::Relaxed,
-                        ) {
-                            // successful update
-                            Ok(_) => unsafe {
-                                // safety: the old value is now unreachable in this table
-                                self.defer_retire(entry, guard);
-                                return Some((*new_entry).value.assume_init_ref());
-                            },
-
-                            // lost to a concurrent update, retry
-                            Err(found) => {
-                                entry = found.unpack(Entry::MASK);
-
-                                // the entry got deleted
-                                //
-                                // we can return directly here because we saw the entry was in
-                                // this table at some point and then got deleted
-                                if Entry::is_tombstone(entry.ptr) {
-                                    return None;
-                                }
-
-                                fence(Ordering::Acquire);
-
-                                // drop the old value
-                                unsafe { (*new_entry).value.assume_init_drop() }
+                        // Try to update the value.
+                        match self.update_at(probe.i, entry, new_entry.cast(), guard) {
+                            // Successfully performed the update.
+                            UpdateStatus::Replaced(_) => {
+                                // Return the value we inserted.
+                                return unsafe { Some((*new_entry).value.assume_init_ref()) };
                             }
+                            // The entry is being copied to the new table, we have to complete the copy
+                            // before we can update.
+                            UpdateStatus::Found(EntryStatus::Copied) => {
+                                // Drop the previous value as it will be overwritten when we retry
+                                // in the new table.
+                                (*new_entry).value.assume_init_drop();
+                                break 'probe Some(probe.i);
+                            }
+                            // The entry was deleted.
+                            //
+                            // We can return directly because we saw that this was the correct entry at
+                            // some point.
+                            UpdateStatus::Found(EntryStatus::Removed) => return None,
+                            // Lost to a concurrent update, retry.
+                            UpdateStatus::Found(EntryStatus::Value(found)) => unsafe {
+                                entry = found;
+
+                                // Drop the previous value.
+                                (*new_entry).value.assume_init_drop();
+                            },
                         }
                     }
                 }
@@ -736,47 +666,56 @@ where
         };
 
         match self.root.resize {
-            ResizeMode::Blocking => {
-                // the entry we want to update is being copied
-                if copying.is_some() {
-                    // complete the copy
+            ResizeMode::Blocking => match copying {
+                // The entry we want to update is being copied.
+                Some(_) => {
+                    // In blocking mode we must complete the resize before proceeding.
                     let next_table = self.help_copy(guard, false);
 
-                    // update in the next table
+                    // Continue in the new table.
                     return self
                         .as_ref(next_table)
                         .update_with(new_entry, update, help_copy, guard);
                 }
+                // If we went over the probe limit, the key is not in this table.
+                None => None,
+            },
 
-                // went over the probe limit, the entry is not in this table
-                None
-            }
             ResizeMode::Incremental(_) => {
-                // the entry we want to update is being copied
+                // The entry we want to update is being copied.
                 if let Some(i) = copying {
                     let next_table = self.next_table_ref().unwrap();
+
+                    // Help out with the copy.
                     if help_copy {
                         self.help_copy(guard, false);
                     }
 
-                    // wait for the copy to complete
-                    // TODO: update the copied entry and race to insert into the table
+                    // Wait for the entry to be copied.
+                    //
+                    // We could perform an update based on the copied entry and
+                    // race to insert it into the table here instead. However, this
+                    // entire code path is very rare and likely to complete
+                    // very quickly, so blocking is likely cheaper.
                     self.wait_copied(i);
 
-                    // retry in the new table
+                    // Continue in the new table.
                     return next_table.update_with(new_entry, update, false, guard);
                 }
 
-                // the entry might be in the next table if we went over the probe limit
+                // In incremental resize mode, we have to check the next table if we found
+                // a copied entry or went over the probe limit.
                 if let Some(next_table) = self.next_table_ref() {
+                    // Help out with the copy.
                     if help_copy {
                         self.help_copy(guard, false);
                     }
 
+                    // Continue in the new table.
                     return next_table.update_with(new_entry, update, false, guard);
                 }
 
-                // otherwise the entry is not in the table
+                // Otherwise, the key is not in the table.
                 None
             }
         }
@@ -792,6 +731,8 @@ where
     }
 
     // Removes a key from the map, returning the entry for the key if the key was previously in the map.
+    //
+    // This is a recursive helper for `remove_entry`.
     pub fn remove_inner<'g, Q: ?Sized>(
         &self,
         key: &Q,
@@ -806,81 +747,78 @@ where
             return None;
         }
 
-        let hash = self.root.hasher.hash_one(key);
-        let h2 = meta::h2(hash);
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
 
-        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
+        // Probe until we reach the limit.
         let copying = 'probe: loop {
-            if probe.len > end {
+            if probe.len > limit {
                 break None;
             }
 
+            // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i).load(Ordering::Acquire) };
 
-            // the key is not in this table
+            // The key is not in the table.
+            // It also cannot be in the next table because we have not went over the probe limit.
             if meta == meta::EMPTY {
                 return None;
             }
 
+            // Found a potential match.
             if meta == h2 {
+                // Load the full entry.
                 let mut entry =
-                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }
-                        .unpack(Entry::MASK);
+                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
-                // the entry was deleted
-                if Entry::is_tombstone(entry.ptr) {
+                // The entry was deleted, keep probing.
+                if Entry::is_tombstone(entry) {
                     probe.next();
                     continue;
                 }
 
-                // the key matches, we might be able to perform an update
+                // Check for a full match.
                 fence(Ordering::Acquire);
                 if unsafe { (*entry.ptr).key.borrow() == key } {
+                    // The entry is being copied to the new table, we have to complete the copy before
+                    // we can remove it.
+                    if entry.tag() & Entry::COPYING != 0 {
+                        break 'probe Some(probe.i);
+                    }
+
                     loop {
-                        // the entry is being copied to a new table, we have to retry there
-                        if entry.addr & Entry::COPYING != 0 {
-                            break 'probe Some(probe.i);
-                        }
+                        match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
+                            // Successfully removed the entry.
+                            UpdateStatus::Replaced(entry) => {
+                                // Mark the key as a tombstone to avoid unnecessary loads of the
+                                // entry.
+                                //
+                                // Note that this might end up being overwritten by the metadata hash
+                                // if the initial insertion is lagging behind, but we avoid the RMW
+                                // and sacrifice reads in the extremely rare case.
+                                unsafe {
+                                    self.table
+                                        .meta(probe.i)
+                                        .store(meta::TOMBSTONE, Ordering::Release)
+                                };
 
-                        // perform the deletion
-                        match unsafe { self.table.entry(probe.i) }.compare_exchange_weak(
-                            entry.raw,
-                            Entry::tombstone(),
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        ) {
-                            // successfully deleted
-                            Ok(_) => unsafe {
-                                // mark the key as a tombstone to avoid unnecessary reads
-                                // note this might end up being overwritten by a slow h2 store,
-                                // but we avoid the RMW and sacrifice extra reads in that extremely
-                                // rare case
-                                self.table
-                                    .meta(probe.i)
-                                    .store(meta::TOMBSTONE, Ordering::Release);
-
-                                // safety: the old value is now unreachable in this table
-                                self.defer_retire(entry, guard);
-
+                                // Decrement the table length.
                                 self.root
                                     .count
                                     .get(guard.thread_id())
                                     .fetch_sub(1, Ordering::Relaxed);
 
-                                return Some((&(*entry.ptr).key, &(*entry.ptr).value));
-                            },
-
-                            // lost to a concurrent update, retry
-                            Err(found) => {
-                                entry = found.unpack(Entry::MASK);
-
-                                // the entry was deleted
-                                if Entry::is_tombstone(entry.ptr) {
-                                    return None;
-                                }
-
-                                fence(Ordering::Acquire);
+                                let entry = unsafe { (&(*entry.ptr).key, &(*entry.ptr).value) };
+                                return Some(entry);
                             }
+                            // The entry is being copied to the new table, we have to complete the copy
+                            // before we can remove.
+                            UpdateStatus::Found(EntryStatus::Copied) => break 'probe Some(probe.i),
+                            // The entry was deleted.
+                            UpdateStatus::Found(EntryStatus::Removed) => return None,
+                            // Lost to a concurrent update, retry.
+                            UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
                         }
                     }
                 }
@@ -890,46 +828,190 @@ where
         };
 
         match self.root.resize {
-            ResizeMode::Blocking => {
-                // the entry we want to update is being copied
-                if copying.is_some() {
-                    // complete the copy
+            ResizeMode::Blocking => match copying {
+                // The entry we want to remove is being copied.
+                Some(_) => {
+                    // In blocking mode we must complete the resize before proceeding.
                     let next_table = self.help_copy(guard, false);
 
-                    // retry in the new table
+                    // Continue in the new table.
                     return self.as_ref(next_table).remove_inner(key, help_copy, guard);
                 }
+                // If we went over the probe limit, the key is not in this table.
+                None => None,
+            },
 
-                // went over the probe limit, the entry is not in this table
-                None
-            }
             ResizeMode::Incremental(_) => {
-                // the entry we want to update is being copied
+                // The entry we want to remove is being copied.
                 if let Some(i) = copying {
                     let next_table = self.next_table_ref().unwrap();
+
+                    // Help out with the copy.
                     if help_copy {
                         self.help_copy(guard, false);
                     }
 
-                    // wait for the copy to complete
+                    // Wait for the entry to be copied.
                     self.wait_copied(i);
 
-                    // retry in the new table
+                    // Continue in the new table.
                     return next_table.remove_inner(key, false, guard);
                 }
 
-                // the entry might be in the next table if we went over the probe limit
+                // In incremental resize mode, we have to check the next table if we found
+                // a copied entry or went over the probe limit.
                 if let Some(next_table) = self.next_table_ref() {
+                    // Help out with the copy.
                     if help_copy {
                         self.help_copy(guard, false);
                     }
 
+                    // Continue in the new table.
                     return next_table.remove_inner(key, false, guard);
                 }
 
-                // otherwise the entry is not in the table
+                // Otherwise, the key is not in the table.
                 None
             }
+        }
+    }
+
+    // Attempts to insert an entry at the given index.
+    #[inline(always)]
+    unsafe fn insert_at<'g>(
+        &self,
+        i: usize,
+        meta: u8,
+        new_entry: Tagged<Entry<K, V>>,
+        guard: &'g impl Guard,
+    ) -> InsertStatus<'g, K, V> {
+        let entry = unsafe { self.table.entry(i) };
+
+        // Try to claim the empty entry.
+        match entry.compare_exchange(
+            ptr::null_mut(),
+            new_entry.raw,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            // Successfully claimed the entry.
+            Ok(_) => {
+                // Update the metadata table.
+                unsafe { self.table.meta(i).store(meta, Ordering::Release) };
+
+                // Return the value we inserted.
+                return InsertStatus::Inserted(&(*new_entry.ptr).value);
+            }
+
+            // Lost to a concurrent update.
+            Err(found) => {
+                let found = found.unpack();
+
+                let (meta, status) = match EntryStatus::from(found) {
+                    EntryStatus::Value(_) => {
+                        // Protect the entry before accessing it.
+                        let found = guard.protect(entry, Ordering::Acquire).unpack();
+
+                        // Re-check the entry status.
+                        match EntryStatus::from(found) {
+                            EntryStatus::Value(found) => {
+                                // An entry was inserted, we have to hash it to get the metadata.
+                                let hash = self.root.hasher.hash_one(&(*found.ptr).key);
+                                (meta::h2(hash), EntryStatus::Value(found))
+                            }
+                            // The entry was deleted or copied.
+                            status => (meta::TOMBSTONE, status),
+                        }
+                    }
+                    // The entry was deleted or copied.
+                    status => (meta::TOMBSTONE, status),
+                };
+
+                // Ensure the meta table is updated to keep the probe chain alive for readers.
+                if self.table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
+                    self.table.meta(i).store(meta, Ordering::Release);
+                }
+
+                InsertStatus::Found(status)
+            }
+        }
+    }
+
+    // Attempts to replace the value of an existing entry at the given index.
+    #[inline(always)]
+    unsafe fn update_at(
+        &self,
+        i: usize,
+        current: Tagged<Entry<K, V>>,
+        new_entry: *mut Entry<K, V>,
+        guard: &impl Guard,
+    ) -> UpdateStatus<K, V> {
+        let entry = unsafe { self.table.entry(i) };
+
+        // Try to perform the update.
+        match entry.compare_exchange_weak(
+            current.raw,
+            new_entry,
+            Ordering::Release,
+            Ordering::Relaxed,
+        ) {
+            // Successfully updated.
+            Ok(_) => unsafe {
+                // Safety: The old value is now unreachable from this table.
+                self.defer_retire(current, guard);
+                UpdateStatus::Replaced(current)
+            },
+
+            // Lost to a concurrent update.
+            Err(found) => {
+                let found = found.unpack();
+
+                let status = match EntryStatus::from(found) {
+                    EntryStatus::Value(_) => {
+                        // Protect the entry before accessing it.
+                        let found = guard.protect(entry, Ordering::Acquire).unpack();
+
+                        // Re-check the entry status.
+                        EntryStatus::from(found)
+                    }
+                    // The entry was copied.
+                    EntryStatus::Copied => {
+                        // Acquire the next table.
+                        fence(Ordering::Acquire);
+                        EntryStatus::Copied
+                    }
+                    // The entry was deleted.
+                    removed => removed,
+                };
+
+                UpdateStatus::Found(status)
+            }
+        }
+    }
+
+    // Reserve capacity for `additional` more elements.
+    pub fn reserve(&mut self, additional: usize, guard: &impl Guard) {
+        // The table has not yet been allocated, try to initialize it.
+        if self.table.raw.is_null() && self.init(Some(probe::entries_for(additional))) {
+            return;
+        }
+
+        loop {
+            let capacity =
+                probe::entries_for(self.root.count.sum().checked_add(additional).unwrap());
+
+            // We have enough capacity.
+            if self.table.len >= capacity {
+                return;
+            }
+
+            // Race to allocate the new table.
+            self.get_or_alloc_next(Some(capacity));
+
+            // Force the copy to complete.
+            //
+            // Note that this is not strictly necessary for a `reserve` operation.
+            self.table = self.help_copy(guard, true);
         }
     }
 
@@ -939,29 +1021,34 @@ where
             return;
         }
 
-        // get a clean copy of the table to delete from
+        // Get a clean copy of the table to delete from.
         self.linearize(guard);
 
         let mut copying = false;
         'probe: for i in 0..self.table.len {
-            let mut entry = unsafe { guard.protect(self.table.entry(i), Ordering::Relaxed) }
-                .unpack(Entry::MASK);
+            // Load the entry to delete.
+            let mut entry =
+                unsafe { guard.protect(self.table.entry(i), Ordering::Relaxed) }.unpack();
 
             loop {
-                // a non-empty entry is being copied
-                // clear every entry in this table that we can, then deal with the copy
-                if entry.addr & Entry::COPYING != 0 && !Entry::is_sentinel(entry.ptr) {
+                // Found a non-empty entry being copied.
+                if entry.tag() & Entry::COPYING != 0
+                    && !entry.ptr.is_null()
+                    && !Entry::is_tombstone(entry)
+                {
                     fence(Ordering::Acquire);
+
+                    // Clear every entry in this table that we can, then deal with the copy.
                     copying = true;
                     continue 'probe;
                 }
 
-                // the entry is empty or already deleted
-                if Entry::is_sentinel(entry.ptr) {
+                // The entry is empty or already deleted.
+                if entry.ptr.is_null() || Entry::is_tombstone(entry) {
                     continue 'probe;
                 }
 
-                // try to delete the entry
+                // Try to delete the entry.
                 let result = unsafe {
                     self.table.entry(i).compare_exchange(
                         entry.raw,
@@ -972,476 +1059,38 @@ where
                 };
 
                 match result {
+                    // Successfully deleted the entry.
                     Ok(_) => unsafe {
+                        // Update the metadata table.
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
+                        // Decrement the table length.
                         self.root
                             .count
                             .get(guard.thread_id())
                             .fetch_sub(1, Ordering::Relaxed);
 
-                        // safety: the old value is now unreachable in this table
+                        // Safety: We just removed the old value from this table.
                         self.defer_retire(entry, guard);
+
                         break;
                     },
-                    // lost to a concurrent update, retry
-                    Err(found) => {
-                        entry = found.unpack(Entry::MASK);
-                        continue;
-                    }
+
+                    // Lost to a concurrent update, retry.
+                    Err(found) => entry = found.unpack(),
                 }
             }
         }
 
-        // a resize prevented us from deleting all the entries in the table. complete the resize
-        // and retry in the new table
-        if self.root.is_blocking() && copying {
+        // A resize prevented us from deleting all the entries in this table.
+        //
+        // Complete the resize and retry in the new table.
+        if copying {
             let next_table = self.help_copy(guard, true);
             return self.as_ref(next_table).clear(guard);
         }
     }
 
-    // Wait for an incremental entry copy to complete.
-    fn wait_copied(&self, i: usize) {
-        let parker = &self.table.state().parker;
-        let entry = unsafe { self.table.entry(i) };
-
-        let value = entry.load(Ordering::Acquire).unpack(Entry::MASK);
-        if value.addr & Entry::COPIED != 0 {
-            return;
-        }
-
-        // wait for the copy to complete
-        parker.park(value.ptr.addr(), entry, |entry| {
-            entry.addr() & Entry::COPIED == 0
-        });
-
-        assert!(entry.load(Ordering::Relaxed).addr() & Entry::COPIED != 0);
-    }
-
-    // Help along with an existing resize operation, returning the new root table.
-    //
-    // If `copy_all` is `false` in incremental mode, this just returns the current reference's next table,
-    // not necessarily the new root.
-    fn help_copy(&self, guard: &impl Guard, copy_all: bool) -> Table<K, V> {
-        match self.root.resize {
-            ResizeMode::Blocking => self.help_copy_blocking(guard),
-            ResizeMode::Incremental(chunk) => {
-                let copied_to = self.help_copy_incremental(chunk, copy_all, guard);
-
-                if !copy_all {
-                    // if we weren't trying to linearize, we're trying to write to the next
-                    // table even if the copy hasn't completed yet
-                    return self.next_table_ref().unwrap().table;
-                }
-
-                copied_to
-            }
-        }
-    }
-
-    // Help along the resize operation until it completes and the next table is promoted.
-    //
-    // Should only be called on the root table.
-    fn help_copy_blocking(&self, guard: &impl Guard) -> Table<K, V> {
-        // make sure we are copying from the root (or ex-root) table
-        debug_assert_eq!(
-            self.table.state().status.load(Ordering::Relaxed),
-            State::PROMOTED
-        );
-
-        let next = self.table.state().next.load(Ordering::Acquire);
-        debug_assert!(!next.is_null());
-        let mut next = unsafe { Table::<K, V>::from_raw(next) };
-
-        'copy: loop {
-            // make sure we are copying to the correct table
-            while next.state().status.load(Ordering::Relaxed) == State::ABORTED {
-                next = self.as_ref(next).get_or_alloc_next(None);
-            }
-
-            // the copy already completed
-            if self.try_promote(next, 0, guard) {
-                return next;
-            }
-
-            let copy_chunk = self.table.len.min(4096);
-
-            loop {
-                // every entry has already been claimed
-                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
-                    break;
-                }
-
-                // claim a range to copy
-                let copy_start = next.state().claim.fetch_add(copy_chunk, Ordering::Relaxed);
-
-                let mut copied = 0;
-                for i in 0..copy_chunk {
-                    let i = copy_start + i;
-
-                    if i >= self.table.len {
-                        break;
-                    }
-
-                    // if this table doesn't have space, we have to abort the resize and allocate a
-                    // new table
-                    if !self.copy_at_blocking(i, next) {
-                        // abort the current resize
-                        next.state().status.store(State::ABORTED, Ordering::Relaxed);
-
-                        // allocate the next table
-                        let allocated = self.as_ref(next).get_or_alloc_next(None);
-                        atomic_wait::wake_all(&next.state().status);
-
-                        // retry in a new table
-                        next = allocated;
-                        continue 'copy;
-                    }
-
-                    copied += 1;
-                }
-
-                // are we done?
-                if self.try_promote(next, copied, guard) {
-                    return next;
-                }
-
-                // if the resize was aborted while we were copying, continue in the new table
-                if next.state().status.load(Ordering::Relaxed) == State::ABORTED {
-                    continue 'copy;
-                }
-            }
-
-            // we copied all that we can, wait for the table to be promoted
-            for spun in 0.. {
-                const SPIN_WAIT: usize = 7;
-
-                let status = next.state().status.load(Ordering::Relaxed);
-
-                // if this copy was aborted, we have to retry in the new table
-                if status == State::ABORTED {
-                    continue 'copy;
-                }
-
-                // the copy is complete
-                if status == State::PROMOTED {
-                    fence(Ordering::Acquire);
-                    return next;
-                }
-
-                // copy chunks are relatively small and we expect to finish quickly,
-                // so spin for a bit before resorting to parking
-                if spun <= SPIN_WAIT {
-                    for _ in 0..(spun * spun) {
-                        hint::spin_loop();
-                    }
-
-                    continue;
-                }
-
-                atomic_wait::wait(&next.state().status, State::PENDING);
-            }
-        }
-    }
-
-    // Copy the entry at the given index to the new table.
-    //
-    // Returns `true` if the entry was copied into the table, or `false` if
-    // the table was full.
-    fn copy_at_blocking(&self, i: usize, next_table: Table<K, V>) -> bool {
-        // mark the entry as copying
-        let entry = unsafe {
-            self.table
-                .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::Release)
-                .unpack(Entry::MASK)
-        };
-
-        // there is nothing to copy
-        if Entry::is_sentinel(entry.ptr) {
-            unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
-            return true;
-        }
-
-        // otherwise, copy the value
-        fence(Ordering::Acquire);
-        self.as_ref(next_table)
-            .insert_copy(entry.ptr.unpack(Entry::MASK))
-            .is_some()
-    }
-
-    // Copy an entry into the table, returning the index it was inserted into.
-    //
-    // This is an optimized version of `insert_entry` where we are the only
-    // writer inserting the given key into the new table
-    //
-    // If `abort` is `true`, this method returns `None` if the table is full.
-    // Otherwise, it will recursively try to allocate and insert into a resize.
-    fn insert_copy(&self, new_entry: Tagged<*mut Entry<K, V>>) -> Option<(Table<K, V>, usize)> {
-        let key = unsafe { &(*new_entry.ptr).key };
-        let hash = self.root.hasher.hash_one(key);
-
-        let (mut probe, end) = Probe::start(h1(hash), self.table.len);
-        while probe.len <= end {
-            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
-
-            if meta == meta::EMPTY {
-                let entry = unsafe { self.table.entry(probe.i) };
-
-                // try to claim the entry
-                match entry.compare_exchange(
-                    ptr::null_mut(),
-                    new_entry.raw,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        unsafe {
-                            self.table
-                                .meta(probe.i)
-                                .store(meta::h2(hash), Ordering::Release)
-                        };
-
-                        return Some((self.table, probe.i));
-                    }
-                    Err(found) => {
-                        let found = found.unpack(Entry::MASK);
-                        fence(Ordering::Acquire);
-
-                        // nothing can be deleted or copied during a resize
-                        assert!(!Entry::is_sentinel(found.ptr));
-
-                        unsafe {
-                            // ensure the meta table is updated to avoid breaking the probe chain
-                            let hash = self.root.hasher.hash_one(&(*found.ptr).key);
-                            let meta = meta::h2(hash);
-
-                            if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
-                                self.table.meta(probe.i).store(meta, Ordering::Release);
-                            }
-                        }
-                    }
-                }
-            }
-
-            probe.next();
-        }
-
-        // the table is full, abort
-        None
-    }
-
-    // Help along an in-progress resize incrementally by copying a chunk of entries.
-    //
-    // Returns the entry that was copied to.
-    fn help_copy_incremental(&self, chunk: usize, block: bool, guard: &impl Guard) -> Table<K, V> {
-        let root = self.root.root(guard);
-        debug_assert!(!root.table.raw.is_null());
-
-        // always help the highest priority root resize
-        if self.table.raw != root.table.raw {
-            return root.help_copy_incremental(chunk, block, guard);
-        }
-
-        let next = self.table.state().next.load(Ordering::Relaxed);
-
-        // the copy was already promoted to the root
-        if next.is_null() {
-            return self.table;
-        }
-
-        fence(Ordering::Acquire);
-        let next = unsafe { Table::<K, V>::from_raw(next) };
-
-        loop {
-            // the copy already completed
-            if self.try_promote(next, 0, guard) {
-                return next;
-            }
-
-            loop {
-                // every entry has already been claimed
-                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
-                    break;
-                }
-
-                // claim a range to copy
-                let copy_start = next.state().claim.fetch_add(chunk, Ordering::Relaxed);
-
-                let mut copied = 0;
-                for i in 0..chunk {
-                    let i = copy_start + i;
-
-                    if i >= self.table.len {
-                        break;
-                    }
-
-                    // copy the entry
-                    self.copy_at(i, next, guard);
-                    copied += 1;
-                }
-
-                // are we done?
-                if self.try_promote(next, copied, guard) || !block {
-                    return next;
-                }
-            }
-
-            if !block {
-                return next;
-            }
-
-            // we need to block for the resize but all entries are claimed
-            for spun in 0.. {
-                const SPIN_WAIT: usize = 7;
-
-                let status = next.state().status.load(Ordering::Acquire);
-
-                // the copy is complete
-                if status == State::PROMOTED {
-                    return next;
-                }
-
-                // copy chunks are relatively small and we expect to finish quickly,
-                // so spin for a bit before resorting to parking
-                if spun <= SPIN_WAIT {
-                    for _ in 0..(spun * spun) {
-                        hint::spin_loop();
-                    }
-
-                    continue;
-                }
-
-                atomic_wait::wait(&next.state().status, State::PENDING);
-            }
-        }
-    }
-
-    // Copy the entry at the given index to the new table.
-    fn copy_at(&self, i: usize, next_table: Table<K, V>, guard: &impl Guard) {
-        // mark the entry as copying
-        let entry = unsafe {
-            self.table
-                .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::Release)
-                .unpack(Entry::MASK)
-        };
-
-        // there is nothing to copy
-        if Entry::is_sentinel(entry.ptr) {
-            unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
-            return;
-        }
-
-        // otherwise, copy the value
-        fence(Ordering::Acquire);
-        let new_entry = entry.ptr.map_addr(|addr| addr | Entry::BORROWED);
-        match self
-            .as_ref(next_table)
-            .insert_entry(new_entry, false, false, guard)
-        {
-            // successfully copied
-            EntryStatusRaw::Empty(_) => {}
-            // an insert/update beat us to the new table, we no longer have to copy
-            EntryStatusRaw::Error { .. } => {}
-            EntryStatusRaw::Replaced(_) => unreachable!(),
-        }
-
-        // complete the copy
-        unsafe {
-            let copied = entry
-                .raw
-                .map_addr(|addr| addr | Entry::COPYING | Entry::COPIED);
-
-            // note that we put COPYING down before, so no one else can update the old entry
-            self.table.entry(i).store(copied, Ordering::Release);
-
-            // notify writers that the copy has completed
-            self.table.state().parker.unpark(entry.ptr.addr());
-        }
-    }
-
-    // Completes all pending copies in incremental mode to get a clean copy of the table.
-    //
-    // This is necessary for operations like `iter` or `clear`, where entries in multiple tables
-    // can cause lead to incomplete results.
-    fn linearize(&mut self, guard: &impl Guard) {
-        // if we're in incremental mode, we need to complete any in-progress resizes
-        // to ensure we don't miss any entries in the next table. we can't iterate
-        // over both because we risk returning the same entry twice.
-        if self.root.is_incremental() {
-            while self.next_table_ref().is_some() {
-                self.table = self.help_copy(guard, true);
-            }
-        }
-    }
-
-    // Reserve capacity for `additional` more elements.
-    pub fn reserve(&mut self, additional: usize, guard: &impl Guard) {
-        if self.table.raw.is_null() && self.init(Some(entries_for(additional))) {
-            return;
-        }
-
-        loop {
-            let active = self.root.count.active();
-            let capacity = entries_for(active.checked_add(additional).unwrap());
-
-            // we have enough capacity
-            if self.table.len >= capacity {
-                return;
-            }
-
-            // race to allocate the new table
-            self.get_or_alloc_next(Some(capacity));
-
-            // complete the copy
-            self.table = self.help_copy(guard, true);
-        }
-    }
-
-    // Allocate the initial table.
-    fn init(&mut self, capacity: Option<usize>) -> bool {
-        const CAPACITY: usize = 32;
-
-        let mut table = Table::<K, V>::new(capacity.unwrap_or(CAPACITY), &self.root.collector);
-
-        // mark this table as the root
-        *table.state_mut().status.get_mut() = State::PROMOTED;
-
-        match self.root.table.compare_exchange(
-            ptr::null_mut(),
-            table.raw,
-            Ordering::Release,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                self.table = table;
-                true
-            }
-
-            // someone us allocated before us, deallocate our table
-            Err(found) => {
-                unsafe { Table::dealloc(table) }
-                self.table = unsafe { Table::from_raw(found) };
-                false
-            }
-        }
-    }
-}
-
-// An iterator over the keys and values of this table.
-pub struct Iter<'g, K, V, G> {
-    i: usize,
-    table: Table<K, V>,
-    guard: &'g G,
-}
-
-impl<K, V, S> HashMapRef<'_, K, V, S>
-where
-    K: Hash + Eq,
-    S: BuildHasher,
-{
     // Returns an iterator over the keys and values of this table.
     pub fn iter<'g, G>(&mut self, guard: &'g G) -> Iter<'g, K, V, G>
     where
@@ -1455,13 +1104,719 @@ where
             };
         }
 
-        // get a clean copy of the table to iterate over
+        // Get a clean copy of the table to iterate over.
         self.linearize(guard);
 
         Iter {
             i: 0,
             guard,
             table: self.table,
+        }
+    }
+
+    // Returns the h1 and h2 hash for the given key.
+    fn hash<Q>(&self, key: &Q) -> (usize, u8)
+    where
+        Q: Hash + ?Sized,
+    {
+        let hash = self.root.hasher.hash_one(key);
+        (meta::h1(hash), meta::h2(hash))
+    }
+}
+
+// Resize operations.
+impl<'root, K, V, S> HashMapRef<'root, K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    // Returns a reference to the given table.
+    fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'root, K, V, S> {
+        HashMapRef {
+            table,
+            root: self.root,
+        }
+    }
+
+    // Returns a reference to the next table, if it has already been created.
+    fn next_table_ref(&self) -> Option<HashMapRef<'root, K, V, S>> {
+        let state = self.table.state();
+        let next = state.next.load(Ordering::Acquire);
+
+        if !next.is_null() {
+            return unsafe { Some(self.as_ref(Table::from_raw(next))) };
+        }
+
+        None
+    }
+
+    // Allocate the initial table.
+    fn init(&mut self, capacity: Option<usize>) -> bool {
+        const CAPACITY: usize = 32;
+
+        // Allocate the table and mark it as the root.
+        let mut table = Table::<K, V>::alloc(capacity.unwrap_or(CAPACITY), &self.root.collector);
+        *table.state_mut().status.get_mut() = State::PROMOTED;
+
+        // Race to write the initial table.
+        match self.root.table.compare_exchange(
+            ptr::null_mut(),
+            table.raw,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            // Successfully initialized the table.
+            Ok(_) => {
+                self.table = table;
+                true
+            }
+
+            // Someone beat us, deallocate our table and use the table that was written.
+            Err(found) => {
+                unsafe { Table::dealloc(table) }
+                self.table = unsafe { Table::from_raw(found) };
+                false
+            }
+        }
+    }
+
+    // Returns the next table, allocating it has not already been created.
+    fn get_or_alloc_next(&self, capacity: Option<usize>) -> Table<K, V> {
+        const SPIN_ALLOC: usize = 7;
+
+        let state = self.table.state();
+        let next = state.next.load(Ordering::Relaxed);
+
+        // The next table is already allocated.
+        if !next.is_null() {
+            fence(Ordering::Acquire);
+            return unsafe { Table::from_raw(next) };
+        }
+
+        // Otherwise, try to acquire the allocation lock.
+        //
+        // Unlike in `init`, we do not race here to prevent unnecessary allocator pressure.
+        let _allocating = match state.allocating.try_lock() {
+            Ok(lock) => lock,
+            // Someone else is currently allocating.
+            Err(_) => {
+                let mut spun = 0;
+
+                // Spin for a bit, waiting for the table to be initialized.
+                while spun <= SPIN_ALLOC {
+                    for _ in 0..(spun * spun) {
+                        hint::spin_loop();
+                    }
+
+                    let next = state.next.load(Ordering::Relaxed);
+                    if !next.is_null() {
+                        // The table was initialized.
+                        fence(Ordering::Acquire);
+                        return unsafe { Table::from_raw(next) };
+                    }
+
+                    spun += 1;
+                }
+
+                // Otherwise, we have to block.
+                state.allocating.lock().unwrap()
+            }
+        };
+
+        let next = state.next.load(Ordering::Relaxed);
+        if !next.is_null() {
+            // The table was allocated while we were waiting for the lock.
+            fence(Ordering::Acquire);
+            return unsafe { Table::from_raw(next) };
+        }
+
+        // Double the table capacity.
+        let next_capacity = capacity.unwrap_or(self.table.len << 1);
+        assert!(
+            next_capacity <= isize::MAX as usize,
+            "`HashMap` exceeded maximum capacity"
+        );
+
+        // Allocate the new table while holding the lock.
+        let next = Table::alloc(next_capacity, &self.root.collector);
+        state.next.store(next.raw, Ordering::Release);
+        drop(_allocating);
+
+        next
+    }
+
+    // Help along with an existing resize operation, returning the new root table.
+    //
+    // If `copy_all` is `false` in incremental resize mode, this returns the current reference's next table,
+    // not necessarily the new root.
+    fn help_copy(&self, guard: &impl Guard, copy_all: bool) -> Table<K, V> {
+        match self.root.resize {
+            ResizeMode::Blocking => self.help_copy_blocking(guard),
+            ResizeMode::Incremental(chunk) => {
+                let copied_to = self.help_copy_incremental(chunk, copy_all, guard);
+
+                if !copy_all {
+                    // If we weren't trying to linearize, we have to write to the next table
+                    // even if the copy hasn't completed yet.
+                    return self.next_table_ref().unwrap().table;
+                }
+
+                copied_to
+            }
+        }
+    }
+
+    // Help along the resize operation until it completes and the next table is promoted.
+    //
+    // Should only be called on the root table.
+    fn help_copy_blocking(&self, guard: &impl Guard) -> Table<K, V> {
+        // Make sure we are copying from the root or an ex-root table.
+        debug_assert_eq!(
+            self.table.state().status.load(Ordering::Relaxed),
+            State::PROMOTED
+        );
+
+        // Load the next table.
+        let next = self.table.state().next.load(Ordering::Acquire);
+        debug_assert!(!next.is_null());
+        let mut next = unsafe { Table::<K, V>::from_raw(next) };
+
+        'copy: loop {
+            // Make sure we are copying to the correct table.
+            while next.state().status.load(Ordering::Relaxed) == State::ABORTED {
+                next = self.as_ref(next).get_or_alloc_next(None);
+            }
+
+            // The copy already completed
+            if self.try_promote(next, 0, guard) {
+                return next;
+            }
+
+            let copy_chunk = self.table.len.min(4096);
+
+            loop {
+                // Every entry has already been claimed.
+                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
+                    break;
+                }
+
+                // Claim a chunk to copy.
+                let copy_start = next.state().claim.fetch_add(copy_chunk, Ordering::Relaxed);
+
+                // Copy our chunk of entries.
+                let mut copied = 0;
+                for i in 0..copy_chunk {
+                    let i = copy_start + i;
+
+                    if i >= self.table.len {
+                        break;
+                    }
+
+                    // Copy the entry.
+                    if !self.copy_at_blocking(i, next, guard) {
+                        // This table doesn't have space for the next entry.
+                        //
+                        // Abort the current resize.
+                        next.state().status.store(State::ABORTED, Ordering::Relaxed);
+
+                        // Allocate the next table.
+                        let allocated = self.as_ref(next).get_or_alloc_next(None);
+
+                        // Wake anyone waiting for us to finish.
+                        atomic_wait::wake_all(&next.state().status);
+
+                        // Retry in a new table.
+                        next = allocated;
+                        continue 'copy;
+                    }
+
+                    copied += 1;
+                }
+
+                // Are we done?
+                if self.try_promote(next, copied, guard) {
+                    return next;
+                }
+
+                // If the resize was aborted while we were copying, continue in the new table.
+                if next.state().status.load(Ordering::Relaxed) == State::ABORTED {
+                    continue 'copy;
+                }
+            }
+
+            // We copied all that we can, wait for the table to be promoted.
+            for spun in 0.. {
+                const SPIN_WAIT: usize = 7;
+
+                let status = next.state().status.load(Ordering::Relaxed);
+
+                // If this copy was aborted, we have to retry in the new table.
+                if status == State::ABORTED {
+                    continue 'copy;
+                }
+
+                // The copy has completed.
+                if status == State::PROMOTED {
+                    fence(Ordering::Acquire);
+                    return next;
+                }
+
+                // Copy chunks are relatively small and we expect to finish quickly,
+                // so spin for a bit before resorting to parking.
+                if spun <= SPIN_WAIT {
+                    for _ in 0..(spun * spun) {
+                        hint::spin_loop();
+                    }
+
+                    continue;
+                }
+
+                // Park until the table is promoted.
+                atomic_wait::wait(&next.state().status, State::PENDING);
+            }
+        }
+    }
+
+    // Copy the entry at the given index to the new table.
+    //
+    // Returns `true` if the entry was copied into the table or `false` if the table was full.
+    fn copy_at_blocking(&self, i: usize, next_table: Table<K, V>, guard: &impl Guard) -> bool {
+        // Mark the entry as copying.
+        let entry = unsafe {
+            self.table
+                .entry(i)
+                .fetch_or(Entry::COPYING, Ordering::Release)
+                .unpack()
+        };
+
+        // There is nothing to copy, we're done.
+        if entry.ptr.is_null() {
+            // Mark as a tombstone so readers avoid having to load the entry.
+            unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
+            return true;
+        }
+
+        // The entry was deleted.
+        if Entry::is_tombstone(entry) {
+            return true;
+        }
+
+        // Otherwise, copy the value.
+        fence(Ordering::Acquire);
+        unsafe {
+            self.as_ref(next_table)
+                .insert_copy(entry.ptr.unpack(), guard)
+                .is_some()
+        }
+    }
+
+    // Copy an entry into the table, returning the index it was inserted into.
+    //
+    // This is an optimized version of `insert_entry` where we are the only
+    // writer inserting the given key into the new table, useful for blocking resizes.
+    unsafe fn insert_copy(
+        &self,
+        new_entry: Tagged<Entry<K, V>>,
+        guard: &impl Guard,
+    ) -> Option<(Table<K, V>, usize)> {
+        // Safety: The new entry is guaranteed to be valid by the caller.
+        let key = unsafe { &(*new_entry.ptr).key };
+
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
+
+        // Probe until we reach the limit.
+        while probe.len <= limit {
+            // Load the entry metadata first for cheap searches.
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
+
+            // The entry is empty, try to insert.
+            if meta == meta::EMPTY {
+                let entry = unsafe { self.table.entry(probe.i) };
+
+                // Try to claim the entry.
+                match entry.compare_exchange(
+                    ptr::null_mut(),
+                    new_entry.raw,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    // Successfully inserted.
+                    Ok(_) => {
+                        // Update the metadata table.
+                        unsafe { self.table.meta(probe.i).store(h2, Ordering::Release) };
+                        return Some((self.table, probe.i));
+                    }
+                    Err(_) => {
+                        // Protect the entry before accessing it.
+                        let found = guard.protect(entry, Ordering::Acquire).unpack();
+
+                        // Nothing can be deleted or copied during a resize.
+                        assert!(!found.ptr.is_null() && !Entry::is_tombstone(found));
+
+                        // Ensure the meta table is updated to avoid breaking the probe chain.
+                        let hash = self.root.hasher.hash_one(&(*found.ptr).key);
+                        let meta = meta::h2(hash);
+
+                        if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
+                            self.table.meta(probe.i).store(meta, Ordering::Release);
+                        }
+                    }
+                }
+            }
+
+            // Continue probing.
+            probe.next();
+        }
+
+        // Went over the probe limit, abort.
+        None
+    }
+
+    // Help along an in-progress resize incrementally by copying a chunk of entries.
+    //
+    // Returns the table that was copied to.
+    fn help_copy_incremental(&self, chunk: usize, block: bool, guard: &impl Guard) -> Table<K, V> {
+        // Always help the highest priority root resize.
+        let root = self.root.root(guard);
+        if self.table.raw != root.table.raw {
+            return root.help_copy_incremental(chunk, block, guard);
+        }
+
+        // Load the next table.
+        let next = self.table.state().next.load(Ordering::Acquire);
+
+        // The copy we tried to help was already promoted.
+        if next.is_null() {
+            return self.table;
+        }
+
+        let next = unsafe { Table::<K, V>::from_raw(next) };
+
+        loop {
+            // The copy already completed.
+            if self.try_promote(next, 0, guard) {
+                return next;
+            }
+
+            loop {
+                // Every entry has already been claimed.
+                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
+                    break;
+                }
+
+                // Claim a chunk to copy.
+                let copy_start = next.state().claim.fetch_add(chunk, Ordering::Relaxed);
+
+                // Copy our chunk of entries.
+                let mut copied = 0;
+                for i in 0..chunk {
+                    let i = copy_start + i;
+
+                    if i >= self.table.len {
+                        break;
+                    }
+
+                    // Copy the entry.
+                    self.copy_at_incremental(i, next, guard);
+                    copied += 1;
+                }
+
+                // Update the copy state, and try to promote the table.
+                //
+                // Only copy a single chunk if promotion fails, unless we are forced
+                // to complete the resize.
+                if self.try_promote(next, copied, guard) || !block {
+                    return next;
+                }
+            }
+
+            // There are no entries that we can copy, block if necessary.
+            if !block {
+                return next;
+            }
+
+            for spun in 0.. {
+                const SPIN_WAIT: usize = 7;
+
+                let status = next.state().status.load(Ordering::Acquire);
+
+                // The copy has completed.
+                if status == State::PROMOTED {
+                    return next;
+                }
+
+                // Copy chunks are relatively small and we expect to finish quickly,
+                // so spin for a bit before resorting to parking.
+                if spun <= SPIN_WAIT {
+                    for _ in 0..(spun * spun) {
+                        hint::spin_loop();
+                    }
+
+                    continue;
+                }
+
+                // Park until the table is promoted.
+                atomic_wait::wait(&next.state().status, State::PENDING);
+            }
+        }
+    }
+
+    // Copy the entry at the given index to the new table.
+    fn copy_at_incremental(&self, i: usize, next_table: Table<K, V>, guard: &impl Guard) {
+        // Mark the entry as copying.
+        let entry = unsafe {
+            self.table
+                .entry(i)
+                .fetch_or(Entry::COPYING, Ordering::Release)
+                .unpack()
+        };
+
+        // There is nothing to copy, we're done.
+        if entry.ptr.is_null() {
+            // Mark as a tombstone so readers avoid having to load the entry.
+            unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
+            return;
+        }
+
+        // The entry was deleted.
+        if Entry::is_tombstone(entry) {
+            return;
+        }
+
+        // Mark the entry as borrowed so writers in the new table know it was copied.
+        let new_entry = entry.map_tag(|addr| addr | Entry::BORROWED);
+
+        // Copy the value to the new table.
+        fence(Ordering::Acquire);
+        match unsafe {
+            self.as_ref(next_table)
+                .insert_with(new_entry, false, false, guard)
+        } {
+            // Successfully copied.
+            RawInsertResult::Inserted(_) => {}
+            // An insert or update beat us to the new table, we no longer have to copy.
+            RawInsertResult::Error { .. } => {}
+            RawInsertResult::Replaced(_) => unreachable!(),
+        }
+
+        // Mark the entry as copied.
+        let copied = entry
+            .raw
+            .map_addr(|addr| addr | Entry::COPYING | Entry::COPIED);
+
+        // Note that we already wrote the COPYING bit, so no one is writing to the old
+        // entry except us.
+        unsafe { self.table.entry(i).store(copied, Ordering::Release) };
+
+        // Notify any writers that the copy has completed.
+        self.table.state().parker.unpark(entry.ptr.addr());
+    }
+
+    // Update the copy state and attempt to promote a table to the root.
+    //
+    // Returns `true` if the table was promoted.
+    fn try_promote(&self, next: Table<K, V>, copied: usize, guard: &impl Guard) -> bool {
+        // Update the copy count.
+        let copied = if copied > 0 {
+            next.state().copied.fetch_add(copied, Ordering::AcqRel) + copied
+        } else {
+            next.state().copied.load(Ordering::Acquire)
+        };
+
+        // If we copied all the entries in the table, we can try to promote.
+        if copied == self.table.len {
+            let root = self.root.table.load(Ordering::Relaxed);
+
+            // Only promote root copies.
+            //
+            // We can't promote a nested copy before it's parent has finished, as
+            // it may not contain all entries.
+            if self.table.raw == root {
+                // Try to update the root.
+                if self
+                    .root
+                    .table
+                    .compare_exchange(
+                        self.table.raw,
+                        next.raw,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    // Successfully promoted the table.
+                    next.state()
+                        .status
+                        .store(State::PROMOTED, Ordering::Release);
+
+                    unsafe {
+                        // Retire the old table.
+                        //
+                        // Note that we do not drop entries because they have been copied to the
+                        // new root.
+                        guard.defer_retire(self.table.raw, |link| {
+                            let raw: *mut RawTable = link.cast();
+                            let table = Table::<K, V>::from_raw(raw);
+                            drop_table::<K, V>(table);
+                        });
+                    }
+                }
+
+                // Wake up any writers waiting for the resize to complete.
+                atomic_wait::wake_all(&next.state().status);
+                return true;
+            }
+        }
+
+        // Not ready to promote yet.
+        false
+    }
+
+    // Completes all pending copies in incremental mode to get a clean copy of the table.
+    //
+    // This is necessary for operations like `iter` or `clear`, where entries in multiple tables
+    // can cause lead to incomplete results.
+    fn linearize(&mut self, guard: &impl Guard) {
+        if self.root.is_incremental() {
+            // If we're in incremental resize mode, we need to complete any in-progress resizes to
+            // ensure we don't miss any entries in the next table. We can't iterate over both because
+            // we risk returning the same entry twice.
+            while self.next_table_ref().is_some() {
+                self.table = self.help_copy(guard, true);
+            }
+        }
+    }
+
+    // Wait for an incremental copy of a given entry to complete.
+    fn wait_copied(&self, i: usize) {
+        let parker = &self.table.state().parker;
+        let entry = unsafe { self.table.entry(i) };
+
+        // The entry is already copied.
+        let value = entry.load(Ordering::Acquire).unpack();
+        if value.tag() & Entry::COPIED != 0 {
+            return;
+        }
+
+        // Park until the copy completes.
+        parker.park(value.ptr.addr(), entry, |entry| {
+            entry.addr() & Entry::COPIED == 0
+        });
+
+        assert!(entry.load(Ordering::Relaxed).addr() & Entry::COPIED != 0);
+    }
+
+    /// Retire an entry that was removed from the current table, but may still be reachable from
+    /// previous tables.
+    unsafe fn defer_retire(&self, entry: Tagged<Entry<K, V>>, guard: &impl Guard) {
+        match self.root.resize {
+            // Safety: In blocking resize mode, we only ever write to the root table, so the entry
+            // is inaccessible from all tables.
+            ResizeMode::Blocking => unsafe {
+                guard.defer_retire(entry.ptr, Entry::reclaim::<K, V>);
+            },
+            // In incremental resize mode, the entry may be accessible in previous tables.
+            ResizeMode::Incremental(_) => {
+                if entry.tag() & Entry::BORROWED == 0 {
+                    // Safety: If the entry is not borrowed, meaning it is not in any previous tables,
+                    // it is inaccessible even if we are not the root. Thus we can safely retire.
+                    unsafe { guard.defer_retire(entry.ptr, Entry::reclaim::<K, V>) };
+                    return;
+                }
+
+                let root = self.root.table.load(Ordering::Relaxed);
+
+                // Check if our table, or any subsequent table, is the root.
+                let mut next = Some(self.clone());
+                while let Some(map) = next {
+                    if map.table.raw == root {
+                        // Safety: The root table is our table or a table that succeeds ours.
+                        // Thus any previous tables are unreachable and we can safely retire.
+                        unsafe { guard.defer_retire(entry.ptr, Entry::reclaim::<K, V>) };
+                        return;
+                    }
+
+                    next = map.next_table_ref();
+                }
+
+                // Otherwise, we have to wait for the table we are copying from to be reclaimed.
+                //
+                // Find the table we are copying from, searching from the root.
+                fence(Ordering::Acquire);
+                let mut prev = self.as_ref(unsafe { Table::<K, V>::from_raw(root) });
+
+                loop {
+                    let next = prev.next_table_ref().unwrap();
+
+                    // Defer the entry to be retired by the table we are copying from.
+                    if next.table.raw == self.table.raw {
+                        prev.table.state().deferred.defer(entry.ptr);
+                        return;
+                    }
+
+                    prev = next;
+                }
+            }
+        }
+    }
+}
+
+// An iterator over the keys and values of this table.
+pub struct Iter<'g, K, V, G> {
+    i: usize,
+    table: Table<K, V>,
+    guard: &'g G,
+}
+
+impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
+where
+    G: Guard,
+{
+    type Item = (&'g K, &'g V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        // The table has not yet been allocated.
+        if self.table.raw.is_null() {
+            return None;
+        }
+
+        loop {
+            // Iterated over every entry in the table, we're done.
+            if self.i >= self.table.len {
+                return None;
+            }
+
+            // Load the entry metadata first to ensure consistency with calls to `get`.
+            let meta = unsafe { self.table.meta(self.i) }.load(Ordering::Acquire);
+
+            // The entry is empty or deleted.
+            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
+                self.i += 1;
+                continue;
+            }
+
+            // Load the entry.
+            let entry = unsafe {
+                self.guard
+                    .protect(self.table.entry(self.i), Ordering::Relaxed)
+                    .unpack()
+            };
+
+            // The entry was deleted.
+            if Entry::is_tombstone(entry) {
+                self.i += 1;
+                continue;
+            }
+
+            // Read the key and value.
+            fence(Ordering::Acquire);
+            debug_assert!(!entry.ptr.is_null());
+            let entry = unsafe { (&(*entry.ptr).key, &(*entry.ptr).value) };
+
+            self.i += 1;
+            return Some(entry);
         }
     }
 }
@@ -1495,183 +1850,6 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
     }
 }
 
-impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
-where
-    G: Guard,
-{
-    type Item = (&'g K, &'g V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.table.raw.is_null() {
-            return None;
-        }
-
-        loop {
-            if self.i >= self.table.len {
-                return None;
-            }
-
-            let meta = unsafe { self.table.meta(self.i) }.load(Ordering::Acquire);
-
-            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
-                self.i += 1;
-                continue;
-            }
-
-            let entry = unsafe {
-                self.guard
-                    .protect(self.table.entry(self.i), Ordering::Relaxed)
-                    .unpack(Entry::MASK)
-            };
-
-            if Entry::is_tombstone(entry.ptr) {
-                self.i += 1;
-                continue;
-            }
-
-            fence(Ordering::Acquire);
-            debug_assert!(!Entry::is_sentinel(entry.ptr));
-
-            self.i += 1;
-            return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
-        }
-    }
-}
-
-impl<'root, K, V, S> HashMapRef<'root, K, V, S> {
-    // Returns a reference to the next table if it has already been created.
-    fn next_table_ref(&self) -> Option<HashMapRef<'root, K, V, S>> {
-        let state = self.table.state();
-        let next = state.next.load(Ordering::Acquire);
-
-        if !next.is_null() {
-            return unsafe { Some(self.as_ref(Table::from_raw(next))) };
-        }
-
-        None
-    }
-
-    // Returns the next table, allocating it has not already been created.
-    fn get_or_alloc_next(&self, capacity: Option<usize>) -> Table<K, V> {
-        const SPIN_ALLOC: usize = 7;
-
-        let state = self.table.state();
-        let next = state.next.load(Ordering::Relaxed);
-
-        // the next table is already allocated
-        if !next.is_null() {
-            fence(Ordering::Acquire);
-            return unsafe { Table::from_raw(next) };
-        }
-
-        // otherwise try to acquire the lock
-        let _allocating = match state.allocating.try_lock() {
-            Ok(lock) => lock,
-            // someone else is allocating
-            Err(_) => {
-                let mut spun = 0;
-
-                // spin for a bit, waiting for the table
-                while spun <= SPIN_ALLOC {
-                    for _ in 0..(spun * spun) {
-                        hint::spin_loop();
-                    }
-
-                    let next = state.next.load(Ordering::Relaxed);
-                    if !next.is_null() {
-                        fence(Ordering::Acquire);
-                        return unsafe { Table::from_raw(next) };
-                    }
-
-                    spun += 1;
-                }
-
-                // otherwise we wait
-                state.allocating.lock().unwrap()
-            }
-        };
-
-        // was the table allocated while we were acquiring the lock?
-        let next = state.next.load(Ordering::Relaxed);
-        if !next.is_null() {
-            fence(Ordering::Acquire);
-            return unsafe { Table::from_raw(next) };
-        }
-
-        // double the table's capacity
-        let next_capacity = capacity.unwrap_or(self.table.len << 1);
-
-        if next_capacity > isize::MAX as usize {
-            panic!("Hash table exceeded maximum capacity");
-        }
-
-        // allocate the new table
-        let next = Table::new(next_capacity, &self.root.collector);
-        state.next.store(next.raw, Ordering::Release);
-        drop(_allocating);
-
-        next
-    }
-
-    // Update the copy state and attempt to promote a copy to the root table.
-    //
-    // Returns true if the table was promoted.
-    fn try_promote(&self, next: Table<K, V>, copied: usize, guard: &impl Guard) -> bool {
-        // update the count
-        let copied = if copied > 0 {
-            next.state().copied.fetch_add(copied, Ordering::AcqRel) + copied
-        } else {
-            next.state().copied.load(Ordering::Acquire)
-        };
-
-        if copied == self.table.len {
-            let root = self.root.table.load(Ordering::Relaxed);
-
-            if self.table.raw == root {
-                if self
-                    .root
-                    .table
-                    .compare_exchange(
-                        self.table.raw,
-                        next.raw,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    // mark this table as the root
-                    next.state()
-                        .status
-                        .store(State::PROMOTED, Ordering::Release);
-
-                    unsafe {
-                        // retire the old table. note we don't drop entries because everything was copied
-                        guard.defer_retire(self.table.raw, |link| {
-                            let raw: *mut RawTable = link.cast();
-                            let table = Table::<K, V>::from_raw(raw);
-                            drop_table::<K, V>(table);
-                        });
-                    }
-                }
-
-                // wake up anyone waiting for the promotion
-                atomic_wait::wake_all(&next.state().status);
-                return true;
-            }
-        }
-
-        false
-    }
-
-    // Creates a reference to the given table while maintaining the root table pointer.
-    fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'root, K, V, S> {
-        HashMapRef {
-            table,
-            root: self.root,
-        }
-    }
-}
-
 impl<K, V, S> Clone for HashMapRef<'_, K, V, S> {
     fn clone(&self) -> Self {
         HashMapRef {
@@ -1685,11 +1863,13 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
         let mut raw = *self.table.get_mut();
 
-        // make sure everything is reclaimed before the collector is dropped,
-        // because reclaiming a table depends on accessing the collector
-        // through a shared pointer
+        // Make sure all objects are reclaimed before the collector is dropped.
+        //
+        // Dropping a table depends on accessing the collector for deferred retirement,
+        // using the shared collector pointer that is invalidated by drop.
         unsafe { self.collector.reclaim_all() };
 
+        // Drop all nested tables and entries.
         while !raw.is_null() {
             let mut table = unsafe { Table::<K, V>::from_raw(raw) };
             let next = *table.state_mut().next.get_mut();
@@ -1700,117 +1880,63 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
     }
 }
 
+// Drop all entries in this table.
 unsafe fn drop_entries<K, V>(table: Table<K, V>) {
-    // drop all the entries
     for i in 0..table.len {
-        let entry = unsafe { (*table.entry(i).as_ptr()).unpack(Entry::MASK) };
+        let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
-        // the entry was copied, or there is nothing to deallocate
-        if Entry::is_sentinel(entry.ptr) || entry.addr & Entry::COPYING != 0 {
+        // The entry was copied, or there is nothing to deallocate.
+        if entry.ptr.is_null() || Entry::is_tombstone(entry) || entry.tag() & Entry::COPYING != 0 {
             continue;
         }
 
-        unsafe { Entry::retire::<K, V>(entry.ptr.cast()) }
+        // Drop the entry.
+        unsafe { Entry::reclaim::<K, V>(entry.ptr.cast()) }
     }
 }
 
+// Drop the table allocation.
 unsafe fn drop_table<K, V>(mut table: Table<K, V>) {
-    // safety: `drop_table` is being called from `reclaim_all` in `Drop`, or
-    // a table is being reclaimed by our thread, both cases in which the collector
-    // is still alive and safe to access through the stable pointer
+    // Safety: `drop_table` is being called from `reclaim_all` in `Drop` or
+    // a table is being reclaimed by our thread. In both cases, the collector
+    // is still alive and safe to access through the state pointer.
     let collector = unsafe { &*table.state().collector };
 
-    // drop any entries deferred during an incremental resize
+    // Drop any entries that were deferred during an incremental resize.
     //
-    // safety: a deferred entry was retired after it was made unreachable
-    // from the next table during a resize. because our table was still accessible
+    // Safety: A deferred entry was retired after it was made unreachable
+    // from the next table during a resize. Because our table was still accessible
     // for this entry to be deferred, our table must have been retired *after* the
-    // entry was made accessible in the next table. now that our table is being reclaimed,
-    // the entry has thus been totally removed from the map, and can be safely retired
+    // entry was made accessible in the next table. Now that our table is being reclaimed,
+    // the entry has thus been totally removed from the map, and can be safely retired.
     unsafe {
         table
             .state_mut()
             .deferred
-            .retire_all(collector, Entry::retire::<K, V>)
+            .retire_all(collector, Entry::reclaim::<K, V>)
     }
 
-    // deallocate the table
+    // Deallocate the table.
     unsafe { Table::dealloc(table) };
-}
-
-// The maximum probe length for table operations.
-macro_rules! probe_limit {
-    ($capacity:expr) => {
-        // 5 * log2(capacity): testing shows this gives us a ~80% load factor
-        5 * ((usize::BITS as usize) - ($capacity.leading_zeros() as usize) - 1)
-    };
-}
-
-use probe_limit;
-
-// Returns an estimate of the number of entries needed to hold `capacity` elements.
-fn entries_for(capacity: usize) -> usize {
-    // we should rarely resize before 75%
-    let capacity = capacity.checked_mul(8).expect("capacity overflow") / 6;
-    capacity.next_power_of_two()
-}
-
-// Number of linear probes per triangular jump.
-const GROUP: usize = 8;
-
-// Triangular probe sequence.
-#[derive(Default)]
-struct Probe {
-    i: usize,
-    len: usize,
-    mask: usize,
-    stride: usize,
-}
-
-impl Probe {
-    fn start(hash: usize, len: usize) -> (Probe, usize) {
-        let i = hash & (len - 1);
-        let probe = Probe {
-            i,
-            len: 0,
-            stride: 0,
-            mask: len - 1,
-        };
-
-        (probe, probe_limit!(len))
-    }
-
-    #[inline]
-    fn next(&mut self) {
-        self.len += 1;
-
-        if self.len & (GROUP - 1) == 0 {
-            self.stride += GROUP;
-            self.i += self.stride;
-        } else {
-            self.i += 1;
-        }
-
-        self.i &= self.mask;
-    }
-}
-
-#[inline(always)]
-fn h1(hash: u64) -> usize {
-    hash as usize
 }
 
 // Entry metadata.
 mod meta {
     use std::mem;
 
-    // Marks an empty entry.
+    // Indicates an empty entry.
     pub const EMPTY: u8 = 0x80;
 
-    // Marks an entry that has been deleted.
+    // Indicates an entry that has been deleted.
     pub const TOMBSTONE: u8 = u8::MAX;
 
-    /// Returns the top bits of the hash, used as metadata.
+    // Returns the primary hash for an entry.
+    #[inline(always)]
+    pub fn h1(hash: u64) -> usize {
+        hash as usize
+    }
+
+    /// Return a byte of hash metadata, used for cheap searches.
     #[inline(always)]
     pub fn h2(hash: u64) -> u8 {
         const MIN_HASH_LEN: usize = if mem::size_of::<usize>() < mem::size_of::<u64>() {
@@ -1819,11 +1945,12 @@ mod meta {
             mem::size_of::<u64>()
         };
 
-        // grab the top 7 bits of the hash. while the hash is normally a full 64-bit
-        // value, some hash functions (such as fxhash) produce a usize result
-        // instead, which means that the top 32 bits are 0 on 32-bit platforms.
-        // so we use min_hash_len constant to handle this.
+        // Grab the top 7 bits of the hash.
+        //
+        // While the hash is normally a full 64-bit value, some hash functions
+        // (such as fxhash) produce a usize result instead, which means that the
+        // top 32 bits are 0 on 32-bit platforms.
         let top7 = hash >> (MIN_HASH_LEN * 8 - 7);
-        (top7 & 0x7f) as u8 // truncation
+        (top7 & 0x7f) as u8
     }
 }

@@ -5,10 +5,12 @@ use std::thread::{self, Thread};
 
 // A simpler thread parker.
 //
-// This parker is rarely used and relatively naive.
+// This parker is rarely used and relatively naive. Ideally this would just use `futex`
+// but the hashmap needs to park on tagged pointer state, and mixed-sized atomic accesses
+// are questionable.
 //
-// Ideally this would just use `futex` but the hashmap needs to park on tagged pointer state, and
-// mixed-sized atomic accesses are questionable.
+// The parker implementation may be sharded and use intrusive lists if it is found to be
+// a bottleneck.
 #[derive(Default)]
 pub struct Parker {
     pending: AtomicUsize,
@@ -25,7 +27,7 @@ impl Parker {
     // Block the current thread until the park condition is false.
     pub fn park<T>(&self, key: usize, atomic: &AtomicPtr<T>, should_park: impl Fn(*mut T) -> bool) {
         loop {
-            // insert our thread into the parker
+            // Insert our thread into the parker.
             let id = {
                 let state = &mut *self.state.lock().unwrap();
                 state.count += 1;
@@ -38,9 +40,9 @@ impl Parker {
 
             self.pending.fetch_add(1, Ordering::SeqCst);
 
-            // check the park condition
+            // Check the park condition.
             if !should_park(atomic.load(Ordering::SeqCst)) {
-                // no need to park, remove our thread if it wasn't already unparked
+                // Don't need to park, remove our thread if it wasn't already unparked.
                 let mut state = self.state.lock().unwrap();
                 if let Some(threads) = state.threads.get_mut(&key) {
                     threads.remove(&id).unwrap();
@@ -49,7 +51,7 @@ impl Parker {
                 return;
             }
 
-            // park until we are unparked
+            // Park until we are unparked.
             loop {
                 thread::park();
 
@@ -59,7 +61,7 @@ impl Parker {
                 }
             }
 
-            // ensure we were unparked for the correct reason
+            // Ensure we were unparked for the correct reason.
             if !should_park(atomic.load(Ordering::Acquire)) {
                 return;
             }
@@ -68,7 +70,7 @@ impl Parker {
 
     // Unpark all threads under the given key.
     pub fn unpark(&self, key: usize) {
-        // fast-path, no one waiting to be unparked
+        // Fast-path, no one waiting to be unparked.
         if self.pending.load(Ordering::SeqCst) == 0 {
             return;
         }

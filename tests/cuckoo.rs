@@ -1,4 +1,4 @@
-// adapted from: https://github.com/jonhoo/flurry/blob/main/tests/cuckoo/stress.rs
+// Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/cuckoo/stress.rs
 
 use papaya::{HashMap, ResizeMode};
 
@@ -9,12 +9,25 @@ use std::sync::Mutex;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::thread;
 
-/// Number of keys and values to work with.
-const NUM_KEYS: usize = 1 << 14;
-/// Number of threads that should be started.
-const NUM_THREADS: usize = 4;
-/// How long the stress test will run (in milliseconds).
-const TEST_LEN: u64 = 10_000;
+#[cfg(not(miri))]
+mod cfg {
+    /// Number of keys and values to work with.
+    pub const NUM_KEYS: usize = 1 << 14;
+    /// Number of threads that should be started.
+    pub const NUM_THREADS: usize = 4;
+    /// How long the stress test will run (in milliseconds).
+    pub const TEST_LEN: u64 = 10_000;
+}
+
+#[cfg(miri)]
+mod cfg {
+    /// Number of keys and values to work with.
+    pub const NUM_KEYS: usize = 1 << 10;
+    /// Number of threads that should be started.
+    pub const NUM_THREADS: usize = 4;
+    /// How long the stress test will run (in milliseconds).
+    pub const TEST_LEN: u64 = 5000;
+}
 
 type Key = usize;
 type Value = usize;
@@ -35,10 +48,10 @@ struct Environment {
 
 impl Environment {
     pub fn new() -> Self {
-        let mut keys = Vec::with_capacity(NUM_KEYS);
-        let mut in_use = Vec::with_capacity(NUM_KEYS);
+        let mut keys = Vec::with_capacity(cfg::NUM_KEYS);
+        let mut in_use = Vec::with_capacity(cfg::NUM_KEYS);
 
-        for i in 0..NUM_KEYS {
+        for i in 0..cfg::NUM_KEYS {
             keys.push(i);
             in_use.push(AtomicBool::new(false));
         }
@@ -47,12 +60,12 @@ impl Environment {
             table1: HashMap::new(),
             table2: HashMap::new(),
             keys,
-            vals1: Mutex::new(vec![0usize; NUM_KEYS]),
-            vals2: Mutex::new(vec![0usize; NUM_KEYS]),
-            ind_dist: Uniform::from(0..NUM_KEYS - 1),
+            vals1: Mutex::new(vec![0usize; cfg::NUM_KEYS]),
+            vals2: Mutex::new(vec![0usize; cfg::NUM_KEYS]),
+            ind_dist: Uniform::from(0..cfg::NUM_KEYS - 1),
             val_dist1: Uniform::from(Value::min_value()..Value::max_value()),
             val_dist2: Uniform::from(Value::min_value()..Value::max_value()),
-            in_table: Mutex::new(vec![false; NUM_KEYS]),
+            in_table: Mutex::new(vec![false; cfg::NUM_KEYS]),
             in_use: Mutex::new(in_use),
             finished: AtomicBool::new(false),
         }
@@ -166,7 +179,6 @@ fn stress_find_thread(env: Arc<Environment>) {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn stress_test_blocking() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder().resize_mode(ResizeMode::Blocking).build();
@@ -175,7 +187,6 @@ fn stress_test_blocking() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn stress_test_incremental() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder()
@@ -188,7 +199,6 @@ fn stress_test_incremental() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
 fn stress_test_incremental_slow() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder()
@@ -202,7 +212,7 @@ fn stress_test_incremental_slow() {
 
 fn run(root: Arc<Environment>) {
     let mut threads = Vec::new();
-    for _ in 0..NUM_THREADS {
+    for _ in 0..cfg::NUM_THREADS {
         let env = Arc::clone(&root);
         threads.push(thread::spawn(move || stress_insert_thread(env)));
         let env = Arc::clone(&root);
@@ -210,7 +220,7 @@ fn run(root: Arc<Environment>) {
         let env = Arc::clone(&root);
         threads.push(thread::spawn(move || stress_find_thread(env)));
     }
-    thread::sleep(std::time::Duration::from_millis(TEST_LEN));
+    thread::sleep(std::time::Duration::from_millis(cfg::TEST_LEN));
     root.finished.swap(true, Ordering::SeqCst);
     for t in threads {
         t.join().expect("failed to join thread");

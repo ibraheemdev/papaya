@@ -7,36 +7,32 @@ use seize::Collector;
 
 use super::State;
 
-// A hash table laid out in a single allocation
+// A hash-table laid out in a single allocation.
 #[repr(transparent)]
 pub struct RawTable(u8);
 
-// Safety: seize::Link is the first field (see TableLayout)
+// Safety: `seize::Link` is the first field (see `TableLayout`).
 unsafe impl seize::AsLink for RawTable {}
 
-#[repr(align(16))]
-#[allow(dead_code)]
-struct AtomicU128(u128);
-
-// The table allocation's layout
+// The layout of the table allocation.
 #[repr(C)]
 struct TableLayout {
     link: seize::Link,
     len: usize,
     capacity: usize,
     state: State,
-    meta: [AtomicU128; 0],
+    meta: [AtomicU8; 0],
     entries: [AtomicPtr<()>; 0],
 }
 
 // Manages a table allocation.
 #[repr(C)]
 pub struct Table<T> {
-    // the exposed length of the table
+    // The exposed length of the table.
     pub len: usize,
-    // the raw table pointer
+    // The raw table pointer.
     pub raw: *mut RawTable,
-    // the true (padded) table capacity
+    // The true (padded) table capacity.
     capacity: usize,
     _t: PhantomData<T>,
 }
@@ -50,24 +46,24 @@ impl<T> Clone for Table<T> {
 }
 
 impl<T> Table<T> {
-    pub fn new(len: usize, collector: &Collector) -> Table<T> {
+    // Allocate a table with the provided length.
+    pub fn alloc(len: usize, collector: &Collector) -> Table<T> {
         assert!(len.is_power_of_two());
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
-        // pad the meta table to fulfill the alignment requirement of an entry
+        // Pad the meta table to fulfill the alignment requirement of an entry.
         let capacity = (len + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
 
         unsafe {
             let layout = Self::layout(capacity);
 
-            // allocate the table, with the entry pointers zeroed
+            // Allocate the table, zeroing the entries.
             let ptr = alloc::alloc_zeroed(layout);
-
             if ptr.is_null() {
                 alloc::handle_alloc_error(layout);
             }
 
-            // write the table layout state
+            // Write the table state.
             ptr.cast::<TableLayout>().write(TableLayout {
                 link: collector.link(),
                 len,
@@ -80,7 +76,7 @@ impl<T> Table<T> {
                 entries: [],
             });
 
-            // initialize the meta table
+            // Initialize the meta table.
             ptr.add(mem::size_of::<TableLayout>())
                 .cast::<u8>()
                 .write_bytes(super::meta::EMPTY, capacity);
@@ -94,6 +90,7 @@ impl<T> Table<T> {
         }
     }
 
+    // Creates a `Table` from a raw pointer.
     #[inline(always)]
     pub unsafe fn from_raw(raw: *mut RawTable) -> Table<T> {
         if raw.is_null() {
@@ -115,6 +112,7 @@ impl<T> Table<T> {
         }
     }
 
+    // Returns the metadata entry at the given index.
     #[inline(always)]
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         debug_assert!(i < self.capacity);
@@ -125,6 +123,7 @@ impl<T> Table<T> {
             .cast::<AtomicU8>()
     }
 
+    // Returns the entry at the given index.
     #[inline(always)]
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
         let offset = mem::size_of::<TableLayout>()
@@ -135,20 +134,24 @@ impl<T> Table<T> {
         &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
+    // Returns a reference to the table state.
     pub fn state(&self) -> &State {
         unsafe { &(*self.raw.cast::<TableLayout>()).state }
     }
 
+    // Returns a mutable reference to the table state.
     pub fn state_mut(&mut self) -> &mut State {
         unsafe { &mut (*self.raw.cast::<TableLayout>()).state }
     }
 
+    // Deallocate the table.
     pub unsafe fn dealloc(table: Table<T>) {
         let layout = Self::layout(table.capacity);
         ptr::drop_in_place(table.raw.cast::<TableLayout>());
         unsafe { alloc::dealloc(table.raw.cast::<u8>(), layout) }
     }
 
+    // The table layout used for allocation.
     fn layout(capacity: usize) -> Layout {
         let size = mem::size_of::<TableLayout>()
             + (mem::size_of::<u8>() * capacity) // meta
@@ -161,10 +164,10 @@ impl<T> Table<T> {
 fn layout() {
     unsafe {
         let collector = seize::Collector::new();
-        let table: Table<u8> = Table::new(4, &collector);
+        let table: Table<u8> = Table::alloc(4, &collector);
         let table: Table<u8> = Table::from_raw(table.raw);
         assert_eq!(table.len, 4);
-        // padded for pointer alignment
+        // The capacity is padded for pointer alignment.
         assert_eq!(table.capacity, 8);
         Table::dealloc(table);
     }

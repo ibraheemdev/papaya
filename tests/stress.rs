@@ -1,4 +1,4 @@
-// adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
+// Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
 
 use papaya::{HashMap, ResizeMode};
 use rand::prelude::*;
@@ -27,7 +27,7 @@ fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
 
 #[test]
 fn contains_key_stress() {
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 256 };
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
     with_map(|map| {

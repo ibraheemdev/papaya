@@ -157,6 +157,6 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 
 `papaya` also aims to provide predictable, consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing], meaning operations aren't required to block when resizing the hash-table. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
 
-[benchmarks]: TOOD
+[benchmarks]: TODO
 [`seize`]: https://docs.rs/seize/latest
 [incremental resizing]: https://docs.rs/papaya/latest/papaya/enum.ResizeMode.html

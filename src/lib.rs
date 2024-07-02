@@ -1,4 +1,4 @@
-#![allow(unstable_name_collisions)]
+#![allow(unstable_name_collisions, clippy::multiple_bound_locations)]
 #![doc = include_str!("../README.md")]
 
 mod map;

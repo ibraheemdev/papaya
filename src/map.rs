@@ -1,4 +1,4 @@
-use crate::raw::{self, EntryStatus};
+use crate::raw::{self, InsertResult};
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use std::borrow::Borrow;
@@ -420,10 +420,10 @@ where
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g,
+        K: Borrow<Q> + 'g, // TODO: this bound is necessary because `raw::HashMap::get` returns the full entry.
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.root(guard).get_entry(key, guard).map(|(_, v)| v)
+        self.raw.root(guard).get(key, guard).map(|(_, v)| v)
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -452,7 +452,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.root(guard).get_entry(key, guard)
+        self.raw.root(guard).get(key, guard)
     }
 
     /// Inserts a key-value pair into the map.
@@ -485,9 +485,9 @@ where
     #[inline]
     pub fn insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
         match self.raw.root(guard).insert(key, value, true, guard) {
-            EntryStatus::Empty(_) => None,
-            EntryStatus::Replaced(value) => Some(value),
-            EntryStatus::Error { .. } => unreachable!(),
+            InsertResult::Inserted(_) => None,
+            InsertResult::Replaced(value) => Some(value),
+            InsertResult::Error { .. } => unreachable!(),
         }
     }
 
@@ -518,15 +518,15 @@ where
         guard: &'g impl Guard,
     ) -> Result<&'g V, OccupiedError<'g, V>> {
         match self.raw.root(guard).insert(key, value, false, guard) {
-            EntryStatus::Empty(value) => Ok(value),
-            EntryStatus::Error {
+            InsertResult::Inserted(value) => Ok(value),
+            InsertResult::Error {
                 current,
                 not_inserted,
             } => Err(OccupiedError {
                 current,
                 not_inserted,
             }),
-            EntryStatus::Replaced(_) => unreachable!(),
+            InsertResult::Replaced(_) => unreachable!(),
         }
     }
 
@@ -549,10 +549,10 @@ where
     ///
     /// let mut map = HashMap::new();
     /// map.pin().insert("a", 1);
-    /// assert_eq!(m.get(&"a"), Some(&1));
+    /// assert_eq!(map.pin().get(&"a"), Some(&1));
     ///
     /// map.pin().update("a", |v| v + 1);
-    /// assert_eq!(m.get(&"a"), Some(&2));
+    /// assert_eq!(map.pin().get(&"a"), Some(&2));
     /// ```
     pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
@@ -581,7 +581,7 @@ where
     #[inline]
     pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g,
+        K: Borrow<Q> + 'g, // TODO: this bound is necessary because `raw::HashMap::remove` returns the full entry.
         Q: Hash + Eq + ?Sized,
     {
         match self.raw.root(guard).remove(key, guard) {
