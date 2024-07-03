@@ -168,20 +168,20 @@ impl<K, V> Entry<K, V> {
 
 /// The status of an entry.
 enum EntryStatus<K, V> {
+    // The entry is a tombstone or a null copy.
+    Null,
     // The entry is being copied.
-    Copied,
-    // The entry is a tombstone.
-    Removed,
+    Copied(Tagged<Entry<K, V>>),
     // A valid entry.
     Value(Tagged<Entry<K, V>>),
 }
 
 impl<K, V> From<Tagged<Entry<K, V>>> for EntryStatus<K, V> {
     fn from(entry: Tagged<Entry<K, V>>) -> Self {
-        if Entry::is_tombstone(entry) {
-            EntryStatus::Removed
+        if entry.ptr.is_null() {
+            EntryStatus::Null
         } else if entry.tag() & Entry::COPYING != 0 {
-            EntryStatus::Copied
+            EntryStatus::Copied(entry)
         } else {
             EntryStatus::Value(entry)
         }
@@ -197,9 +197,9 @@ enum UpdateStatus<K, V> {
 }
 
 /// The state of an entry we attempted to insert into.
-enum InsertStatus<'g, K, V> {
-    // Successfully inserted the given value.
-    Inserted(&'g V),
+enum InsertStatus<K, V> {
+    // Successfully inserted the value.
+    Inserted,
     // A new entry was written before we could update.
     Found(EntryStatus<K, V>),
 }
@@ -325,32 +325,35 @@ where
                 return None;
             }
 
-            // Found a potential match.
-            if meta == h2 {
-                // Load the full entry.
-                let entry =
-                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+            // Check for a potential match.
+            if meta != h2 {
+                probe.next();
+                continue;
+            }
 
-                // The entry was deleted, keep probing.
-                if Entry::is_tombstone(entry) {
-                    probe.next();
-                    continue;
+            // Load the full entry.
+            let entry =
+                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+
+            // The entry was deleted, keep probing.
+            if Entry::is_tombstone(entry) {
+                probe.next();
+                continue;
+            }
+
+            // Check for a full match.
+            fence(Ordering::Acquire);
+            if unsafe { (*entry.ptr).key.borrow() } == key {
+                // The entry was copied to the new table.
+                //
+                // In blocking resize mode we do not need to perform this check as all writes block
+                // until any resizes are complete, making the root table the source of truth for readers.
+                if self.root.is_incremental() && entry.tag() & Entry::COPIED != 0 {
+                    break;
                 }
 
-                // Check for a full match.
-                fence(Ordering::Acquire);
-                if unsafe { (*entry.ptr).key.borrow() } == key {
-                    // The entry was copied to the new table.
-                    //
-                    // In blocking resize mode we do not need to perform this check as all writes block
-                    // until any resizes are complete, making the root table the source of truth for readers.
-                    if self.root.is_incremental() && entry.tag() & Entry::COPIED != 0 {
-                        break;
-                    }
-
-                    // Found the correct entry, return the key and value.
-                    return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
-                }
+                // Found the correct entry, return the key and value.
+                return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
             }
 
             probe.next();
@@ -446,72 +449,83 @@ where
         while probe.len <= limit {
             // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
-            let mut entry = match meta {
-                // The entry is empty, try to insert.
-                meta::EMPTY => match self.insert_at(probe.i, h2, new_entry, guard) {
+
+            // The entry is empty, try to insert.
+            let mut entry = if meta == meta::EMPTY {
+                match self.insert_at(probe.i, h2, new_entry.raw, guard) {
                     // Successfully inserted.
-                    InsertStatus::Inserted(value) => return RawInsertResult::Inserted(value),
+                    InsertStatus::Inserted => return RawInsertResult::Inserted(&new_ref.value),
+
                     // Lost to a concurrent insert.
+                    //
                     // If the key matches, we might be able to update the value.
-                    InsertStatus::Found(EntryStatus::Value(found)) => found,
+                    InsertStatus::Found(EntryStatus::Value(found))
+                    | InsertStatus::Found(EntryStatus::Copied(found)) => found,
+
                     // Otherwise, continue probing.
-                    _ => {
+                    InsertStatus::Found(EntryStatus::Null) => {
                         probe.next();
                         continue;
                     }
-                },
-                // Found a potential match.
-                _ if meta == h2 => {
-                    // Load the full entry.
-                    let entry = self.table.entry(probe.i);
-                    let found = guard.protect(entry, Ordering::Relaxed).unpack();
-
-                    // The entry was deleted, keep probing.
-                    if Entry::is_tombstone(found) {
-                        probe.next();
-                        continue;
-                    }
-
-                    // If the key matches, we might be able to update the value.
-                    found
                 }
-                // Otherwise, continue probing.
-                _ => {
+            }
+            // Found a potential match.
+            else if meta == h2 {
+                // Load the full entry.
+                let entry = self.table.entry(probe.i);
+                let found = guard.protect(entry, Ordering::Relaxed).unpack();
+
+                // The entry was deleted, keep probing.
+                if Entry::is_tombstone(found) {
                     probe.next();
                     continue;
                 }
+
+                // If the key matches, we might be able to update the value.
+                found
+            }
+            // Otherwise, continue probing.
+            else {
+                probe.next();
+                continue;
             };
 
             // Check for a full match.
             fence(Ordering::Acquire);
-            if unsafe { (*entry.ptr).key == new_ref.key } {
-                // The entry is being copied to the new table.
-                if entry.tag() & Entry::COPYING != 0 {
-                    break;
-                }
+            if unsafe { (*entry.ptr).key != new_ref.key } {
+                probe.next();
+                continue;
+            }
 
-                // Return an error for calls to `try_insert`.
-                if !should_replace {
-                    return RawInsertResult::Error {
-                        current: entry,
-                        not_inserted: new_entry.ptr,
-                    };
-                }
+            // The entry is being copied to the new table.
+            if entry.tag() & Entry::COPYING != 0 {
+                break;
+            }
 
-                loop {
-                    // Try to update the value.
-                    match self.update_at(probe.i, entry, new_entry.raw, guard) {
-                        // Successfully updated.
-                        UpdateStatus::Replaced(entry) => {
-                            return RawInsertResult::Replaced(&(*entry.ptr).value)
-                        }
-                        // The entry is being copied.
-                        UpdateStatus::Found(EntryStatus::Copied) => break,
-                        // The entry was deleted before we could update it, continue probing.
-                        UpdateStatus::Found(EntryStatus::Removed) => {}
-                        // Someone else beat us to the update, retry.
-                        UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
+            // Return an error for calls to `try_insert`.
+            if !should_replace {
+                return RawInsertResult::Error {
+                    current: entry,
+                    not_inserted: new_entry.ptr,
+                };
+            }
+
+            loop {
+                // Try to update the value.
+                match self.update_at(probe.i, entry, new_entry.raw, guard) {
+                    // Successfully updated.
+                    UpdateStatus::Replaced(entry) => {
+                        return RawInsertResult::Replaced(&(*entry.ptr).value)
                     }
+
+                    // The entry is being copied.
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break,
+
+                    // The entry was deleted before we could update it, continue probing.
+                    UpdateStatus::Found(EntryStatus::Null) => {}
+
+                    // Someone else beat us to the update, retry.
+                    UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
                 }
             }
 
@@ -520,11 +534,11 @@ where
         }
 
         // If went over the probe limit or found a copied entry, trigger a resize.
-        let next_table = self.get_or_alloc_next(None);
+        let mut next_table = self.get_or_alloc_next(None);
 
         // Help out with the resize.
         if self.root.is_blocking() || help_copy {
-            self.help_copy(guard, false);
+            next_table = self.help_copy(guard, false);
         }
 
         // Make sure not to do any more copying to keep resizing costs constant in
@@ -599,70 +613,77 @@ where
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             // The key is not in the table.
+            //
             // It also cannot be in the next table because we have not went over the probe limit.
             if meta == meta::EMPTY {
                 return None;
             }
 
-            // Found a potential match.
-            if meta == h2 {
-                // Load the full entry.
-                let mut entry =
-                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+            // Check for a potential match.
+            if meta != h2 {
+                probe.next();
+                continue;
+            }
 
-                // The entry was deleted, keep probing.
-                if Entry::is_tombstone(entry) {
-                    probe.next();
-                    continue;
-                }
+            // Load the full entry.
+            let mut entry =
+                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
-                // Check for a full match.
-                fence(Ordering::Acquire);
-                if unsafe { (*entry.ptr).key == new_ref.key } {
-                    // The entry is being copied to the new table, we have to complete the copy before
-                    // we can update.
-                    if entry.tag() & Entry::COPYING != 0 {
+            // The entry was deleted, keep probing.
+            if Entry::is_tombstone(entry) {
+                probe.next();
+                continue;
+            }
+
+            // Check for a full match.
+            fence(Ordering::Acquire);
+            if unsafe { (*entry.ptr).key != new_ref.key } {
+                probe.next();
+                continue;
+            }
+
+            // The entry is being copied to the new table, we have to complete the copy before
+            // we can update.
+            if entry.tag() & Entry::COPYING != 0 {
+                break 'probe Some(probe.i);
+            }
+
+            loop {
+                // Initialize the value to insert.
+                let value = update(&(*entry.ptr).value);
+                (*new_entry).value = MaybeUninit::new(value);
+
+                // Try to update the value.
+                let status = match self.update_at(probe.i, entry, new_entry.cast(), guard) {
+                    // Successfully performed the update.
+                    UpdateStatus::Replaced(_) => {
+                        // Return the value we inserted.
+                        return unsafe { Some((*new_entry).value.assume_init_ref()) };
+                    }
+                    status => status,
+                };
+
+                // Drop the previous value as we will no longer use it.
+                (*new_entry).value.assume_init_drop();
+
+                match status {
+                    // The entry is being copied to the new table, we have to complete the copy
+                    // before we can update.
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => {
                         break 'probe Some(probe.i);
                     }
 
-                    loop {
-                        // Initialize the value to insert.
-                        let value = update(&(*entry.ptr).value);
-                        (*new_entry).value = MaybeUninit::new(value);
+                    // The entry was deleted.
+                    //
+                    // We know that at some point during our execution the key was not in the map.
+                    UpdateStatus::Found(EntryStatus::Null) => return None,
 
-                        // Try to update the value.
-                        match self.update_at(probe.i, entry, new_entry.cast(), guard) {
-                            // Successfully performed the update.
-                            UpdateStatus::Replaced(_) => {
-                                // Return the value we inserted.
-                                return unsafe { Some((*new_entry).value.assume_init_ref()) };
-                            }
-                            // The entry is being copied to the new table, we have to complete the copy
-                            // before we can update.
-                            UpdateStatus::Found(EntryStatus::Copied) => {
-                                // Drop the previous value as it will be overwritten when we retry
-                                // in the new table.
-                                (*new_entry).value.assume_init_drop();
-                                break 'probe Some(probe.i);
-                            }
-                            // The entry was deleted.
-                            //
-                            // We can return directly because we saw that this was the correct entry at
-                            // some point.
-                            UpdateStatus::Found(EntryStatus::Removed) => return None,
-                            // Lost to a concurrent update, retry.
-                            UpdateStatus::Found(EntryStatus::Value(found)) => unsafe {
-                                entry = found;
+                    // Lost to a concurrent update, retry.
+                    UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
 
-                                // Drop the previous value.
-                                (*new_entry).value.assume_init_drop();
-                            },
-                        }
-                    }
+                    _ => unreachable!(),
                 }
             }
-
-            probe.next();
         };
 
         match self.root.resize {
@@ -766,65 +787,71 @@ where
                 return None;
             }
 
-            // Found a potential match.
-            if meta == h2 {
-                // Load the full entry.
-                let mut entry =
-                    unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
-
-                // The entry was deleted, keep probing.
-                if Entry::is_tombstone(entry) {
-                    probe.next();
-                    continue;
-                }
-
-                // Check for a full match.
-                fence(Ordering::Acquire);
-                if unsafe { (*entry.ptr).key.borrow() == key } {
-                    // The entry is being copied to the new table, we have to complete the copy before
-                    // we can remove it.
-                    if entry.tag() & Entry::COPYING != 0 {
-                        break 'probe Some(probe.i);
-                    }
-
-                    loop {
-                        match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
-                            // Successfully removed the entry.
-                            UpdateStatus::Replaced(entry) => {
-                                // Mark the key as a tombstone to avoid unnecessary loads of the
-                                // entry.
-                                //
-                                // Note that this might end up being overwritten by the metadata hash
-                                // if the initial insertion is lagging behind, but we avoid the RMW
-                                // and sacrifice reads in the extremely rare case.
-                                unsafe {
-                                    self.table
-                                        .meta(probe.i)
-                                        .store(meta::TOMBSTONE, Ordering::Release)
-                                };
-
-                                // Decrement the table length.
-                                self.root
-                                    .count
-                                    .get(guard.thread_id())
-                                    .fetch_sub(1, Ordering::Relaxed);
-
-                                let entry = unsafe { (&(*entry.ptr).key, &(*entry.ptr).value) };
-                                return Some(entry);
-                            }
-                            // The entry is being copied to the new table, we have to complete the copy
-                            // before we can remove.
-                            UpdateStatus::Found(EntryStatus::Copied) => break 'probe Some(probe.i),
-                            // The entry was deleted.
-                            UpdateStatus::Found(EntryStatus::Removed) => return None,
-                            // Lost to a concurrent update, retry.
-                            UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
-                        }
-                    }
-                }
+            // Check for a potential match.
+            if meta != h2 {
+                probe.next();
+                continue;
             }
 
-            probe.next();
+            // Load the full entry.
+            let mut entry =
+                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+
+            // The entry was deleted, keep probing.
+            if Entry::is_tombstone(entry) {
+                probe.next();
+                continue;
+            }
+
+            // Check for a full match.
+            fence(Ordering::Acquire);
+            if unsafe { (*entry.ptr).key.borrow() != key } {
+                probe.next();
+                continue;
+            }
+
+            // The entry is being copied to the new table, we have to complete the copy before
+            // we can remove it.
+            if entry.tag() & Entry::COPYING != 0 {
+                break 'probe Some(probe.i);
+            }
+
+            loop {
+                match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
+                    // Successfully removed the entry.
+                    UpdateStatus::Replaced(entry) => {
+                        // Mark the entry as a tombstone.
+                        //
+                        // Note that this might end up being overwritten by the metadata hash
+                        // if the initial insertion is lagging behind, but we avoid the RMW
+                        // and sacrifice reads in the extremely rare case.
+                        unsafe {
+                            self.table
+                                .meta(probe.i)
+                                .store(meta::TOMBSTONE, Ordering::Release)
+                        };
+
+                        // Decrement the table length.
+                        let count = self.root.count.get(guard.thread_id());
+                        count.fetch_sub(1, Ordering::Relaxed);
+
+                        let entry = unsafe { &(*entry.ptr) };
+                        return Some((&entry.key, &entry.value));
+                    }
+
+                    // The entry is being copied to the new table, we have to complete the copy
+                    // before we can remove.
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
+
+                    // The entry was deleted.
+                    //
+                    // We know that at some point during our execution the key was not in the map.
+                    UpdateStatus::Found(EntryStatus::Null) => return None,
+
+                    // Lost to a concurrent update, retry.
+                    UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
+                }
+            }
         };
 
         match self.root.resize {
@@ -882,15 +909,15 @@ where
         &self,
         i: usize,
         meta: u8,
-        new_entry: Tagged<Entry<K, V>>,
+        new_entry: *mut Entry<K, V>,
         guard: &'g impl Guard,
-    ) -> InsertStatus<'g, K, V> {
+    ) -> InsertStatus<K, V> {
         let entry = unsafe { self.table.entry(i) };
 
         // Try to claim the empty entry.
-        match entry.compare_exchange(
+        let found = match entry.compare_exchange(
             ptr::null_mut(),
-            new_entry.raw,
+            new_entry,
             Ordering::Release,
             Ordering::Relaxed,
         ) {
@@ -900,41 +927,41 @@ where
                 unsafe { self.table.meta(i).store(meta, Ordering::Release) };
 
                 // Return the value we inserted.
-                return InsertStatus::Inserted(&(*new_entry.ptr).value);
+                return InsertStatus::Inserted;
             }
 
             // Lost to a concurrent update.
-            Err(found) => {
-                let found = found.unpack();
+            Err(found) => found.unpack(),
+        };
 
-                let (meta, status) = match EntryStatus::from(found) {
-                    EntryStatus::Value(_) => {
-                        // Protect the entry before accessing it.
-                        let found = guard.protect(entry, Ordering::Acquire).unpack();
+        let (meta, status) = match EntryStatus::from(found) {
+            EntryStatus::Value(_) => {
+                // Protect the entry before accessing it.
+                let found = guard.protect(entry, Ordering::Acquire).unpack();
 
-                        // Re-check the entry status.
-                        match EntryStatus::from(found) {
-                            EntryStatus::Value(found) => {
-                                // An entry was inserted, we have to hash it to get the metadata.
-                                let hash = self.root.hasher.hash_one(&(*found.ptr).key);
-                                (meta::h2(hash), EntryStatus::Value(found))
-                            }
-                            // The entry was deleted or copied.
-                            status => (meta::TOMBSTONE, status),
-                        }
+                // Re-check the entry status.
+                match EntryStatus::from(found) {
+                    EntryStatus::Value(found) => {
+                        // An entry was inserted, we have to hash it to get the metadata.
+                        let hash = self.root.hasher.hash_one(&(*found.ptr).key);
+                        (meta::h2(hash), EntryStatus::Value(found))
                     }
+
                     // The entry was deleted or copied.
                     status => (meta::TOMBSTONE, status),
-                };
-
-                // Ensure the meta table is updated to keep the probe chain alive for readers.
-                if self.table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
-                    self.table.meta(i).store(meta, Ordering::Release);
                 }
-
-                InsertStatus::Found(status)
             }
+
+            // The entry was deleted or copied.
+            status => (meta::TOMBSTONE, status),
+        };
+
+        // Ensure the meta table is updated to keep the probe chain alive for readers.
+        if self.table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
+            self.table.meta(i).store(meta, Ordering::Release);
         }
+
+        InsertStatus::Found(status)
     }
 
     // Attempts to replace the value of an existing entry at the given index.
@@ -949,7 +976,7 @@ where
         let entry = unsafe { self.table.entry(i) };
 
         // Try to perform the update.
-        match entry.compare_exchange_weak(
+        let found = match entry.compare_exchange_weak(
             current.raw,
             new_entry,
             Ordering::Release,
@@ -959,34 +986,34 @@ where
             Ok(_) => unsafe {
                 // Safety: The old value is now unreachable from this table.
                 self.defer_retire(current, guard);
-                UpdateStatus::Replaced(current)
+                return UpdateStatus::Replaced(current);
             },
 
             // Lost to a concurrent update.
-            Err(found) => {
-                let found = found.unpack();
+            Err(found) => found.unpack(),
+        };
 
-                let status = match EntryStatus::from(found) {
-                    EntryStatus::Value(_) => {
-                        // Protect the entry before accessing it.
-                        let found = guard.protect(entry, Ordering::Acquire).unpack();
+        let status = match EntryStatus::from(found) {
+            EntryStatus::Value(_) => {
+                // Protect the entry before accessing it.
+                let found = guard.protect(entry, Ordering::Acquire).unpack();
 
-                        // Re-check the entry status.
-                        EntryStatus::from(found)
-                    }
-                    // The entry was copied.
-                    EntryStatus::Copied => {
-                        // Acquire the next table.
-                        fence(Ordering::Acquire);
-                        EntryStatus::Copied
-                    }
-                    // The entry was deleted.
-                    removed => removed,
-                };
-
-                UpdateStatus::Found(status)
+                // Re-check the entry status.
+                EntryStatus::from(found)
             }
-        }
+
+            // The entry was copied.
+            EntryStatus::Copied(entry) => {
+                // Acquire the next table.
+                fence(Ordering::Acquire);
+                EntryStatus::Copied(entry)
+            }
+
+            // The entry was deleted.
+            removed => removed,
+        };
+
+        UpdateStatus::Found(status)
     }
 
     // Reserve capacity for `additional` more elements.
@@ -1065,10 +1092,8 @@ where
                         self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
 
                         // Decrement the table length.
-                        self.root
-                            .count
-                            .get(guard.thread_id())
-                            .fetch_sub(1, Ordering::Relaxed);
+                        let count = self.root.count.get(guard.thread_id());
+                        count.fetch_sub(1, Ordering::Relaxed);
 
                         // Safety: We just removed the old value from this table.
                         self.defer_retire(entry, guard);

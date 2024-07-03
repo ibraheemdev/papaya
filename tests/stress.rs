@@ -28,7 +28,7 @@ fn contains_key_stress() {
             }
         }
 
-        for _ in 0..ITERATIONS {
+        for _ in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = Barrier::new(threads);
             thread::scope(|s| {
@@ -66,7 +66,7 @@ fn insert_stress<'g>() {
     }
 
     with_map(|map| {
-        for _ in 0..ITERATIONS {
+        for _ in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let map = map();
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = Barrier::new(threads);
@@ -77,6 +77,7 @@ fn insert_stress<'g>() {
                         for _ in 0..ENTRIES {
                             let key = KeyVal::new();
                             map.insert(key, key, &map.guard());
+                            // map.compute(key, |_| Operation::Insert(key), &map.guard());
                             assert!(map.contains_key(&key, &map.guard()));
                         }
                     });
@@ -103,7 +104,7 @@ fn update_stress() {
             }
         }
 
-        for t in 0..ITERATIONS {
+        for t in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = std::sync::Barrier::new(threads);
 
@@ -145,7 +146,7 @@ fn update_insert_stress() {
             }
         }
 
-        for t in 0..ITERATIONS {
+        for t in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = std::sync::Barrier::new(threads);
 
@@ -229,7 +230,7 @@ fn mixed_chunk_stress() {
     };
 
     with_map(|map| {
-        for _ in 0..ITERATIONS {
+        for _ in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let map = map();
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = Barrier::new(threads);
@@ -288,7 +289,7 @@ fn mixed_entry_stress() {
     };
 
     with_map(|map| {
-        for _ in 0..ITERATIONS {
+        for _ in (0..ITERATIONS).inspect(|e| println!("{e}")) {
             let map = map();
             let threads = thread::available_parallelism().unwrap().get().min(8);
             let barrier = Barrier::new(threads);
