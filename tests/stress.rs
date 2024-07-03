@@ -1,30 +1,16 @@
 // Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
 
-use papaya::{HashMap, ResizeMode};
+use papaya::HashMap;
 use rand::prelude::*;
 
 use std::hash::Hash;
 use std::sync::Barrier;
 use std::thread;
 
-fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
-    test(&(|| HashMap::builder().resize_mode(ResizeMode::Blocking).build()));
-    test(
-        &(|| {
-            HashMap::builder()
-                .resize_mode(ResizeMode::Incremental(1))
-                .build()
-        }),
-    );
-    test(
-        &(|| {
-            HashMap::builder()
-                .resize_mode(ResizeMode::Incremental(128))
-                .build()
-        }),
-    );
-}
+mod common;
+use common::with_map;
 
+// Call `contains_key` in parallel for a shared set of keys.
 #[test]
 fn contains_key_stress() {
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 256 };
@@ -61,6 +47,47 @@ fn contains_key_stress() {
     });
 }
 
+// Call `insert` in parallel with each thread inserting a distinct set of keys.
+#[test]
+fn insert_stress<'g>() {
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
+
+    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
+    struct KeyVal {
+        _data: usize,
+    }
+
+    impl KeyVal {
+        pub fn new() -> Self {
+            let mut rng = rand::thread_rng();
+            Self { _data: rng.gen() }
+        }
+    }
+
+    with_map(|map| {
+        for _ in 0..ITERATIONS {
+            let map = map();
+            let threads = thread::available_parallelism().unwrap().get().min(8);
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..ENTRIES {
+                            let key = KeyVal::new();
+                            map.insert(key, key, &map.guard());
+                            assert!(map.contains_key(&key, &map.guard()));
+                        }
+                    });
+                }
+            });
+            assert_eq!(map.len(), ENTRIES * threads);
+        }
+    });
+}
+
+// Call `update` in parallel for a shared set of keys.
 #[test]
 fn update_stress() {
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
@@ -101,45 +128,62 @@ fn update_stress() {
     });
 }
 
+// Call `update` in parallel for a shared set of keys, with a single thread dedicated
+// to calling `insert`. This is likely to cause interference with incremental resizing.
 #[test]
-fn insert_stress<'g>() {
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 128 };
+fn update_insert_stress() {
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 1 << 14 };
 
-    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
-    struct KeyVal {
-        _data: usize,
-    }
-
-    impl KeyVal {
-        pub fn new() -> Self {
-            let mut rng = rand::thread_rng();
-            Self { _data: rng.gen() }
-        }
-    }
-
     with_map(|map| {
-        for _ in 0..ITERATIONS {
-            let map = map();
+        let map = map();
+
+        {
+            let guard = map.guard();
+            for i in 0..ENTRIES {
+                map.insert(i, 0, &guard);
+            }
+        }
+
+        for t in 0..ITERATIONS {
             let threads = thread::available_parallelism().unwrap().get().min(8);
-            let barrier = Barrier::new(threads);
+            let barrier = std::sync::Barrier::new(threads);
+
+            let threads = &threads;
             thread::scope(|s| {
-                for _ in 0..threads {
+                for _ in 0..(threads - 1) {
                     s.spawn(|| {
                         barrier.wait();
-                        for _ in 0..ENTRIES {
-                            let key = KeyVal::new();
-                            map.insert(key, key, &map.guard());
-                            assert!(map.contains_key(&key, &map.guard()));
+                        let guard = map.guard();
+                        for i in 0..ENTRIES {
+                            let new = *map.update(i, |v| v + 1, &guard).unwrap();
+                            assert!((0..=(threads * (t + 1))).contains(&new));
                         }
                     });
                 }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in ENTRIES..(ENTRIES * threads) {
+                        map.insert(i, usize::MAX, &guard);
+                    }
+                });
             });
-            assert_eq!(map.len(), ENTRIES * threads);
+
+            let guard = map.guard();
+            for i in 0..ENTRIES {
+                assert_eq!(*map.get(&i, &guard).unwrap(), (threads - 1) * (t + 1));
+            }
+
+            for i in ENTRIES..(ENTRIES * threads) {
+                assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
+            }
         }
     });
 }
 
+// Performs a mix of operations with each thread operating on a distinct set of keys.
 #[test]
 fn mixed_chunk_stress() {
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -209,6 +253,8 @@ fn mixed_chunk_stress() {
     });
 }
 
+// Performs a mix of operations with each thread operating on a specific entry within
+// a distinct set of keys. This is more likely to cause interference with incremental resizing.
 #[test]
 fn mixed_entry_stress() {
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 24 };
@@ -263,6 +309,7 @@ fn mixed_entry_stress() {
     });
 }
 
+// Performs a mix of operations on a single thread.
 #[test]
 fn everything() {
     const SIZE: usize = if cfg!(miri) { 12 } else { 50_000 };
@@ -306,151 +353,151 @@ fn everything() {
         ittest2(&map, SIZE);
         ittest3(&map, SIZE);
     });
-}
 
-fn t1<K, V>(map: &HashMap<K, V>, keys: &[K], expect: usize)
-where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send,
-{
-    let mut sum = 0;
-    let iters = 4;
-    let guard = map.guard();
-    for _ in 0..iters {
+    fn t1<K, V>(map: &HashMap<K, V>, keys: &[K], expect: usize)
+    where
+        K: Sync + Send + Clone + Hash + Ord,
+        V: Sync + Send,
+    {
+        let mut sum = 0;
+        let iters = 4;
+        let guard = map.guard();
+        for _ in 0..iters {
+            for key in keys {
+                if map.get(key, &guard).is_some() {
+                    sum += 1;
+                }
+            }
+        }
+        assert_eq!(sum, expect * iters);
+    }
+
+    fn t2<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Ord + std::fmt::Display,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
         for key in keys {
-            if map.get(key, &guard).is_some() {
+            if map.remove(key, &guard).is_some() {
                 sum += 1;
             }
         }
+        assert_eq!(sum, expect);
     }
-    assert_eq!(sum, expect * iters);
-}
 
-fn t2<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Ord + std::fmt::Display,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for key in keys {
-        if map.remove(key, &guard).is_some() {
+    fn t3<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Ord,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for i in 0..keys.len() {
+            if map.insert(keys[i], 0, &guard).is_none() {
+                sum += 1;
+            }
+        }
+        assert_eq!(sum, expect);
+    }
+
+    fn t4<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Ord,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for i in 0..keys.len() {
+            if map.contains_key(&keys[i], &guard) {
+                sum += 1;
+            }
+        }
+        assert_eq!(sum, expect);
+    }
+
+    fn t5<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Ord,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        let mut i = keys.len() as isize - 2;
+        while i >= 0 {
+            if map.remove(&keys[i as usize], &guard).is_some() {
+                sum += 1;
+            }
+            i -= 2;
+        }
+        assert_eq!(sum, expect);
+    }
+
+    fn t6<K, V>(map: &HashMap<K, V>, keys1: &[K], keys2: &[K], expect: usize, mask: usize)
+    where
+        K: Sync + Send + Clone + Hash + Ord,
+        V: Sync + Send,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for i in 0..expect {
+            if map.get(&keys1[i], &guard).is_some() {
+                sum += 1;
+            }
+            if map.get(&keys2[i & mask], &guard).is_some() {
+                sum += 1;
+            }
+        }
+        assert_eq!(sum, expect);
+    }
+
+    fn t7<K>(map: &HashMap<K, usize>, k1: &[K], k2: &[K])
+    where
+        K: Sync + Send + Copy + Hash + Ord,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for i in 0..k1.len() {
+            if map.contains_key(&k1[i], &guard) {
+                sum += 1;
+            }
+            if map.contains_key(&k2[i], &guard) {
+                sum += 1;
+            }
+        }
+        assert_eq!(sum, k1.len());
+    }
+
+    fn ittest1<K>(map: &HashMap<K, usize>, expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Eq,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for _ in map.keys(&guard) {
             sum += 1;
         }
+        assert_eq!(sum, expect);
     }
-    assert_eq!(sum, expect);
-}
 
-fn t3<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Ord,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for i in 0..keys.len() {
-        if map.insert(keys[i], 0, &guard).is_none() {
+    fn ittest2<K>(map: &HashMap<K, usize>, expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Eq,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for _ in map.values(&guard) {
             sum += 1;
         }
+        assert_eq!(sum, expect);
     }
-    assert_eq!(sum, expect);
-}
 
-fn t4<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Ord,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for i in 0..keys.len() {
-        if map.contains_key(&keys[i], &guard) {
+    fn ittest3<K>(map: &HashMap<K, usize>, expect: usize)
+    where
+        K: Sync + Send + Copy + Hash + Eq,
+    {
+        let mut sum = 0;
+        let guard = map.guard();
+        for _ in map.iter(&guard) {
             sum += 1;
         }
+        assert_eq!(sum, expect);
     }
-    assert_eq!(sum, expect);
-}
-
-fn t5<K>(map: &HashMap<K, usize>, keys: &[K], expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Ord,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    let mut i = keys.len() as isize - 2;
-    while i >= 0 {
-        if map.remove(&keys[i as usize], &guard).is_some() {
-            sum += 1;
-        }
-        i -= 2;
-    }
-    assert_eq!(sum, expect);
-}
-
-fn t6<K, V>(map: &HashMap<K, V>, keys1: &[K], keys2: &[K], expect: usize, mask: usize)
-where
-    K: Sync + Send + Clone + Hash + Ord,
-    V: Sync + Send,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for i in 0..expect {
-        if map.get(&keys1[i], &guard).is_some() {
-            sum += 1;
-        }
-        if map.get(&keys2[i & mask], &guard).is_some() {
-            sum += 1;
-        }
-    }
-    assert_eq!(sum, expect);
-}
-
-fn t7<K>(map: &HashMap<K, usize>, k1: &[K], k2: &[K])
-where
-    K: Sync + Send + Copy + Hash + Ord,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for i in 0..k1.len() {
-        if map.contains_key(&k1[i], &guard) {
-            sum += 1;
-        }
-        if map.contains_key(&k2[i], &guard) {
-            sum += 1;
-        }
-    }
-    assert_eq!(sum, k1.len());
-}
-
-fn ittest1<K>(map: &HashMap<K, usize>, expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Eq,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for _ in map.keys(&guard) {
-        sum += 1;
-    }
-    assert_eq!(sum, expect);
-}
-
-fn ittest2<K>(map: &HashMap<K, usize>, expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Eq,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for _ in map.values(&guard) {
-        sum += 1;
-    }
-    assert_eq!(sum, expect);
-}
-
-fn ittest3<K>(map: &HashMap<K, usize>, expect: usize)
-where
-    K: Sync + Send + Copy + Hash + Eq,
-{
-    let mut sum = 0;
-    let guard = map.guard();
-    for _ in map.iter(&guard) {
-        sum += 1;
-    }
-    assert_eq!(sum, expect);
 }

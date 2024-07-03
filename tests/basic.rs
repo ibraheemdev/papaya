@@ -1,32 +1,22 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::{HashMap, ResizeMode};
+use papaya::HashMap;
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
-fn with_map<K, V>(test: impl Fn(HashMap<K, V>)) {
-    test(HashMap::builder().resize_mode(ResizeMode::Blocking).build());
-    test(
-        HashMap::builder()
-            .resize_mode(ResizeMode::Incremental(1))
-            .build(),
-    );
-    test(
-        HashMap::builder()
-            .resize_mode(ResizeMode::Incremental(128))
-            .build(),
-    );
-}
+mod common;
+use common::with_map;
 
 #[test]
 fn new() {
-    with_map::<usize, usize>(|map| drop(map));
+    with_map::<usize, usize>(|map| drop(map()));
 }
 
 #[test]
 fn clear() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         {
             map.insert(0, 1, &guard);
@@ -43,6 +33,7 @@ fn clear() {
 #[test]
 fn insert() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         let old = map.insert(42, 0, &guard);
         assert!(old.is_none());
@@ -52,6 +43,7 @@ fn insert() {
 #[test]
 fn get_empty() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         let e = map.get(&42, &guard);
         assert!(e.is_none());
@@ -61,6 +53,7 @@ fn get_empty() {
 #[test]
 fn get_key_value_empty() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         let e = map.get_key_value(&42, &guard);
         assert!(e.is_none());
@@ -70,6 +63,7 @@ fn get_key_value_empty() {
 #[test]
 fn remove_empty() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         let old = map.remove(&42, &guard);
         assert!(old.is_none());
@@ -79,6 +73,7 @@ fn remove_empty() {
 #[test]
 fn insert_and_remove() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
         let old = map.remove(&42, &guard).unwrap();
@@ -90,6 +85,7 @@ fn insert_and_remove() {
 #[test]
 fn insert_and_get() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         map.insert(42, 0, &map.guard());
 
         {
@@ -103,6 +99,7 @@ fn insert_and_get() {
 #[test]
 fn insert_and_get_key_value() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         map.insert(42, 0, &map.guard());
 
         {
@@ -116,6 +113,7 @@ fn insert_and_get_key_value() {
 #[test]
 fn reinsert() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
         let old = map.insert(42, 1, &guard);
@@ -132,6 +130,7 @@ fn reinsert() {
 #[test]
 fn update() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
         let new = map.update(42, |v| v + 1, &guard);
@@ -148,6 +147,7 @@ fn update() {
 #[test]
 fn update_empty() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         let new = map.update(42, |v| v + 1, &guard);
         assert!(new.is_none());
@@ -162,6 +162,7 @@ fn update_empty() {
 #[test]
 fn concurrent_insert() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let map = Arc::new(map);
 
         let map1 = map.clone();
@@ -194,6 +195,7 @@ fn concurrent_insert() {
 #[test]
 fn concurrent_remove() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let map = Arc::new(map);
 
         {
@@ -236,6 +238,7 @@ fn concurrent_remove() {
 #[test]
 fn concurrent_update() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let map = Arc::new(map);
 
         {
@@ -277,6 +280,7 @@ fn concurrent_update() {
 #[cfg_attr(miri, ignore)]
 fn concurrent_resize_and_get() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let map = Arc::new(map);
 
         {
@@ -328,6 +332,7 @@ fn current_kv_dropped() {
     let dropped2 = Arc::new(0);
 
     with_map::<Arc<usize>, Arc<usize>>(|map| {
+        let map = map();
         map.insert(dropped1.clone(), dropped2.clone(), &map.guard());
         assert_eq!(Arc::strong_count(&dropped1), 2);
         assert_eq!(Arc::strong_count(&dropped2), 2);
@@ -343,7 +348,9 @@ fn current_kv_dropped() {
 #[test]
 fn empty_maps_equal() {
     with_map::<usize, usize>(|map1| {
+        let map1 = map1();
         with_map::<usize, usize>(|map2| {
+            let map2 = map2();
             assert_eq!(map1, map2);
             assert_eq!(map2, map1);
         });
@@ -353,7 +360,9 @@ fn empty_maps_equal() {
 #[test]
 fn different_size_maps_not_equal() {
     with_map::<usize, usize>(|map1| {
+        let map1 = map1();
         with_map::<usize, usize>(|map2| {
+            let map2 = map2();
             {
                 let guard1 = map1.guard();
                 let guard2 = map2.guard();
@@ -375,7 +384,9 @@ fn different_size_maps_not_equal() {
 #[test]
 fn same_values_equal() {
     with_map::<usize, usize>(|map1| {
+        let map1 = map1();
         with_map::<usize, usize>(|map2| {
+            let map2 = map2();
             {
                 map1.pin().insert(1, 0);
                 map2.pin().insert(1, 0);
@@ -390,7 +401,9 @@ fn same_values_equal() {
 #[test]
 fn different_values_not_equal() {
     with_map::<usize, usize>(|map1| {
+        let map1 = map1();
         with_map::<usize, usize>(|map2| {
+            let map2 = map2();
             {
                 map1.pin().insert(1, 0);
                 map2.pin().insert(1, 1);
@@ -405,6 +418,7 @@ fn different_values_not_equal() {
 #[test]
 fn clone_map_empty() {
     with_map::<&'static str, u32>(|map| {
+        let map = map();
         let cloned_map = map.clone();
         assert_eq!(map.len(), cloned_map.len());
         assert_eq!(&map, &cloned_map);
@@ -416,6 +430,7 @@ fn clone_map_empty() {
 // Test that same values exists in both maps (original and cloned)
 fn clone_map_filled() {
     with_map::<&'static str, u32>(|map| {
+        let map = map();
         map.insert("FooKey", 0, &map.guard());
         map.insert("BarKey", 10, &map.guard());
         let cloned_map = map.clone();
@@ -431,6 +446,7 @@ fn clone_map_filled() {
 #[test]
 fn default() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
 
@@ -441,6 +457,7 @@ fn default() {
 #[test]
 fn debug() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
         map.insert(16, 8, &guard);
@@ -454,6 +471,7 @@ fn debug() {
 #[test]
 fn extend() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let guard = map.guard();
 
         let mut entries: Vec<(usize, usize)> = vec![(42, 0), (16, 6), (38, 42)];
@@ -474,6 +492,7 @@ fn extend() {
 #[test]
 fn extend_ref() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let mut entries: Vec<(&usize, &usize)> = vec![(&42, &0), (&16, &6), (&38, &42)];
         entries.sort();
 
@@ -500,6 +519,7 @@ fn from_iter_empty() {
 #[test]
 fn len() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let len = if cfg!(miri) { 100 } else { 10_000 };
         for i in 0..len {
             map.pin().insert(i, i + 1);
@@ -511,6 +531,7 @@ fn len() {
 #[test]
 fn iter() {
     with_map::<usize, usize>(|map| {
+        let map = map();
         let len = if cfg!(miri) { 100 } else { 10_000 };
         for i in 0..len {
             assert_eq!(map.pin().insert(i, i + 1), None);
@@ -527,6 +548,7 @@ fn iter() {
 fn mixed() {
     const LEN: usize = if cfg!(miri) { 48 } else { 1024 };
     with_map::<usize, usize>(|map| {
+        let map = map();
         assert!(map.pin().get(&100).is_none());
         map.pin().insert(100, 101);
         assert_eq!(map.pin().get(&100), Some(&101));
@@ -589,6 +611,7 @@ mod hasher {
         let range = if cfg!(miri) { 0..16 } else { 0..100 };
 
         with_map::<i32, i32>(|map| {
+            let map = map();
             let guard = map.guard();
             for i in range.clone() {
                 map.insert(i, i, &guard);
