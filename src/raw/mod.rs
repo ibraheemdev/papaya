@@ -1597,7 +1597,12 @@ where
             // Successfully copied.
             RawInsertResult::Inserted(_) => {}
             // An insert or update beat us to the new table, we no longer have to copy.
-            RawInsertResult::Error { .. } => {}
+            RawInsertResult::Error { .. } => {
+                // The entry is unreachable from the new table because it was overwritten,
+                // but it is still reachable from this table until the copy completes. Defer
+                // it's retirement.
+                unsafe { self.table.state().deferred.defer(entry.ptr) };
+            }
             RawInsertResult::Replaced(_) => unreachable!(),
         }
 
@@ -1710,6 +1715,10 @@ where
 
     /// Retire an entry that was removed from the current table, but may still be reachable from
     /// previous tables.
+    ///
+    /// # Safety
+    ///
+    /// The entry must be unreachable from the current table.
     unsafe fn defer_retire(&self, entry: Tagged<Entry<K, V>>, guard: &impl Guard) {
         match self.root.resize {
             // Safety: In blocking resize mode, we only ever write to the root table, so the entry
