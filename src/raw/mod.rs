@@ -932,25 +932,25 @@ where
         };
 
         let (meta, status) = match EntryStatus::from(found) {
-            EntryStatus::Value(_) => {
+            EntryStatus::Value(_) | EntryStatus::Copied(_) => {
                 // Protect the entry before accessing it.
                 let found = guard.protect(entry, Ordering::Acquire).unpack();
 
                 // Re-check the entry status.
                 match EntryStatus::from(found) {
-                    EntryStatus::Value(found) => {
+                    EntryStatus::Value(found) | EntryStatus::Copied(found) => {
                         // An entry was inserted, we have to hash it to get the metadata.
                         let hash = self.root.hasher.hash_one(&(*found.ptr).key);
                         (meta::h2(hash), EntryStatus::Value(found))
                     }
 
-                    // The entry was deleted or copied.
-                    status => (meta::TOMBSTONE, status),
+                    // The entry was deleted or null copied.
+                    EntryStatus::Null => (meta::TOMBSTONE, EntryStatus::Null),
                 }
             }
 
-            // The entry was deleted or copied.
-            status => (meta::TOMBSTONE, status),
+            // The entry was deleted or null copied.
+            EntryStatus::Null => (meta::TOMBSTONE, EntryStatus::Null),
         };
 
         // Ensure the meta table is updated to keep the probe chain alive for readers.
