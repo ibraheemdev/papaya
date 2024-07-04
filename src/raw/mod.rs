@@ -1635,7 +1635,7 @@ where
 
         // Note that we already wrote the COPYING bit, so no one is writing to the old
         // entry except us.
-        unsafe { self.table.entry(i).store(copied, Ordering::Release) };
+        unsafe { self.table.entry(i).store(copied, Ordering::SeqCst) };
 
         // Notify any writers that the copy has completed.
         self.table.state().parker.unpark(entry.ptr.addr());

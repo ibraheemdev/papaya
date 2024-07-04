@@ -69,6 +69,8 @@ impl Parker {
     }
 
     // Unpark all threads under the given key.
+    //
+    // Note that any modifications must be `SeqCst` to be visible to unparked threads.
     pub fn unpark(&self, key: usize) {
         // Fast-path, no one waiting to be unparked.
         if self.pending.load(Ordering::SeqCst) == 0 {
