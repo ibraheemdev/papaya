@@ -1735,21 +1735,32 @@ where
 
     // Wait for an incremental copy of a given entry to complete.
     fn wait_copied(&self, i: usize) {
+        const SPIN_WAIT: usize = 5;
+
         let parker = &self.table.state().parker;
         let entry = unsafe { self.table.entry(i) };
 
-        // The entry is already copied.
-        let value = entry.load(Ordering::Acquire).unpack();
-        if value.tag() & Entry::COPIED != 0 {
-            return;
-        }
+        // Spin for a short while, waiting for the entry to be copied.
+        let mut spun = 0;
+        let addr = loop {
+            for _ in 0..(spun * spun) {
+                hint::spin_loop();
+            }
+
+            // The entry was copied.
+            let entry = entry.load(Ordering::Acquire).unpack();
+            if entry.tag() & Entry::COPIED != 0 {
+                return;
+            }
+
+            spun += 1;
+            if spun > SPIN_WAIT {
+                break entry.ptr as usize;
+            }
+        };
 
         // Park until the copy completes.
-        parker.park(value.ptr.addr(), entry, |entry| {
-            entry.addr() & Entry::COPIED == 0
-        });
-
-        assert!(entry.load(Ordering::Relaxed).addr() & Entry::COPIED != 0);
+        parker.park(addr, entry, |entry| entry.addr() & Entry::COPIED == 0);
     }
 
     /// Retire an entry that was removed from the current table, but may still be reachable from
