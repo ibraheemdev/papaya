@@ -446,7 +446,7 @@ where
         let (mut probe, limit) = Probe::start(h1, self.table.len);
 
         // Probe until we reach the limit.
-        while probe.len <= limit {
+        'probe: while probe.len <= limit {
             // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
@@ -465,7 +465,7 @@ where
                     // Otherwise, continue probing.
                     InsertStatus::Found(EntryStatus::Null) => {
                         probe.next();
-                        continue;
+                        continue 'probe;
                     }
                 }
             }
@@ -478,7 +478,7 @@ where
                 // The entry was deleted, keep probing.
                 if Entry::is_tombstone(found) {
                     probe.next();
-                    continue;
+                    continue 'probe;
                 }
 
                 // If the key matches, we might be able to update the value.
@@ -487,19 +487,19 @@ where
             // Otherwise, continue probing.
             else {
                 probe.next();
-                continue;
+                continue 'probe;
             };
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != new_ref.key } {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // The entry is being copied to the new table.
             if entry.tag() & Entry::COPYING != 0 {
-                break;
+                break 'probe;
             }
 
             // Return an error for calls to `try_insert`.
@@ -519,7 +519,7 @@ where
                     }
 
                     // The entry is being copied.
-                    UpdateStatus::Found(EntryStatus::Copied(_)) => break,
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe,
 
                     // The entry was deleted before we could update it, continue probing.
                     UpdateStatus::Found(EntryStatus::Null) => {}
@@ -528,9 +528,6 @@ where
                     UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
                 }
             }
-
-            // Continue probing.
-            probe.next();
         }
 
         // If went over the probe limit or found a copied entry, trigger a resize.
@@ -622,7 +619,7 @@ where
             // Check for a potential match.
             if meta != h2 {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // Load the full entry.
@@ -632,14 +629,14 @@ where
             // The entry was deleted, keep probing.
             if Entry::is_tombstone(entry) {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != new_ref.key } {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // The entry is being copied to the new table, we have to complete the copy before
@@ -790,7 +787,7 @@ where
             // Check for a potential match.
             if meta != h2 {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // Load the full entry.
@@ -800,14 +797,14 @@ where
             // The entry was deleted, keep probing.
             if Entry::is_tombstone(entry) {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key.borrow() != key } {
                 probe.next();
-                continue;
+                continue 'probe;
             }
 
             // The entry is being copied to the new table, we have to complete the copy before
@@ -1098,7 +1095,7 @@ where
                         // Safety: We just removed the old value from this table.
                         self.defer_retire(entry, guard);
 
-                        break;
+                        continue 'probe;
                     },
 
                     // Lost to a concurrent update, retry.
