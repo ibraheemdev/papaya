@@ -274,12 +274,6 @@ impl<K, V, S> HashMap<K, V, S> {
         matches!(self.resize, ResizeMode::Incremental(_))
     }
 
-    // Returns true if blocking resizing is enabled.
-    #[inline(always)]
-    fn is_blocking(&self) -> bool {
-        matches!(self.resize, ResizeMode::Blocking)
-    }
-
     // Returns a reference to the given table.
     #[inline(always)]
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'_, K, V, S> {
@@ -446,7 +440,11 @@ where
         let (mut probe, limit) = Probe::start(h1, self.table.len);
 
         // Probe until we reach the limit.
-        'probe: while probe.len <= limit {
+        let copying = 'probe: loop {
+            if probe.len > limit {
+                break None;
+            }
+
             // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
@@ -499,7 +497,7 @@ where
 
             // The entry is being copied to the new table.
             if entry.tag() & Entry::COPYING != 0 {
-                break 'probe;
+                break 'probe Some(probe.i);
             }
 
             // Return an error for calls to `try_insert`.
@@ -519,7 +517,7 @@ where
                     }
 
                     // The entry is being copied.
-                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe,
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
 
                     // The entry was deleted before we could update it, continue probing.
                     UpdateStatus::Found(EntryStatus::Null) => {}
@@ -528,23 +526,40 @@ where
                     UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
                 }
             }
-        }
+        };
 
         // If went over the probe limit or found a copied entry, trigger a resize.
         let mut next_table = self.get_or_alloc_next(None);
 
-        // Help out with the resize.
-        if self.root.is_blocking() || help_copy {
-            next_table = self.help_copy(guard, false);
-        }
+        let next_table = match self.root.resize {
+            ResizeMode::Blocking => {
+                // In blocking mode we must complete the resize before proceeding.
+                self.help_copy(guard, false)
+            }
 
-        // Make sure not to do any more copying to keep resizing costs constant in
-        // incremental mode.
-        let help_copy = false;
+            ResizeMode::Incremental(_) => {
+                // Help out with the copy.
+                if help_copy {
+                    next_table = self.help_copy(guard, false);
+                }
 
-        // Insert into the next table, racing with the copy of this entry.
+                // The entry we want to update is being copied.
+                if let Some(i) = copying {
+                    // Wait for the entry to be copied.
+                    //
+                    // We could race with the copy to insert into the table. However,
+                    // this entire code path is very rare and likely to complete quickly,
+                    // so blocking allows us to make copies faster.
+                    self.wait_copied(i);
+                }
+
+                next_table
+            }
+        };
+
+        // Insert into the next table.
         self.as_ref(next_table)
-            .insert_with(new_entry, should_replace, help_copy, guard)
+            .insert_with(new_entry, should_replace, false, guard)
     }
 
     // Update an entry with a remapping function.
@@ -709,12 +724,10 @@ where
                         self.help_copy(guard, false);
                     }
 
-                    // Wait for the entry to be copied.
-                    //
                     // We could perform an update based on the copied entry and
                     // race to insert it into the table here instead. However, this
-                    // entire code path is very rare and likely to complete
-                    // very quickly, so blocking is likely cheaper.
+                    // entire code path is very rare and likely to complete quickly,
+                    // so blocking allows us to make copies faster.
                     self.wait_copied(i);
 
                     // Continue in the new table.
@@ -1423,77 +1436,13 @@ where
             return true;
         }
 
-        // Otherwise, copy the value.
+        // Copy the value to the new table.
         fence(Ordering::Acquire);
         unsafe {
             self.as_ref(next_table)
-                .insert_copy(entry.ptr.unpack(), guard)
+                .insert_copy(entry.ptr.unpack(), false, guard)
                 .is_some()
         }
-    }
-
-    // Copy an entry into the table, returning the index it was inserted into.
-    //
-    // This is an optimized version of `insert_entry` where we are the only
-    // writer inserting the given key into the new table, useful for blocking resizes.
-    unsafe fn insert_copy(
-        &self,
-        new_entry: Tagged<Entry<K, V>>,
-        guard: &impl Guard,
-    ) -> Option<(Table<K, V>, usize)> {
-        // Safety: The new entry is guaranteed to be valid by the caller.
-        let key = unsafe { &(*new_entry.ptr).key };
-
-        // Initialize the probe state.
-        let (h1, h2) = self.hash(key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
-
-        // Probe until we reach the limit.
-        while probe.len <= limit {
-            // Load the entry metadata first for cheap searches.
-            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
-
-            // The entry is empty, try to insert.
-            if meta == meta::EMPTY {
-                let entry = unsafe { self.table.entry(probe.i) };
-
-                // Try to claim the entry.
-                match entry.compare_exchange(
-                    ptr::null_mut(),
-                    new_entry.raw,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                ) {
-                    // Successfully inserted.
-                    Ok(_) => {
-                        // Update the metadata table.
-                        unsafe { self.table.meta(probe.i).store(h2, Ordering::Release) };
-                        return Some((self.table, probe.i));
-                    }
-                    Err(_) => {
-                        // Protect the entry before accessing it.
-                        let found = guard.protect(entry, Ordering::Acquire).unpack();
-
-                        // Nothing can be deleted or copied during a resize.
-                        assert!(!found.ptr.is_null() && !Entry::is_tombstone(found));
-
-                        // Ensure the meta table is updated to avoid breaking the probe chain.
-                        let hash = self.root.hasher.hash_one(&(*found.ptr).key);
-                        let meta = meta::h2(hash);
-
-                        if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
-                            self.table.meta(probe.i).store(meta, Ordering::Release);
-                        }
-                    }
-                }
-            }
-
-            // Continue probing.
-            probe.next();
-        }
-
-        // Went over the probe limit, abort.
-        None
     }
 
     // Help along an in-progress resize incrementally by copying a chunk of entries.
@@ -1612,20 +1561,10 @@ where
 
         // Copy the value to the new table.
         fence(Ordering::Acquire);
-        match unsafe {
+        unsafe {
             self.as_ref(next_table)
-                .insert_with(new_entry, false, false, guard)
-        } {
-            // Successfully copied.
-            RawInsertResult::Inserted(_) => {}
-            // An insert or update beat us to the new table, we no longer have to copy.
-            RawInsertResult::Error { .. } => {
-                // The entry is unreachable from the new table because it was overwritten,
-                // but it is still reachable from this table until the copy completes. Defer
-                // it's retirement.
-                unsafe { self.table.state().deferred.defer(entry.ptr) };
-            }
-            RawInsertResult::Replaced(_) => unreachable!(),
+                .insert_copy(new_entry, true, guard)
+                .unwrap();
         }
 
         // Mark the entry as copied.
@@ -1639,6 +1578,84 @@ where
 
         // Notify any writers that the copy has completed.
         self.table.state().parker.unpark(entry.ptr.addr());
+    }
+
+    // Copy an entry into the table, returning the index it was inserted into.
+    //
+    // This is an optimized version of `insert_entry` where the caller is the only writer
+    // inserting the given key into the new table, as it has already been marked as copying.
+    unsafe fn insert_copy(
+        &self,
+        new_entry: Tagged<Entry<K, V>>,
+        resize: bool,
+        guard: &impl Guard,
+    ) -> Option<(Table<K, V>, usize)> {
+        // Safety: The new entry is guaranteed to be valid by the caller.
+        let key = unsafe { &(*new_entry.ptr).key };
+
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
+
+        // Probe until we reach the limit.
+        while probe.len <= limit {
+            // Load the entry metadata first for cheap searches.
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
+
+            // The entry is empty, try to insert.
+            if meta == meta::EMPTY {
+                let entry = unsafe { self.table.entry(probe.i) };
+
+                // Try to claim the entry.
+                match entry.compare_exchange(
+                    ptr::null_mut(),
+                    new_entry.raw,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                ) {
+                    // Successfully inserted.
+                    Ok(_) => {
+                        // Update the metadata table.
+                        unsafe { self.table.meta(probe.i).store(h2, Ordering::Release) };
+                        return Some((self.table, probe.i));
+                    }
+                    Err(found) => {
+                        // The entry was deleted or copied.
+                        let meta = if found.unpack().ptr.is_null() {
+                            meta::TOMBSTONE
+                        } else {
+                            // Protect the entry before accessing it.
+                            let found = guard.protect(entry, Ordering::Acquire).unpack();
+
+                            // Recheck the pointer.
+                            if found.ptr.is_null() {
+                                meta::TOMBSTONE
+                            } else {
+                                // Ensure the meta table is updated to avoid breaking the probe chain.
+                                let hash = self.root.hasher.hash_one(&(*found.ptr).key);
+                                meta::h2(hash)
+                            }
+                        };
+
+                        if self.table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
+                            self.table.meta(probe.i).store(meta, Ordering::Release);
+                        }
+                    }
+                }
+            }
+
+            // Continue probing.
+            probe.next();
+        }
+
+        if !resize {
+            return None;
+        }
+
+        // Insert into the next table.
+        let next_table = self.get_or_alloc_next(None);
+        self.as_ref(next_table)
+            .insert_copy(new_entry, resize, guard)
     }
 
     // Update the copy state and attempt to promote a table to the root.
