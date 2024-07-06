@@ -279,6 +279,10 @@ fn concurrent_update() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn concurrent_resize_and_get() {
+    if resize_stress!() {
+        return;
+    }
+
     with_map::<usize, usize>(|map| {
         let map = map();
         let map = Arc::new(map);
@@ -470,6 +474,10 @@ fn debug() {
 
 #[test]
 fn extend() {
+    if resize_stress!() {
+        return;
+    }
+
     with_map::<usize, usize>(|map| {
         let map = map();
         let guard = map.guard();
@@ -491,6 +499,10 @@ fn extend() {
 
 #[test]
 fn extend_ref() {
+    if resize_stress!() {
+        return;
+    }
+
     with_map::<usize, usize>(|map| {
         let map = map();
         let mut entries: Vec<(&usize, &usize)> = vec![(&42, &0), (&16, &6), (&38, &42)];
@@ -530,6 +542,10 @@ fn len() {
 
 #[test]
 fn iter() {
+    if resize_stress!() {
+        return;
+    }
+
     with_map::<usize, usize>(|map| {
         let map = map();
         let len = if cfg!(miri) { 100 } else { 10_000 };

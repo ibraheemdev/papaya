@@ -1265,8 +1265,14 @@ where
             return unsafe { Table::from_raw(next) };
         }
 
-        // Double the table capacity.
-        let next_capacity = capacity.unwrap_or(self.table.len << 1);
+        let next_capacity = match option_env!("PAPAYA_RESIZE_STRESS") {
+            // Never grow the table to stress the incremental resizing algorithm.
+            Some(_) => self.table.len,
+            // Double the table capacity.
+            None => self.table.len << 1,
+        };
+
+        let next_capacity = capacity.unwrap_or(next_capacity);
         assert!(
             next_capacity <= isize::MAX as usize,
             "`HashMap` exceeded maximum capacity"
