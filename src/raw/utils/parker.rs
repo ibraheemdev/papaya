@@ -44,8 +44,11 @@ impl Parker {
             if !should_park(atomic.load(Ordering::SeqCst)) {
                 // Don't need to park, remove our thread if it wasn't already unparked.
                 let mut state = self.state.lock().unwrap();
-                if let Some(threads) = state.threads.get_mut(&key) {
-                    threads.remove(&id).unwrap();
+                if let Some(_) = state
+                    .threads
+                    .get_mut(&key)
+                    .and_then(|threads| threads.remove(&id))
+                {
                     self.pending.fetch_sub(1, Ordering::Relaxed);
                 }
                 return;
@@ -56,7 +59,11 @@ impl Parker {
                 thread::park();
 
                 let mut state = self.state.lock().unwrap();
-                if state.threads.get_mut(&key).is_none() {
+                if !state
+                    .threads
+                    .get_mut(&key)
+                    .is_some_and(|threads| threads.contains_key(&id))
+                {
                     break;
                 }
             }
