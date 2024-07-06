@@ -14,7 +14,8 @@ A fast and ergonomic concurrent hash-table that features:
 The top-level crate documentation is organized as follows:
 
 - [Usage](#usage) shows how to interact with the concurrent `HashMap`.
-- [Atomic Operations](#atomic-operations) shows how to modify a map atomically.
+- [Consistency](#consistency) describes the consistency of concurrent operations.
+- [Atomic Operations](#atomic-operations) shows how to perform dynamic operations atomically.
 - [Async Support](#async-support) shows how to use the map in an async context.
 - [Advanced Lifetimes](#advanced-lifetimes) explains how to use guards when working with nested types.
 - [Performance](#performance) provides details of expected performance characteristics.
@@ -23,16 +24,7 @@ The top-level crate documentation is organized as follows:
 
 `papaya` aims to provide an ergonomic API without sacrificing performance. The `HashMap` provided by this crate exposes a lock-free API and can hand out direct references to objects in the map without the need for wrapper types that are clunky and prone to deadlocks. 
 
-However, you can't hold on to references forever due to concurrent removals. Because of this, the `HashMap` API is structured around *pinning*:
-
-```rust,ignore
-let map = papaya::HashMap::new();
-
-// Pin the map.
-let map = map.pin();
-```
-
-Once you create a pin you can access the map just like a standard `HashMap`. The pinned table is similar to a lock guard, so any references that are returned will be tied to the lifetime of the guard. Unlike a lock however, pinning is cheap and can never cause a deadlock.
+However, you can't hold on to references forever due to concurrent removals. Because of this, the `HashMap` API is structured around *pinning*. Through a pin you can access the map just like a standard `HashMap`. A pin is similar to a lock guard, so any references that are returned will be tied to the lifetime of the guard. Unlike a lock however, pinning is cheap and can never cause deadlocks.
 
 ```rust
 let map = papaya::HashMap::new();
@@ -80,9 +72,13 @@ std::thread::scope(|s| {
 
 It is important to note that as long as you are holding on to a guard, you are preventing the map from performing garbage collection. Pinning and unpinning the table is relatively cheap but not free, similar to the cost of locking and unlocking an uncontended or lightly contended `Mutex`. Thus guard reuse is encouraged, within reason. See the [`seize`] crate for advanced usage and specifics of the garbage collection algorithm.
 
-## Atomic Operations
+## Consistency
 
-TODO
+Due to the concurrent nature of the map, read and write operations may overlap in time. There is no support for locking the entire table nor individual keys to prevent concurrent access, except through external fine-grained locking. As such, read operations (such as `get`) reflect the results of the *most-recent* write. More formally, a read establishes a *happens-before* relationship with the corresponding write.
+
+Aggregate operations, such as iterators, rely on a weak snapshot of the table and return results reflecting the state of the table at or some point after the creation of the iterator. This means that they may, but are not guaranteed to, reflect concurrent modifications to the table that occur during iteration. Similarly, operations such as `clear` and `clone` rely on iteration and may not produce "perfect" results if the map is being concurrently modified.
+
+## Atomic Operations
 
 ## Async Support
 
