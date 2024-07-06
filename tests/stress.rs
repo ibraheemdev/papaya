@@ -15,7 +15,7 @@ use common::{threads, with_map};
 fn contains_key_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() => 1 << 12,
+        _ if resize_stress!() || asan!() => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -56,7 +56,7 @@ fn contains_key_stress() {
 fn insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() => 1 << 11,
+        _ if resize_stress!() || asan!() => 1 << 11,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -100,7 +100,7 @@ fn insert_stress() {
 fn update_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() => 1 << 12,
+        _ if resize_stress!() || asan!() => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -146,7 +146,7 @@ fn update_stress() {
 fn update_insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() => 1 << 12,
+        _ if resize_stress!() || asan!() => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -204,7 +204,7 @@ fn update_insert_stress() {
 fn mixed_chunk_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 48,
-        _ if resize_stress!() => 1 << 10,
+        _ if resize_stress!() || asan!() => 1 << 10,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -283,7 +283,7 @@ fn mixed_chunk_stress() {
 fn mixed_entry_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 100,
-        _ if resize_stress!() => 1 << 10,
+        _ if resize_stress!() || asan!() => 1 << 10,
         _ => 1 << 10,
     };
     const OPERATIONS: usize = if cfg!(miri) { 1 } else { 72 };
@@ -346,7 +346,7 @@ fn mixed_entry_stress() {
 fn everything() {
     const SIZE: usize = match () {
         _ if cfg!(miri) => 1 << 5,
-        _ if resize_stress!() => 1 << 8,
+        _ if resize_stress!() || asan!() => 1 << 8,
         _ => 1 << 16,
     };
     // there must be more things absent than present!

@@ -50,6 +50,15 @@ macro_rules! resize_stress {
     };
 }
 
+// Returns a `bool` indicating whether the program is running under
+// address sanitizer.
+#[macro_export]
+macro_rules! asan {
+    () => {
+        option_env!("ADDRESS_SANITIZER").is_some()
+    };
+}
+
 // Returns the number of threads to use for stress testing.
 pub fn threads() -> usize {
     if cfg!(miri) {
