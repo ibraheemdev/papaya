@@ -1,6 +1,6 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::HashMap;
+use papaya::{Compute, HashMap, Operation};
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -133,7 +133,9 @@ fn update() {
         let map = map();
         let guard = map.guard();
         map.insert(42, 0, &guard);
+        assert_eq!(map.len(), 1);
         let new = map.update(42, |v| v + 1, &guard);
+        assert_eq!(map.len(), 1);
         assert_eq!(new, Some(&1));
 
         {
@@ -155,6 +157,147 @@ fn update_empty() {
         {
             let guard = map.guard();
             assert!(map.get(&42, &guard).is_none());
+        }
+    });
+}
+
+#[test]
+fn update_or_insert() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        let result = map.update_or_insert(42, |v| v + 1, 0, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &0);
+        }
+
+        let result = map.update_or_insert(42, |v| v + 1, 0, &guard);
+        assert_eq!(result, &1);
+        assert_eq!(map.len(), 1);
+
+        let result = map.update_or_insert(42, |v| v + 1, 0, &guard);
+        assert_eq!(result, &2);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &2);
+        }
+    });
+}
+
+#[test]
+fn update_or_insert_with() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        let result = map.update_or_insert_with(42, |v| v + 1, || 0, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &0);
+        }
+
+        let result = map.update_or_insert_with(42, |v| v + 1, || 0, &guard);
+        assert_eq!(result, &1);
+        assert_eq!(map.len(), 1);
+
+        let result = map.update_or_insert_with(42, |v| v + 1, || 0, &guard);
+        assert_eq!(result, &2);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &2);
+        }
+    });
+}
+
+#[test]
+fn get_or_insert() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        let result = map.get_or_insert(42, 0, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &0);
+        }
+
+        let result = map.get_or_insert(42, 1, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+    });
+}
+
+#[test]
+fn get_or_insert_with() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        let result = map.get_or_insert_with(42, || 0, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &0);
+        }
+
+        let result = map.get_or_insert_with(42, || 1, &guard);
+        assert_eq!(result, &0);
+        assert_eq!(map.len(), 1);
+    });
+}
+
+#[test]
+fn compute() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let map = map.pin();
+
+        for i in 0..100 {
+            let compute = |entry| match entry {
+                Some((_, value)) if value % 2 == 0 => Operation::Remove,
+                Some((_, value)) => Operation::Insert(value + 1),
+                None => Operation::Abort(()),
+            };
+
+            assert_eq!(map.len(), 0);
+            assert_eq!(map.compute(i, compute), Compute::Aborted(()));
+            assert_eq!(map.get(&i), None);
+
+            map.compute(i, |_| Operation::Insert::<_, ()>(1));
+            assert_eq!(map.len(), 1);
+
+            assert_eq!(
+                map.compute(i, compute),
+                Compute::Updated {
+                    old: (&i, &1),
+                    new: (&i, &2),
+                }
+            );
+            assert_eq!(map.compute(i, compute), Compute::Removed(&i, &2));
+            assert_eq!(map.len(), 0);
         }
     });
 }

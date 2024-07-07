@@ -75,9 +75,9 @@ impl<K, V> HashMapBuilder<K, V> {
 impl<K, V, S> HashMapBuilder<K, V, S> {
     /// Set the initial capacity of the map.
     ///
-    /// Note the table should be able to hold at least `capacity` elements before
-    /// resizing, but may prematurely resize due to poor hash distributions. If `capacity`
-    /// is 0, the hash map will not allocate.
+    /// The table should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the table may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
     pub fn capacity(self, capacity: usize) -> HashMapBuilder<K, V, S> {
         HashMapBuilder {
             capacity,
@@ -102,7 +102,6 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
     /// Set the [`seize::Collector`] used for garbage collection.
     ///
     /// This method may be useful when you want more control over garbage collection.
-    /// See [`seize::Collector`] for details.
     ///
     /// Note that all `Guard` references used to access the map must be produced by
     /// the provided `collector`.
@@ -127,7 +126,7 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
 /// Resize behavior for a [`HashMap`].
 ///
 /// Hash maps must resize when the underlying table becomes full, migrating all key and value pairs
-/// to a new allocation. This type allows you to configure the resizing behavior when passed to
+/// to a new table. This type allows you to configure the resizing behavior when passed to
 /// [`HashMapBuilder::resize_mode`].
 pub enum ResizeMode {
     /// Writers copy a constant number of key/value pairs to the new table before making
@@ -154,7 +153,7 @@ pub enum ResizeMode {
 
 impl Default for ResizeMode {
     fn default() -> Self {
-        // incremental resizing is a good default for most workloads as it avoids
+        // Incremental resizing is a good default for most workloads as it avoids
         // unexpected latency spikes.
         ResizeMode::Incremental(1024)
     }
@@ -178,9 +177,9 @@ impl<K, V> HashMap<K, V> {
 
     /// Creates an empty `HashMap` with the specified capacity.
     ///
-    /// Note the table should be able to hold at least `capacity` elements before
-    /// resizing, but may prematurely resize due to poor hash distribution. If `capacity`
-    /// is 0, the hash map will not allocate.
+    /// The table should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the table may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
     ///
     /// # Examples
     ///
@@ -245,9 +244,9 @@ impl<K, V, S> HashMap<K, V, S> {
     /// Creates an empty `HashMap` with at least the specified capacity, using
     /// `hash_builder` to hash the keys.
     ///
-    /// Note the table should be able to hold at least `capacity` elements before
-    /// resizing, but may prematurely resize due to poor hash distribution. If `capacity`
-    /// is 0, the hash map will not allocate.
+    /// The table should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the table may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
     /// to allow HashMaps to be resistant to attacks that cause many collisions
@@ -293,8 +292,8 @@ impl<K, V, S> HashMap<K, V, S> {
     /// Returns a pinned reference to the map.
     ///
     /// Unlike [`HashMap::pin`], the returned reference implements `Send` and `Sync`,
-    /// allowing it to be held across `.await` points in multi-threaded
-    /// schedulers. This is especially useful for iterators.
+    /// allowing it to be held across `.await` points in work-stealing schedulers.
+    /// This is especially useful for iterators.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
@@ -471,7 +470,7 @@ where
     /// ```
     /// use papaya::HashMap;
     ///
-    /// let mut map = HashMap::new();
+    /// let map = HashMap::new();
     /// assert_eq!(map.pin().insert(37, "a"), None);
     /// assert_eq!(map.pin().is_empty(), false);
     ///
@@ -502,7 +501,7 @@ where
     /// ```
     /// use papaya::HashMap;
     ///
-    /// let mut map = HashMap::new();
+    /// let map = HashMap::new();
     /// let m = map.pin();
     /// assert_eq!(m.try_insert(37, "a").unwrap(), &"a");
     ///
@@ -530,24 +529,90 @@ where
         }
     }
 
-    /// Update an entry atomically.
+    /// Returns a reference to the value corresponding to the key, or inserts a default value.
     ///
-    /// If the value for the specified `key` is present, the new value is computed and stored the
-    /// using the provided update function, and the new value is returned. Otherwise, `None`
-    /// is returned.
-    ///
-    /// The update function should be pure, as it may be called multiple times if the current value
-    /// changes during the execution of this function. However, the update is performed atomically,
-    /// meaning the value is only updated using the call to `update` with the previous value —
-    /// similar to a traditional [compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap)
-    /// operation.
+    /// If the given key is present, the corresponding value is returned. If it is not present,
+    /// the provided `value` is inserted, and a reference to the newly inserted value is returned.
     ///
     /// # Examples
     ///
     /// ```
     /// use papaya::HashMap;
     ///
-    /// let mut map = HashMap::new();
+    /// let map = HashMap::new();
+    /// assert_eq!(map.pin().get_or_insert("a", 3), &3);
+    /// assert_eq!(map.pin().get_or_insert("a", 6), &3);
+    /// ```
+    pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> &'g V {
+        // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
+        // allows us to avoid
+        // the closure indirection.
+        match self.try_insert(key, value, guard) {
+            Ok(inserted) => inserted,
+            Err(OccupiedError { current, .. }) => current,
+        }
+    }
+
+    /// Returns a reference to the value corresponding to the key, or inserts a default value
+    /// computed from a closure.
+    ///
+    /// If the given key is present, the corresponding value is returned. If it is not present,
+    /// the value computed from `f` is inserted, and a reference to the newly inserted value is
+    /// returned.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(map.pin().get_or_insert_with("a", || 3), &3);
+    /// assert_eq!(map.pin().get_or_insert_with("a", || 6), &3);
+    /// ```
+    pub fn get_or_insert_with<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> &'g V
+    where
+        F: FnOnce() -> V,
+        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+    {
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Return the existing value.
+            Some((_, current)) => Operation::Abort(current),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Aborted(value) => value,
+            Compute::Inserted(_, value) => value,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Updates an existing entry atomically.
+    ///
+    /// If the value for the specified `key` is present, the new value is computed and stored the
+    /// using the provided update function, and the new value is returned. Otherwise, `None`
+    /// is returned.
+    ///
+    ///
+    /// The update function is given the current value associated with the given key and returns the
+    /// new value to be stored. The operation is applied atomically only if the state of the entry remains
+    /// the same, meaning that it is not concurrently modified in any way. If the entry is
+    /// modified, the operation is retried with the new entry, similar to a traditional [compare-and-swap](https://en.wikipedia.org/wiki/Compare-and-swap)
+    /// operation.
+    ///
+    /// Note that the `update` function should be pure as it may be called multiple times, and the output
+    /// for a given entry may be memoized across retries.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
     /// map.pin().insert("a", 1);
     /// assert_eq!(map.pin().get(&"a"), Some(&1));
     ///
@@ -557,8 +622,144 @@ where
     pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
+        K: 'g,
     {
         self.raw.root(guard).update(key, update, guard)
+    }
+
+    /// Updates an existing entry or inserts a default value.
+    ///
+    /// If the value for the specified `key` is present, the new value is computed and stored the
+    /// using the provided update function, and the new value is returned. Otherwise, the provided
+    /// `value` is inserted into the map, and a reference to the newly inserted value is returned.
+    ///
+    /// See [`HashMap::update`] for details about how atomic updates are performed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(*map.pin().update_or_insert("a", |i| i + 1, 0), 0);
+    /// assert_eq!(*map.pin().update_or_insert("a", |i| i + 1, 0), 1);
+    /// ```
+    pub fn update_or_insert<'g, F>(
+        &self,
+        key: K,
+        update: F,
+        value: V,
+        guard: &'g impl Guard,
+    ) -> &'g V
+    where
+        F: Fn(&V) -> V,
+        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+    {
+        self.update_or_insert_with(key, update, || value, guard)
+    }
+
+    /// Updates an existing entry or inserts a default value computed from a closure.
+    ///
+    /// If the value for the specified `key` is present, the new value is computed and stored the
+    /// using the provided update function, and the new value is returned. Otherwise, the value
+    /// computed by `f` is inserted into the map, and a reference to the newly inserted value is
+    /// returned.
+    ///
+    /// See [`HashMap::update`] for details about how atomic updates are performed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// assert_eq!(*map.pin().update_or_insert_with("a", |i| i + 1, || 0), 0);
+    /// assert_eq!(*map.pin().update_or_insert_with("a", |i| i + 1, || 0), 1);
+    /// ```
+    pub fn update_or_insert_with<'g, U, F>(
+        &self,
+        key: K,
+        update: U,
+        f: F,
+        guard: &'g impl Guard,
+    ) -> &'g V
+    where
+        F: FnOnce() -> V,
+        U: Fn(&V) -> V,
+        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+    {
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Perform the update.
+            Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Updated {
+                new: (_, value), ..
+            } => value,
+            Compute::Inserted(_, value) => value,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Updates an entry with a compare-and-swap (CAS) function.
+    ///
+    /// This method allows you to perform complex operations on the map atomically. The `compute`
+    /// closure is given the current state of the entry and returns the operation that should be
+    /// performed. The operation is applied atomically only if the state of the entry remains the same,
+    /// meaning it is not concurrently modified in any way.
+    ///
+    /// Note that the `compute` function should be pure as it may be called multiple times, and
+    /// the output for a given entry may be memoized across retries.
+    ///
+    /// In most cases you can avoid this method and instead use a higher-level atomic operation.
+    /// See the [crate-level documentation](crate#atomic-operations) for details.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use papaya::{HashMap, Operation, Compute};
+    ///
+    /// let map = HashMap::new();
+    /// let map = map.pin();
+    ///
+    /// let compute = |entry| match entry {
+    ///     // Remove the value if it is even.
+    ///     Some((_key, value)) if value % 2 == 0 => {
+    ///         Operation::Remove
+    ///     }
+    ///
+    ///     // Increment the value if it is odd.
+    ///     Some((_key, value)) => {
+    ///         Operation::Insert(value + 1)
+    ///     }
+    ///
+    ///     // Do nothing if the key does not exist
+    ///     None => Operation::Abort(()),
+    /// };
+    ///
+    /// assert_eq!(map.compute('A', compute), Compute::Aborted(()));
+    ///
+    /// map.insert('A', 1);
+    /// assert_eq!(map.compute('A', compute), Compute::Updated {
+    ///     old: (&'A', &1),
+    ///     new: (&'A', &2),
+    /// });
+    /// assert_eq!(map.compute('A', compute), Compute::Removed(&'A', &2));
+    /// ```
+    pub fn compute<'g, F, T>(
+        &self,
+        key: K,
+        compute: F,
+        guard: &'g impl Guard,
+    ) -> Compute<'g, K, V, T>
+    where
+        F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
+    {
+        self.raw.root(guard).compute(key, compute, guard)
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -573,7 +774,7 @@ where
     /// ```
     /// use papaya::HashMap;
     ///
-    /// let mut map = HashMap::new();
+    /// let map = HashMap::new();
     /// map.pin().insert(1, "a");
     /// assert_eq!(map.pin().remove(&1), Some(&"a"));
     /// assert_eq!(map.pin().remove(&1), None);
@@ -602,7 +803,7 @@ where
     /// ```
     /// use papaya::HashMap;
     ///
-    /// let mut map = HashMap::new();
+    /// let map = HashMap::new();
     /// map.pin().insert(1, "a");
     /// assert_eq!(map.pin().get(&1), Some(&"a"));
     /// assert_eq!(map.pin().remove_entry(&1), Some((&1, &"a")));
@@ -620,7 +821,10 @@ where
     /// Tries to reserve capacity for `additional` more elements to be inserted
     /// in the `HashMap`.
     ///
-    /// The collection may reserve more space to avoid frequent reallocations.
+    /// After calling this method, the table should be able to hold at least `capacity` elements
+    /// before resizing. However, the capacity is an estimate, and the table may prematurely resize
+    /// due to poor hash distribution. The collection may also reserve more space to avoid frequent
+    /// reallocations.
     ///
     /// # Panics
     ///
@@ -738,6 +942,56 @@ where
             iter: self.iter(guard),
         }
     }
+}
+
+/// An operation to perform on given entry in a [`HashMap`].
+///
+/// See [`HashMap::compute`] for details.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Operation<V, T> {
+    /// Insert the given value.
+    Insert(V),
+
+    /// Remove the entry from the map.
+    Remove,
+
+    /// Abort the operation with the given value.
+    Abort(T),
+}
+
+/// The result of a [`compute`](HashMap::compute) operation.
+///
+/// Contains information about the [`Operation`] that was performed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Compute<'g, K, V, T> {
+    /// The given entry was inserted.
+    Inserted(&'g K, &'g V),
+
+    /// The entry was updated.
+    Updated {
+        /// The entry that was replaced.
+        old: (&'g K, &'g V),
+
+        /// The entry that was inserted.
+        new: (&'g K, &'g V),
+    },
+
+    /// The given entry was removed.
+    Removed(&'g K, &'g V),
+
+    /// The operation was aborted with the given value.
+    Aborted(T),
+}
+
+/// An error returned by [`try_insert`](HashMap::try_insert) when the key already exists.
+///
+/// Contains the existing value, and the value that was not inserted.
+#[derive(Debug, PartialEq, Eq)]
+pub struct OccupiedError<'a, V: 'a> {
+    /// The value in the map that was already present.
+    pub current: &'a V,
+    /// The value which was not inserted, because the entry was already occupied.
+    pub not_inserted: V,
 }
 
 impl<K, V, S> PartialEq for HashMap<K, V, S>
@@ -877,21 +1131,10 @@ where
     }
 }
 
-/// The error returned by [`try_insert`](HashMap::try_insert) when the key already exists.
-///
-/// Contains the existing value, and the value that was not inserted.
-#[derive(Debug, PartialEq, Eq)]
-pub struct OccupiedError<'a, V: 'a> {
-    /// The value in the map that was already present.
-    pub current: &'a V,
-    /// The value which was not inserted, because the entry was already occupied.
-    pub not_inserted: V,
-}
-
 /// A pinned reference to a [`HashMap`].
 ///
-/// This type can be used to easily access a [`HashMap`] without explicitly managing a guard.
-/// See [`HashMap::pin`] for details.
+/// This type is created with [`HashMap::pin`] and can be used to easily access a [`HashMap`]
+/// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
 pub struct HashMapRef<'map, K, V, S, G> {
     guard: G,
     map: &'map HashMap<K, V, S>,
@@ -978,15 +1221,64 @@ where
         self.map.try_insert(key, value, &self.guard)
     }
 
-    // Update an entry with a remapping function.
-    //
+    /// Returns a reference to the value corresponding to the key, or inserts a default value.
+    ///
+    /// See [`HashMap::get_or_insert`] for details.
+    pub fn get_or_insert(&self, key: K, value: V) -> &V {
+        self.map.get_or_insert(key, value, &self.guard)
+    }
+
+    /// Returns a reference to the value corresponding to the key, or inserts a default value
+    /// computed from a closure.
+    ///
+    /// See [`HashMap::get_or_insert_with`] for details.
+    pub fn get_or_insert_with<F>(&self, key: K, f: F) -> &V
+    where
+        F: FnOnce() -> V,
+    {
+        self.map.get_or_insert_with(key, f, &self.guard)
+    }
+
+    /// Updates an existing entry atomically.
+    ///
     /// See [`HashMap::update`] for details.
-    #[inline]
     pub fn update<F>(&self, key: K, update: F) -> Option<&V>
     where
         F: Fn(&V) -> V,
     {
         self.map.update(key, update, &self.guard)
+    }
+
+    /// Updates an existing entry or inserts a default value.
+    ///
+    /// See [`HashMap::update_or_insert`] for details.
+    pub fn update_or_insert<F>(&self, key: K, update: F, value: V) -> &V
+    where
+        F: Fn(&V) -> V,
+    {
+        self.map.update_or_insert(key, update, value, &self.guard)
+    }
+
+    /// Updates an existing entry or inserts a default value computed from a closure.
+    ///
+    /// See [`HashMap::update_or_insert_with`] for details.
+    pub fn update_or_insert_with<U, F>(&self, key: K, update: U, f: F) -> &V
+    where
+        F: FnOnce() -> V,
+        U: Fn(&V) -> V,
+    {
+        self.map.update_or_insert_with(key, update, f, &self.guard)
+    }
+
+    // Updates an entry with a compare-and-swap (CAS) function.
+    //
+    /// See [`HashMap::compute`] for details.
+    #[inline]
+    pub fn compute<'g, F, T>(&'g self, key: K, compute: F) -> Compute<'g, K, V, T>
+    where
+        F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
+    {
+        self.map.compute(key, compute, &self.guard)
     }
 
     /// Removes a key from the map, returning the value at the key if the key

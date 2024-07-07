@@ -13,7 +13,7 @@ use std::{hint, ptr};
 use self::alloc::RawTable;
 use self::probe::Probe;
 use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, Shared, StrictProvenance, Tagged};
-use crate::map::ResizeMode;
+use crate::map::{Compute, Operation, ResizeMode};
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -562,196 +562,6 @@ where
             .insert_with(new_entry, should_replace, false, guard)
     }
 
-    // Update an entry with a remapping function.
-    pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
-    where
-        F: Fn(&V) -> V,
-    {
-        // The table has not yet been allocated.
-        if self.table.raw.is_null() {
-            return None;
-        }
-
-        // Initialize the entry we will be inserting.
-        let entry = Box::into_raw(Box::new(Entry {
-            key,
-            link: self.root.collector.link(),
-            value: MaybeUninit::uninit(),
-        }));
-
-        // Perform the update.
-        //
-        // Safety: We just allocated the entry above.
-        let result = unsafe { self.update_with(entry, update, true, guard) };
-        match result {
-            Some(value) => Some(value),
-            None => {
-                // Safety: We allocated this box above, and it was not inserted into the map.
-                let _ = unsafe { Box::from_raw(entry) };
-                None
-            }
-        }
-    }
-
-    // Update an entry with a remapping function.
-    //
-    // # Safety
-    //
-    // The new entry must be a valid pointer.
-    unsafe fn update_with<'g, F>(
-        &self,
-        new_entry: *mut Entry<K, MaybeUninit<V>>,
-        update: F,
-        help_copy: bool,
-        guard: &'g impl Guard,
-    ) -> Option<&'g V>
-    where
-        F: Fn(&V) -> V,
-    {
-        // Safety: The new entry is guaranteed to be valid by the caller.
-        let new_ref = unsafe { &*(new_entry).unpack().ptr };
-
-        // Initialize the probe state.
-        let (h1, h2) = self.hash(&new_ref.key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
-
-        // Probe until we reach the limit.
-        let copying = 'probe: loop {
-            if probe.len > limit {
-                break None;
-            }
-
-            // Load the entry metadata first for cheap searches.
-            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
-
-            // The key is not in the table.
-            //
-            // It also cannot be in the next table because we have not went over the probe limit.
-            if meta == meta::EMPTY {
-                return None;
-            }
-
-            // Check for a potential match.
-            if meta != h2 {
-                probe.next();
-                continue 'probe;
-            }
-
-            // Load the full entry.
-            let mut entry =
-                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
-
-            // The entry was deleted, keep probing.
-            if Entry::is_tombstone(entry) {
-                probe.next();
-                continue 'probe;
-            }
-
-            // Check for a full match.
-            fence(Ordering::Acquire);
-            if unsafe { (*entry.ptr).key != new_ref.key } {
-                probe.next();
-                continue 'probe;
-            }
-
-            // The entry is being copied to the new table, we have to complete the copy before
-            // we can update.
-            if entry.tag() & Entry::COPYING != 0 {
-                break 'probe Some(probe.i);
-            }
-
-            loop {
-                // Initialize the value to insert.
-                let value = update(&(*entry.ptr).value);
-                (*new_entry).value = MaybeUninit::new(value);
-
-                // Try to update the value.
-                let status = match self.update_at(probe.i, entry, new_entry.cast(), guard) {
-                    // Successfully performed the update.
-                    UpdateStatus::Replaced(_) => {
-                        // Return the value we inserted.
-                        return unsafe { Some((*new_entry).value.assume_init_ref()) };
-                    }
-                    status => status,
-                };
-
-                // Drop the previous value as we will no longer use it.
-                (*new_entry).value.assume_init_drop();
-
-                match status {
-                    // The entry is being copied to the new table, we have to complete the copy
-                    // before we can update.
-                    UpdateStatus::Found(EntryStatus::Copied(_)) => {
-                        break 'probe Some(probe.i);
-                    }
-
-                    // The entry was deleted.
-                    //
-                    // We know that at some point during our execution the key was not in the map.
-                    UpdateStatus::Found(EntryStatus::Null) => return None,
-
-                    // Lost to a concurrent update, retry.
-                    UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
-
-                    _ => unreachable!(),
-                }
-            }
-        };
-
-        match self.root.resize {
-            ResizeMode::Blocking => match copying {
-                // The entry we want to update is being copied.
-                Some(_) => {
-                    // In blocking mode we must complete the resize before proceeding.
-                    let next_table = self.help_copy(guard, false);
-
-                    // Continue in the new table.
-                    return self
-                        .as_ref(next_table)
-                        .update_with(new_entry, update, help_copy, guard);
-                }
-                // If we went over the probe limit, the key is not in this table.
-                None => None,
-            },
-
-            ResizeMode::Incremental(_) => {
-                // The entry we want to update is being copied.
-                if let Some(i) = copying {
-                    let next_table = self.next_table_ref().unwrap();
-
-                    // Help out with the copy.
-                    if help_copy {
-                        self.help_copy(guard, false);
-                    }
-
-                    // We could perform an update based on the copied entry and
-                    // race to insert it into the table here instead. However, this
-                    // entire code path is very rare and likely to complete quickly,
-                    // so blocking allows us to make copies faster.
-                    self.wait_copied(i);
-
-                    // Continue in the new table.
-                    return next_table.update_with(new_entry, update, false, guard);
-                }
-
-                // In incremental resize mode, we have to check the next table if we found
-                // a copied entry or went over the probe limit.
-                if let Some(next_table) = self.next_table_ref() {
-                    // Help out with the copy.
-                    if help_copy {
-                        self.help_copy(guard, false);
-                    }
-
-                    // Continue in the new table.
-                    return next_table.update_with(new_entry, update, false, guard);
-                }
-
-                // Otherwise, the key is not in the table.
-                None
-            }
-        }
-    }
-
     // Removes a key from the map, returning the entry for the key if the key was previously in the map.
     pub fn remove<'g, Q: ?Sized>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
@@ -1156,6 +966,418 @@ where
     {
         let hash = self.root.hasher.hash_one(key);
         (meta::h1(hash), meta::h2(hash))
+    }
+}
+
+// A wrapper around a CAS function that manages the computed state.
+struct ComputeState<F, K, V, T> {
+    compute: F,
+    insert: Option<V>,
+    update: Option<CachedUpdate<K, V, T>>,
+}
+
+struct CachedUpdate<K, V, T> {
+    input: *mut Entry<K, V>,
+    output: Operation<V, T>,
+}
+
+impl<'g, F, K, V, T> ComputeState<F, K, V, T>
+where
+    F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
+    K: 'g,
+    V: 'g,
+{
+    // Create a new `ComputeState` for the given function.
+    fn new(compute: F) -> ComputeState<F, K, V, T> {
+        ComputeState {
+            compute,
+            insert: None,
+            update: None,
+        }
+    }
+
+    // Performs a state transition.
+    fn next(&mut self, entry: Option<*mut Entry<K, V>>) -> Operation<V, T> {
+        match entry {
+            Some(entry) => match self.update.take() {
+                Some(CachedUpdate { input, output }) if input == entry => output,
+                _ => {
+                    let entry = unsafe { &*entry };
+                    (self.compute)(Some((&entry.key, &entry.value)))
+                }
+            },
+            None => match self.insert.take() {
+                Some(value) => Operation::Insert(value),
+                None => (self.compute)(None),
+            },
+        }
+    }
+
+    // Restores the state if an operation fails.
+    fn restore(&mut self, input: Option<*mut Entry<K, V>>, output: Operation<V, T>) {
+        match input {
+            Some(input) => self.update = Some(CachedUpdate { input, output }),
+            None => match output {
+                Operation::Insert(value) => self.insert = Some(value),
+                _ => unreachable!(),
+            },
+        }
+    }
+}
+
+// Update operations.
+impl<'root, K, V, S> HashMapRef<'root, K, V, S>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+{
+    // Updates an existing entry atomically, returning the value that was inserted.
+    pub fn update<'g, F>(&mut self, key: K, mut update: F, guard: &'g impl Guard) -> Option<&'g V>
+    where
+        F: FnMut(&V) -> V,
+        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+    {
+        let compute = |entry| match entry {
+            Some((_, value)) => Operation::Insert(update(value)),
+            None => Operation::Abort(()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Updated {
+                new: (_, value), ..
+            } => Some(value),
+            Compute::Aborted(_) => None,
+            _ => unreachable!(),
+        }
+    }
+
+    // Update an entry with a CAS function.
+    //
+    // Note that `compute` closure is guaranteed to be called for a `None` input only once, allowing the insertion
+    // of values that cannot be cloned or reconstructed.
+    pub fn compute<'g, F, T>(
+        &mut self,
+        key: K,
+        compute: F,
+        guard: &'g impl Guard,
+    ) -> Compute<'g, K, V, T>
+    where
+        F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
+    {
+        // Initialize the entry we will be inserting.
+        let entry = Box::into_raw(Box::new(Entry {
+            key,
+            link: self.root.collector.link(),
+            value: MaybeUninit::uninit(),
+        }));
+
+        // Perform the update.
+        //
+        // Safety: We just allocated the entry above.
+        let result = unsafe { self.compute_with(entry, ComputeState::new(compute), true, guard) };
+
+        // Deallocate the entry if it was not inserted.
+        if matches!(result, Compute::Removed(..) | Compute::Aborted(_)) {
+            // Safety: We allocated this box above and it was not inserted into the map.
+            let _ = unsafe { Box::from_raw(entry) };
+        }
+
+        result
+    }
+
+    // Update an entry with a CAS function.
+    //
+    // # Safety
+    //
+    // The new entry must be a valid pointer.
+    unsafe fn compute_with<'g, F, T>(
+        &mut self,
+        new_entry: *mut Entry<K, MaybeUninit<V>>,
+        mut state: ComputeState<F, K, V, T>,
+        help_copy: bool,
+        guard: &'g impl Guard,
+    ) -> Compute<'g, K, V, T>
+    where
+        F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
+    {
+        // The table has not yet been allocated.
+        if self.table.raw.is_null() {
+            // Compute the value to insert.
+            match state.next(None) {
+                op @ Operation::Insert(_) => state.restore(None, op),
+                Operation::Remove => panic!("Cannot remove `None` entry."),
+                Operation::Abort(value) => return Compute::Aborted(value),
+            }
+
+            // Initialize the table.
+            self.init(None);
+        }
+
+        // Safety: The new entry is guaranteed to be valid by the caller.
+        let key = unsafe { &(*new_entry).key };
+
+        // Initialize the probe state.
+        let (h1, h2) = self.hash(key);
+        let (mut probe, limit) = Probe::start(h1, self.table.len);
+
+        // Probe until we reach the limit.
+        let copying = 'probe: loop {
+            if probe.len > limit {
+                break None;
+            }
+
+            // Load the entry metadata first for cheap searches.
+            let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
+
+            // The entry is empty.
+            let mut entry = if meta == meta::EMPTY {
+                // Compute the value to insert.
+                let value = match state.next(None) {
+                    Operation::Insert(value) => value,
+                    Operation::Remove => panic!("Cannot remove `None` entry."),
+                    Operation::Abort(value) => return Compute::Aborted(value),
+                };
+
+                unsafe { (*new_entry).value = MaybeUninit::new(value) }
+
+                // Attempt to insert.
+                match self.insert_at(probe.i, h2, new_entry.cast(), guard) {
+                    // Successfully inserted.
+                    InsertStatus::Inserted => {
+                        // Increment the table length.
+                        let count = self.root.count.get(guard.thread_id());
+                        count.fetch_add(1, Ordering::Relaxed);
+
+                        let new = unsafe { &*new_entry.cast::<Entry<K, V>>() };
+                        return Compute::Inserted(&new.key, &new.value);
+                    }
+
+                    // Lost to a concurrent insert.
+                    //
+                    // If the key matches, we might be able to update the value.
+                    InsertStatus::Found(EntryStatus::Value(found))
+                    | InsertStatus::Found(EntryStatus::Copied(found)) => {
+                        // Save the previous value in case the update fails.
+                        let value = unsafe { (*new_entry).value.assume_init_read() };
+                        state.restore(None, Operation::Insert(value));
+
+                        found
+                    }
+
+                    // The entry was removed or invalidated.
+                    InsertStatus::Found(EntryStatus::Null) => {
+                        // Save the previous value.
+                        let value = unsafe { (*new_entry).value.assume_init_read() };
+                        state.restore(None, Operation::Insert(value));
+
+                        // Continue probing.
+                        probe.next();
+                        continue 'probe;
+                    }
+                }
+            }
+            // Found a potential match.
+            else if meta == h2 {
+                // Load the full entry.
+                let found = guard
+                    .protect(self.table.entry(probe.i), Ordering::Relaxed)
+                    .unpack();
+
+                // The entry was deleted, keep probing.
+                if Entry::is_tombstone(found) {
+                    probe.next();
+                    continue 'probe;
+                }
+
+                // If the key matches, we might be able to update the value.
+                found
+            }
+            // Otherwise, continue probing.
+            else {
+                probe.next();
+                continue 'probe;
+            };
+
+            // Check for a full match.
+            fence(Ordering::Acquire);
+            if unsafe { (*entry.ptr).key != *key } {
+                probe.next();
+                continue 'probe;
+            }
+
+            // The entry is being copied to the new table.
+            if entry.tag() & Entry::COPYING != 0 {
+                break 'probe Some(probe.i);
+            }
+
+            loop {
+                // Compute the value to insert.
+                let failure = match state.next(Some(entry.ptr)) {
+                    // The operation was aborted.
+                    Operation::Abort(value) => return Compute::Aborted(value),
+
+                    // Update the value.
+                    Operation::Insert(value) => {
+                        unsafe { (*new_entry).value = MaybeUninit::new(value) }
+
+                        // Try to perform the update.
+                        match self.update_at(probe.i, entry, new_entry.cast(), guard) {
+                            // Successfully updated.
+                            UpdateStatus::Replaced(entry) => {
+                                let old = unsafe { &(*entry.ptr) };
+                                let new = unsafe { &*new_entry.cast::<Entry<K, V>>() };
+
+                                return Compute::Updated {
+                                    old: (&old.key, &old.value),
+                                    new: (&new.key, &new.value),
+                                };
+                            }
+
+                            // The update failed.
+                            failure => {
+                                // Save the previous value.
+                                let value = unsafe { (*new_entry).value.assume_init_read() };
+                                state.restore(Some(entry.ptr), Operation::Insert(value));
+
+                                failure
+                            }
+                        }
+                    }
+                    Operation::Remove => {
+                        match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
+                            // Successfully removed the entry.
+                            UpdateStatus::Replaced(entry) => {
+                                // Mark the entry as a tombstone.
+                                //
+                                // Note that this might end up being overwritten by the metadata hash
+                                // if the initial insertion is lagging behind, but we avoid the RMW
+                                // and sacrifice reads in the extremely rare case.
+                                unsafe {
+                                    self.table
+                                        .meta(probe.i)
+                                        .store(meta::TOMBSTONE, Ordering::Release)
+                                };
+
+                                // Decrement the table length.
+                                let count = self.root.count.get(guard.thread_id());
+                                count.fetch_sub(1, Ordering::Relaxed);
+
+                                let entry = unsafe { &(*entry.ptr) };
+                                return Compute::Removed(&entry.key, &entry.value);
+                            }
+
+                            // The remove failed.
+                            failure => {
+                                // Save the removal operation.
+                                state.restore(Some(entry.ptr), Operation::Remove);
+
+                                failure
+                            }
+                        }
+                    }
+                };
+
+                match failure {
+                    // The entry is being copied to the new table.
+                    UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
+
+                    // The entry was deleted before we could update it.
+                    //
+                    // We know that at some point during our execution the key was not in the map.
+                    UpdateStatus::Found(EntryStatus::Null) => {
+                        // Compute the next operation.
+                        match state.next(None) {
+                            Operation::Insert(value) => {
+                                // Save the computed value.
+                                state.restore(None, Operation::Insert(value));
+
+                                // Continue probing to find an empty slot.
+                                probe.next();
+                                continue 'probe;
+                            }
+                            Operation::Remove => panic!("Cannot remove `None` entry."),
+                            Operation::Abort(value) => return Compute::Aborted(value),
+                        }
+                    }
+
+                    // Someone else beat us to the update, retry.
+                    UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
+
+                    _ => unreachable!(),
+                }
+            }
+        };
+
+        match self.root.resize {
+            ResizeMode::Blocking => match copying {
+                // The entry we want to update is being copied.
+                Some(_) => {
+                    // In blocking mode we must complete the resize before proceeding.
+                    let next_table = self.help_copy(guard, false);
+
+                    // Continue in the new table.
+                    return self
+                        .as_ref(next_table)
+                        .compute_with(new_entry, state, help_copy, guard);
+                }
+                // If we went over the probe limit, the key is not in this table.
+                None => {}
+            },
+
+            ResizeMode::Incremental(_) => {
+                // The entry we want to update is being copied.
+                if let Some(i) = copying {
+                    let mut next_table = self.next_table_ref().unwrap();
+
+                    // Help out with the copy.
+                    if help_copy {
+                        self.help_copy(guard, false);
+                    }
+
+                    // Wait for the entry to be copied.
+                    //
+                    // We could perform an update based on the copied entry and
+                    // race to insert it into the table here instead. However, this
+                    // entire code path is very rare and likely to complete quickly,
+                    // so blocking allows us to make copies faster.
+                    self.wait_copied(i);
+
+                    // Continue in the new table.
+                    return next_table.compute_with(new_entry, state, false, guard);
+                }
+
+                // In incremental resize mode, we have to check the next table if we found
+                // a copied entry or went over the probe limit.
+                if let Some(mut next_table) = self.next_table_ref() {
+                    // Help out with the copy.
+                    if help_copy {
+                        self.help_copy(guard, false);
+                    }
+
+                    // Continue in the new table.
+                    return next_table.compute_with(new_entry, state, false, guard);
+                }
+            }
+        }
+
+        // Otherwise, the key is not in the table.
+        match state.next(None) {
+            // Need to insert into the new table.
+            op @ Operation::Insert(_) => {
+                // Trigger a resize.
+                self.get_or_alloc_next(None);
+
+                // Help out with the resize.
+                let next_table = self.help_copy(guard, false);
+
+                state.restore(None, op);
+                return self
+                    .as_ref(next_table)
+                    .compute_with(new_entry, state, help_copy, guard);
+            }
+            Operation::Remove => panic!("Cannot remove `None` entry."),
+            Operation::Abort(value) => return Compute::Aborted(value),
+        }
     }
 }
 

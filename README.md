@@ -80,6 +80,43 @@ Aggregate operations, such as iterators, rely on a weak snapshot of the table an
 
 ## Atomic Operations
 
+As mentioned above, `papaya` does not support locking keys to prevent access, which makes performing complex operations more challenging. Instead, `papaya` exposes a number of atomic operations. The most basic of these is `HashMap::update`, which can be used to update an existing value in the map using a closure:
+
+```rust
+let map = papaya::HashMap::new();
+map.pin().insert("poneyland", 42);
+assert_eq!(map.pin().update("poneyland", |e| e + 1), Some(&43));
+```
+
+Note that in the event that the entry is concurrently modified during an `update`, the closure may be called multiple times to retry the operation, instead of locking. For this reason, update operations are intended to be quick and *pure*, as they may be retried or internally memoized.
+
+`papaya` also exposes more powerful atomic operations that serve as a replacement for the [standard entry API](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html), which relies on unique references to a given entry. These include:
+
+- [`HashMap::update`]
+- [`HashMap::update_or_insert`]
+- [`HashMap::update_or_insert_with`]
+- [`HashMap::get_or_insert`]
+- [`HashMap::get_or_insert_with`]
+- [`HashMap::compute`]
+
+For example, with a standard `HashMap`, `Entry::and_modify` is often paired with `Entry::or_insert`:
+
+```rust
+let mut map = std::collections::HashMap::new();
+map.entry("poneyland")
+   .and_modify(|e| { *e += 1 })
+   .or_insert(42);
+```
+
+However, implementing this with a concurrent `HashMap` is tricky as the entry may be modified in-between operations. Instead, you can write the above operation using [`HashMap::update_or_insert`]:
+
+```rust
+let map = papaya::HashMap::new();
+map.pin().update_or_insert("poneyland", |e| e + 1, 42);
+```
+
+Atomic operations are extremely powerful but are also easy to misuse. They may be less efficient than update mechanisms tailored for the specific type of data in the map. For example, concurrent counters should avoid using `update` and instead use `AtomicUsize`. Entries that are frequently modified may also benefit from fine-grained locking.
+
 ## Async Support
 
 By default, a pinned map guard does not implement `Send` as it is tied to the current thread, similar to a lock. This leads to an issue in work-stealing schedulers as guards are not valid across `.await` points.
@@ -112,7 +149,7 @@ tokio::spawn(async move {
 
 You may run into issues when you try to return a reference to a map contained within an outer type. For example:
 
-```rust,ignore
+```rust,compile_fail
 pub struct Metrics {
     map: papaya::HashMap<String, Vec<u64>>
 }

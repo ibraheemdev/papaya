@@ -4,5 +4,8 @@
 mod map;
 mod raw;
 
-pub use map::{HashMap, HashMapBuilder, HashMapRef, Iter, Keys, ResizeMode, Values};
+pub use map::{
+    Compute, HashMap, HashMapBuilder, HashMapRef, Iter, Keys, OccupiedError, Operation, ResizeMode,
+    Values,
+};
 pub use seize::Guard;
