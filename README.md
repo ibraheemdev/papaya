@@ -14,7 +14,7 @@ A fast and ergonomic concurrent hash-table that features:
 The top-level crate documentation is organized as follows:
 
 - [Usage](#usage) shows how to interact with the concurrent `HashMap`.
-- [Consistency](#consistency) describes the consistency of concurrent operations.
+- [Consistency](#consistency) describes the guarantees of concurrent operations.
 - [Atomic Operations](#atomic-operations) shows how to perform dynamic operations atomically.
 - [Async Support](#async-support) shows how to use the map in an async context.
 - [Advanced Lifetimes](#advanced-lifetimes) explains how to use guards when working with nested types.
@@ -22,7 +22,7 @@ The top-level crate documentation is organized as follows:
 
 ## Usage
 
-`papaya` aims to provide an ergonomic API without sacrificing performance. The `HashMap` provided by this crate exposes a lock-free API and can hand out direct references to objects in the map without the need for wrapper types that are clunky and prone to deadlocks. 
+`papaya` aims to provide an ergonomic API without sacrificing performance. `HashMap` exposes a lock-free API and can hand out direct references to objects in the map without the need for wrapper types that are clunky and prone to deadlocks. 
 
 However, you can't hold on to references forever due to concurrent removals. Because of this, the `HashMap` API is structured around *pinning*. Through a pin you can access the map just like a standard `HashMap`. A pin is similar to a lock guard, so any references that are returned will be tied to the lifetime of the guard. Unlike a lock however, pinning is cheap and can never cause deadlocks.
 
@@ -88,16 +88,16 @@ map.pin().insert("poneyland", 42);
 assert_eq!(map.pin().update("poneyland", |e| e + 1), Some(&43));
 ```
 
-Note that in the event that the entry is concurrently modified during an `update`, the closure may be called multiple times to retry the operation, instead of locking. For this reason, update operations are intended to be quick and *pure*, as they may be retried or internally memoized.
+Note that in the event that the entry is concurrently modified during an `update`, the closure may be called multiple times to retry the operation. For this reason, update operations are intended to be quick and *pure*, as they may be retried or internally memoized.
 
-`papaya` also exposes more powerful atomic operations that serve as a replacement for the [standard entry API](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html), which relies on unique references to a given entry. These include:
+`papaya` also exposes more powerful atomic operations that serve as a replacement for the [standard entry API](https://doc.rust-lang.org/std/collections/hash_map/enum.Entry.html). These include:
 
-- [`HashMap::update`]
-- [`HashMap::update_or_insert`]
-- [`HashMap::update_or_insert_with`]
-- [`HashMap::get_or_insert`]
-- [`HashMap::get_or_insert_with`]
-- [`HashMap::compute`]
+- [`HashMap::update`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.update)
+- [`HashMap::update_or_insert`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.update_or_insert)
+- [`HashMap::update_or_insert_with`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.update_or_insert_with)
+- [`HashMap::get_or_insert`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.get_or_insert)
+- [`HashMap::get_or_insert_with`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.get_or_insert_with)
+- [`HashMap::compute`](https://docs.rs/papaya/latest/papaya/struct.HashMap.html#method.compute)
 
 For example, with a standard `HashMap`, `Entry::and_modify` is often paired with `Entry::or_insert`:
 
@@ -115,11 +115,11 @@ let map = papaya::HashMap::new();
 map.pin().update_or_insert("poneyland", |e| e + 1, 42);
 ```
 
-Atomic operations are extremely powerful but are also easy to misuse. They may be less efficient than update mechanisms tailored for the specific type of data in the map. For example, concurrent counters should avoid using `update` and instead use `AtomicUsize`. Entries that are frequently modified may also benefit from fine-grained locking.
+Atomic operations are extremely powerful but also easy to misuse. They may be less efficient than update mechanisms tailored for the specific type of data in the map. For example, concurrent counters should avoid using `update` and instead use `AtomicUsize`. Entries that are frequently modified may also benefit from fine-grained locking.
 
 ## Async Support
 
-By default, a pinned map guard does not implement `Send` as it is tied to the current thread, similar to a lock. This leads to an issue in work-stealing schedulers as guards are not valid across `.await` points.
+By default, a pinned map guard does not implement `Send` as it is tied to the current thread, similar to a lock guard. This leads to an issue in work-stealing schedulers as guards are not valid across `.await` points.
 
 To overcome this, you can use an *owned* guard.
 
@@ -162,7 +162,7 @@ impl Metrics {
 }
 ```
 
-This is a similar issue to that of locks, as the guard is created within the method and cannot be referenced outside of it. The solution is to accept a guard in the method directly, tying the lifetime to the caller's stack frame:
+The solution is to accept a guard in the method directly, tying the lifetime to the caller's stack frame:
 
 ```rust
 use papaya::Guard;
@@ -182,13 +182,13 @@ impl Metrics {
 }
 ```
 
-The `Guard` trait supports both local and owned guards. Note the `'guard` lifetime that ties the guard to the returned reference. No complicated wrapper types or closure mapping is necessary.
+The `Guard` trait supports both local and owned guards. Note the `'guard` lifetime that ties the guard to the returned reference. No wrapper types or guard mapping is necessary.
 
 ## Performance
 
-`papaya` is built with read-heavy workloads in mind. As such, reads are extremely scalable and provide consistent performance that scales with concurrency, meaning `papaya` will excel in any workload in which reads are more common than writes. In write heavy workloads, `papaya` will still provide competitive performance despite not being it's primary use case. See the [benchmarks] for details.
+`papaya` is built with read-heavy workloads in mind. As such, read operations are extremely high throughput and provide consistent performance that scales with concurrency, meaning `papaya` will excel in any workload in which reads are more common than writes. In write heavy workloads, `papaya` will still provide competitive performance despite not being it's primary use case. See the [benchmarks] for details.
 
-`papaya` also aims to provide predictable, consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing], meaning operations aren't required to block when resizing the hash-table. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
+`papaya` also aims to provide predictable, consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing]. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
 
 [benchmarks]: TODO
 [`seize`]: https://docs.rs/seize/latest
