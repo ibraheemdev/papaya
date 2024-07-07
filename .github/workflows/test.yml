@@ -17,6 +17,7 @@ name: test
 jobs:
   required:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     name: ubuntu / ${{ matrix.toolchain }}
     strategy:
       matrix:
@@ -44,6 +45,7 @@ jobs:
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     name: ${{ matrix.os }} / stable
     strategy:
       fail-fast: false
