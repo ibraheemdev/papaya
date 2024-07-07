@@ -470,8 +470,9 @@ where
             // Found a potential match.
             else if meta == h2 {
                 // Load the full entry.
-                let entry = self.table.entry(probe.i);
-                let found = guard.protect(entry, Ordering::Relaxed).unpack();
+                let found = guard
+                    .protect(self.table.entry(probe.i), Ordering::Relaxed)
+                    .unpack();
 
                 // The entry was deleted, keep probing.
                 if Entry::is_tombstone(found) {
@@ -520,7 +521,10 @@ where
                     UpdateStatus::Found(EntryStatus::Copied(_)) => break 'probe Some(probe.i),
 
                     // The entry was deleted before we could update it, continue probing.
-                    UpdateStatus::Found(EntryStatus::Null) => {}
+                    UpdateStatus::Found(EntryStatus::Null) => {
+                        probe.next();
+                        continue 'probe;
+                    }
 
                     // Someone else beat us to the update, retry.
                     UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
