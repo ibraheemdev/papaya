@@ -1,11 +1,12 @@
-// Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
-
-use papaya::HashMap;
+use papaya::{Compute, HashMap, Operation};
 use rand::prelude::*;
 
+use std::hash::Hash;
+use std::ops::Range;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Barrier;
 use std::thread;
-use std::{hash::Hash, ops::Range};
 
 mod common;
 use common::{threads, with_map};
@@ -61,16 +62,11 @@ fn insert_stress() {
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
 
-    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
-    struct KeyVal {
-        _data: usize,
-    }
+    #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
+    struct Random(usize);
 
-    impl KeyVal {
-        pub fn new() -> Self {
-            let mut rng = rand::thread_rng();
-            Self { _data: rng.gen() }
-        }
+    fn random() -> Random {
+        Random(rand::thread_rng().gen())
     }
 
     with_map(|map| {
@@ -83,7 +79,7 @@ fn insert_stress() {
                     s.spawn(|| {
                         barrier.wait();
                         for _ in 0..ENTRIES {
-                            let key = KeyVal::new();
+                            let key = random();
                             map.insert(key, key, &map.guard());
                             assert!(map.contains_key(&key, &map.guard()));
                         }
@@ -95,15 +91,105 @@ fn insert_stress() {
     });
 }
 
-// Call `update` in parallel for a shared set of keys.
+// Call `insert` in parallel on a small shared set of keys.
 #[test]
-fn update_stress() {
-    const ENTRIES: usize = match () {
-        _ if cfg!(miri) => 64,
-        _ if resize_stress!() || asan!() => 1 << 12,
-        _ => 1 << 14,
+fn insert_overwrite_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 9,
+        _ => 1 << 10,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let counters = (0..ENTRIES)
+                .map(|_| AtomicUsize::new(0))
+                .collect::<Vec<_>>();
+
+            let threads = threads();
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                let mut handles = Vec::with_capacity(threads);
+                for _ in 0..threads {
+                    let h = s.spawn(|| {
+                        let mut seen = (0..ENTRIES)
+                            .map(|_| Vec::with_capacity(OPERATIONS))
+                            .collect::<Vec<_>>();
+                        let entries = entries();
+
+                        barrier.wait();
+                        for i in entries {
+                            let value = counters[i].fetch_add(1, Ordering::Relaxed);
+                            if let Some(&prev) = map.insert(i, value, &map.guard()) {
+                                // Keep track of values we overwrite.
+                                seen[i].push(prev);
+                            }
+                            assert!(map.contains_key(&i, &map.guard()));
+                        }
+                        seen
+                    });
+                    handles.push(h);
+                }
+
+                let mut seen = (0..ENTRIES)
+                    .map(|_| Vec::<usize>::with_capacity(threads * OPERATIONS))
+                    .collect::<Vec<_>>();
+
+                for h in handles {
+                    let values = h.join().unwrap();
+                    for (i, values) in values.iter().enumerate() {
+                        seen[i].extend(values);
+                    }
+                }
+                for i in 0..seen.len() {
+                    seen[i].push(*map.pin().get(&i).unwrap());
+                }
+
+                // Ensure every insert operation was consistent.
+                let operations = (0..(threads * OPERATIONS)).collect::<Vec<_>>();
+                for mut values in seen {
+                    values.sort();
+                    assert_eq!(values, operations);
+                }
+            });
+
+            assert_eq!(map.len(), ENTRIES);
+        }
+    });
+}
+
+// Call `update` in parallel for a small shared set of keys.
+#[test]
+fn update_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 10,
+        _ => 1 << 11,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
 
     with_map(|map| {
         for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
@@ -122,11 +208,12 @@ fn update_stress() {
             thread::scope(|s| {
                 for _ in 0..threads {
                     s.spawn(|| {
+                        let entries = entries();
                         barrier.wait();
-                        let guard = map.guard();
-                        for i in 0..ENTRIES {
+                        for i in entries {
+                            let guard = map.guard();
                             let new = *map.update(i, |v| v + 1, &guard).unwrap();
-                            assert!((0..=threads).contains(&new));
+                            assert!((0..=(threads * OPERATIONS)).contains(&new));
                         }
                     });
                 }
@@ -134,14 +221,14 @@ fn update_stress() {
 
             let guard = map.guard();
             for i in 0..ENTRIES {
-                assert_eq!(*map.get(&i, &guard).unwrap(), threads);
+                assert_eq!(*map.get(&i, &guard).unwrap(), threads * OPERATIONS);
             }
         }
     });
 }
 
 // Call `update` in parallel for a shared set of keys, with a single thread dedicated
-// to calling `insert`. This is likely to cause interference with incremental resizing.
+// to inserting unrelated keys. This is likely to cause interference with incremental resizing.
 #[test]
 fn update_insert_stress() {
     const ENTRIES: usize = match () {
@@ -181,7 +268,7 @@ fn update_insert_stress() {
                 s.spawn(|| {
                     barrier.wait();
                     let guard = map.guard();
-                    for i in ENTRIES..(ENTRIES * 3) {
+                    for i in ENTRIES..(ENTRIES * 2) {
                         map.insert(i, usize::MAX, &guard);
                     }
                 });
@@ -192,9 +279,377 @@ fn update_insert_stress() {
                 assert_eq!(*map.get(&i, &guard).unwrap(), (threads - 1) * (t + 1));
             }
 
-            for i in ENTRIES..(ENTRIES * 3) {
+            for i in ENTRIES..(ENTRIES * 2) {
                 assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
             }
+        }
+    });
+}
+
+// Call `update_or_insert` in parallel for a small shared set of keys.
+// Stresses the `insert` -> `update` transition in `compute`.
+#[test]
+fn update_or_insert_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 10,
+        _ => 1 << 11,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let threads = threads();
+
+    let entries = (0..(threads * OPERATIONS))
+        .flat_map(|_| (0..ENTRIES))
+        .collect::<Vec<_>>();
+
+    let chunk = ENTRIES * OPERATIONS;
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let mut entries = entries.clone();
+            let mut rng = rand::thread_rng();
+            entries.shuffle(&mut rng);
+
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                for t in 0..threads {
+                    let range = (chunk * t)..(chunk * (t + 1));
+
+                    s.spawn(|| {
+                        barrier.wait();
+                        let guard = map.guard();
+                        for i in &entries[range] {
+                            map.update_or_insert(i, |v| v + 1, 1, &guard);
+                        }
+                    });
+                }
+            });
+
+            let guard = map.guard();
+            for i in 0..ENTRIES {
+                assert_eq!(*map.get(&i, &guard).unwrap(), threads * OPERATIONS);
+            }
+
+            assert_eq!(map.len(), ENTRIES);
+        }
+    });
+}
+
+// Call `update_or_insert` in parallel for a small shared set of keys, with some
+// threads removing and reinserting values.
+//
+// Stresses the `update` <-> `insert` transition in `compute`.
+#[test]
+fn remove_update_or_insert_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 4,
+        _ => 1 << 7,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let threads = threads();
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let group = threads.checked_div(2).unwrap();
+            let barrier = Barrier::new(threads + 1);
+            thread::scope(|s| {
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+                        for i in entries {
+                            map.update_or_insert(i, |v| v + 1, 1, &guard);
+                        }
+                    });
+                }
+
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+
+                        for i in entries {
+                            if let Some(&value) = map.remove(&i, &guard) {
+                                map.update_or_insert(i, |v| v + value, value, &guard);
+                            }
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                        map.insert(i, usize::MAX, &guard);
+                    }
+                });
+            });
+
+            let guard = map.guard();
+            assert_eq!(map.len(), ENTRIES * OPERATIONS);
+
+            for i in 0..ENTRIES {
+                assert_eq!(*map.get(&i, &guard).unwrap(), group * OPERATIONS);
+            }
+
+            for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
+            }
+        }
+    });
+}
+
+// Call `update_or_insert` in parallel for a small shared set of keys, with some
+// threads conditionally removing and reinserting values.
+//
+// Stresses the `remove` <-> `update` transition in `compute`.
+#[test]
+fn conditional_remove_update_or_insert_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 4,
+        _ => 1 << 7,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let threads = threads();
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let group = threads.checked_div(2).unwrap();
+            let barrier = Barrier::new(threads + 1);
+            thread::scope(|s| {
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+                        for i in entries {
+                            map.update_or_insert(i, |v| v + 1, 1, &guard);
+                        }
+                    });
+                }
+
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+
+                        for i in entries {
+                            let compute = |entry| match entry {
+                                Some((_, value)) if value % 2 == 0 => Operation::Remove,
+                                _ => Operation::Abort(()),
+                            };
+
+                            if let Compute::Removed(_, &value) = map.compute(i, compute, &guard) {
+                                map.update_or_insert(i, |v| v + value, value, &guard);
+                            }
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                        map.insert(i, usize::MAX, &guard);
+                    }
+                });
+            });
+
+            let guard = map.guard();
+            assert_eq!(map.len(), ENTRIES * OPERATIONS);
+
+            for i in 0..ENTRIES {
+                assert_eq!(*map.get(&i, &guard).unwrap(), group * OPERATIONS);
+            }
+
+            for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
+            }
+        }
+    });
+}
+
+// Call `remove` and `insert` in parallel for a shared set of keys.
+#[test]
+fn insert_remove_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if resize_stress!() || asan!() => 1 << 7,
+        _ => 1 << 7,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
+
+    let threads = threads();
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let group = threads.checked_div(2).unwrap();
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+
+                        let guard = map.guard();
+                        for i in entries {
+                            map.insert(i, i, &guard);
+                        }
+                    });
+                }
+
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+
+                        let guard = map.guard();
+                        for i in entries {
+                            if map.remove(&i, &guard).is_some() {
+                                map.insert(i, i, &guard);
+                            }
+                        }
+                    });
+                }
+            });
+
+            let guard = map.guard();
+            assert_eq!(map.len(), ENTRIES);
+
+            for i in 0..ENTRIES {
+                assert_eq!(map.get(&i, &guard), Some(&i));
+            }
+        }
+    });
+}
+
+// Call `remove` in parallel for a shared set of keys with other threads calling `update`,
+// and a dedicated thread for inserting unrelated keys. This is likely to cause interference
+// with incremental resizing.
+#[test]
+fn remove_mixed_stress() {
+    const ENTRIES: usize = match () {
+        _ if cfg!(miri) => 64,
+        _ if resize_stress!() || asan!() => 1 << 12,
+        _ => 1 << 14,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            {
+                let guard = map.guard();
+                for i in 0..ENTRIES {
+                    map.insert(i, 0, &guard);
+                }
+            }
+
+            let threads = threads().max(3);
+            let barrier = Barrier::new(threads);
+
+            thread::scope(|s| {
+                for _ in 0..(threads - 2) {
+                    s.spawn(|| {
+                        let mut entries = (0..ENTRIES).collect::<Vec<_>>();
+                        let mut rng = rand::thread_rng();
+                        entries.shuffle(&mut rng);
+
+                        barrier.wait();
+                        let guard = map.guard();
+
+                        loop {
+                            let mut empty = true;
+                            for &i in entries.iter() {
+                                if map.update(i, |v| v + 1, &guard).is_some() {
+                                    empty = false;
+                                }
+                            }
+                            if empty {
+                                break;
+                            }
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in 0..ENTRIES {
+                        map.remove(&i, &guard);
+                    }
+
+                    for i in 0..ENTRIES {
+                        assert_eq!(map.get(&i, &guard), None);
+                    }
+                });
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in ENTRIES..(ENTRIES * 2) {
+                        map.insert(i, usize::MAX, &guard);
+                    }
+                });
+            });
+
+            let guard = map.guard();
+            for i in 0..ENTRIES {
+                assert_eq!(map.get(&i, &guard), None);
+            }
+
+            for i in ENTRIES..(ENTRIES * 2) {
+                assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
+            }
+
+            assert_eq!(map.len(), ENTRIES);
         }
     });
 }
@@ -341,7 +796,7 @@ fn mixed_entry_stress() {
     });
 }
 
-// Performs a mix of operations on a single thread.
+// Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
 #[test]
 fn everything() {
     const SIZE: usize = match () {
