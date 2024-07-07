@@ -1494,8 +1494,17 @@ where
         let next_capacity = match option_env!("PAPAYA_RESIZE_STRESS") {
             // Never grow the table to stress the incremental resizing algorithm.
             Some(_) => self.table.len,
-            // Double the table capacity.
-            None => self.table.len << 1,
+            // Double the table capacity if we are at least 50% full.
+            //
+            // Loading the length here is quite expensive, we may want to consider
+            // a probabilistic counter to detect high-deletion workloads.
+            None if self.root.len() >= (self.table.len >> 1) => self.table.len << 1,
+            // Otherwise keep the capacity the same.
+            //
+            // This can occur due to poor hash distribution or frequent cycling of
+            // insertions and deletions, in which case we want to avoid continuously
+            // growing the table.
+            None => self.table.len,
         };
 
         let next_capacity = capacity.unwrap_or(next_capacity);
