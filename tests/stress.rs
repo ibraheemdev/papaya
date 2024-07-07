@@ -16,7 +16,7 @@ use common::{threads, with_map};
 fn contains_key_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() || asan!() => 1 << 12,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -57,7 +57,7 @@ fn contains_key_stress() {
 fn insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() || asan!() => 1 << 11,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -97,7 +97,7 @@ fn insert_overwrite_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 9,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 9,
         _ => 1 << 10,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -177,7 +177,7 @@ fn update_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
         _ => 1 << 11,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -233,7 +233,7 @@ fn update_stress() {
 fn update_insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() || asan!() => 1 << 12,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -293,7 +293,7 @@ fn update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
         _ => 1 << 11,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -348,7 +348,7 @@ fn remove_update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 4,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 4,
         _ => 1 << 7,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -428,7 +428,7 @@ fn conditional_remove_update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 4,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 4,
         _ => 1 << 7,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -510,7 +510,7 @@ fn insert_remove_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if resize_stress!() || asan!() => 1 << 7,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 7,
         _ => 1 << 7,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -576,7 +576,7 @@ fn insert_remove_stress() {
 fn remove_mixed_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if resize_stress!() || asan!() => 1 << 12,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -659,7 +659,7 @@ fn remove_mixed_stress() {
 fn mixed_chunk_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 48,
-        _ if resize_stress!() || asan!() => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
         _ => 1 << 14,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -696,7 +696,7 @@ fn mixed_chunk_stress() {
                 assert_eq!(map.pin().get(&i), Some(&(i + 1)));
             }
 
-            if !resize_stress!() {
+            if !cfg!(papaya_stress) {
                 for (&k, &v) in map.pin().iter() {
                     assert!(k < ENTRIES * threads);
                     assert!(v == k || v == k + 1);
@@ -720,7 +720,7 @@ fn mixed_chunk_stress() {
                 }
             });
 
-            if !resize_stress!() {
+            if !cfg!(papaya_stress) {
                 let v: Vec<_> = (0..ENTRIES * threads).map(|i| (i, i + 1)).collect();
                 let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
                 got.sort();
@@ -738,7 +738,7 @@ fn mixed_chunk_stress() {
 fn mixed_entry_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 100,
-        _ if resize_stress!() || asan!() => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
         _ => 1 << 10,
     };
     const OPERATIONS: usize = if cfg!(miri) { 1 } else { 72 };
@@ -763,7 +763,7 @@ fn mixed_entry_stress() {
                 assert_eq!(map.pin().get(&i), None);
             }
 
-            if !resize_stress!() {
+            if !cfg!(papaya_stress) {
                 for (&k, &v) in map.pin().iter() {
                     assert!(k < ENTRIES * threads);
                     assert!(v == k + 1 || v == k + 2);
@@ -787,7 +787,7 @@ fn mixed_entry_stress() {
                 }
             });
 
-            if !resize_stress!() {
+            if !cfg!(papaya_stress) {
                 let got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
                 assert_eq!(got, []);
             }
@@ -801,7 +801,7 @@ fn mixed_entry_stress() {
 fn everything() {
     const SIZE: usize = match () {
         _ if cfg!(miri) => 1 << 5,
-        _ if resize_stress!() || asan!() => 1 << 8,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 8,
         _ => 1 << 16,
     };
     // there must be more things absent than present!
@@ -841,7 +841,7 @@ fn everything() {
         t3(&map, keys, SIZE / 2);
 
         // iter, keys, values (present)
-        if !resize_stress!() {
+        if !cfg!(papaya_stress) {
             ittest1(&map, SIZE);
             ittest2(&map, SIZE);
             ittest3(&map, SIZE);

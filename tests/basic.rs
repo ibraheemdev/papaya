@@ -422,7 +422,7 @@ fn concurrent_update() {
 #[test]
 #[cfg_attr(miri, ignore)]
 fn concurrent_resize_and_get() {
-    if resize_stress!() {
+    if cfg!(papaya_stress) {
         return;
     }
 
@@ -617,7 +617,7 @@ fn debug() {
 
 #[test]
 fn extend() {
-    if resize_stress!() {
+    if cfg!(papaya_stress) {
         return;
     }
 
@@ -642,7 +642,7 @@ fn extend() {
 
 #[test]
 fn extend_ref() {
-    if resize_stress!() {
+    if cfg!(papaya_stress) {
         return;
     }
 
@@ -685,7 +685,7 @@ fn len() {
 
 #[test]
 fn iter() {
-    if resize_stress!() {
+    if cfg!(papaya_stress) {
         return;
     }
 

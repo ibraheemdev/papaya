@@ -5,7 +5,7 @@ use papaya::{HashMap, ResizeMode};
 // Run the test on different configurations of a `HashMap`.
 pub fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
     // Blocking resize mode.
-    if !crate::resize_stress!() {
+    if !cfg!(papaya_stress) {
         test(&(|| HashMap::builder().resize_mode(ResizeMode::Blocking).build()));
     }
 
@@ -36,26 +36,6 @@ macro_rules! debug {
         if std::env::var("RUST_LOG").as_deref() == Ok("debug") {
             println!($($x)*);
         }
-    };
-}
-
-// Returns a `bool` indicating whether resize stress is enabled.
-//
-// If this is true, linearizable operations such as iteration cannot be
-// performed and will block indefinitely.
-#[macro_export]
-macro_rules! resize_stress {
-    () => {
-        option_env!("PAPAYA_RESIZE_STRESS").is_some()
-    };
-}
-
-// Returns a `bool` indicating whether the program is running under
-// address sanitizer.
-#[macro_export]
-macro_rules! asan {
-    () => {
-        option_env!("ADDRESS_SANITIZER").is_some()
     };
 }
 
