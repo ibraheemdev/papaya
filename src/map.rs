@@ -138,7 +138,7 @@ pub enum ResizeMode {
     /// in-progress resize may have to search both the current and new table before succeeding, trading
     /// off median latency during a resize for tail latency.
     ///
-    /// This is the default resize mode, with a chunk size of `32`.
+    /// This is the default resize mode, with a chunk size of `64`.
     Incremental(usize),
     /// All writes to the map must wait till the resize completes before making progress.
     ///

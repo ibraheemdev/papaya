@@ -154,24 +154,17 @@ impl<K, V> utils::Unpack for Entry<K, V> {
 }
 
 impl<K, V> Entry<K, V> {
-    // Checks whether this entry represents a tombstone.
-    #[inline]
-    fn is_tombstone(entry: Tagged<Entry<K, V>>) -> bool {
-        // Null pointers are never copied to the new table, so this state is safe to use.
-        entry.ptr.is_null() && (entry.tag() & Entry::COPIED != 0)
-    }
-
-    // Return a sentinel pointer for a deleted entry.
-    #[inline]
-    const fn tombstone() -> *mut Entry<K, V> {
-        // Null pointers are never copied to the new table, so this state is safe to use.
-        Entry::COPIED as _
-    }
+    // A sentinel pointer for a deleted entry.
+    //
+    // Null pointers are never copied to the new table, so this state is safe to use.
+    // Note that tombstone entries may still be marked as `COPYING`, so this state
+    // cannot be used for direct equality.
+    const TOMBSTONE: *mut Entry<K, V> = Entry::COPIED as _;
 }
 
 /// The status of an entry.
 enum EntryStatus<K, V> {
-    // The entry is a tombstone or a null copy.
+    // The entry is a tombstone or null (potentially a null copy).
     Null,
     // The entry is being copied.
     Copied(Tagged<Entry<K, V>>),
@@ -322,6 +315,7 @@ where
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
             // The key is not in the table.
+            //
             // It also cannot be in the next table because we have not went over the probe limit.
             if meta == meta::EMPTY {
                 return None;
@@ -338,7 +332,7 @@ where
                 unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
             // The entry was deleted, keep probing.
-            if Entry::is_tombstone(entry) {
+            if entry.ptr.is_null() {
                 probe.next();
                 continue;
             }
@@ -350,7 +344,7 @@ where
                 //
                 // In blocking resize mode we do not need to perform this check as all writes block
                 // until any resizes are complete, making the root table the source of truth for readers.
-                if self.root.is_incremental() && entry.tag() & Entry::COPIED != 0 {
+                if entry.tag() & Entry::COPIED != 0 {
                     break;
                 }
 
@@ -485,7 +479,7 @@ where
                     .unpack();
 
                 // The entry was deleted, keep probing.
-                if Entry::is_tombstone(found) {
+                if found.ptr.is_null() {
                     probe.next();
                     continue 'probe;
                 }
@@ -634,7 +628,7 @@ where
                 unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
 
             // The entry was deleted, keep probing.
-            if Entry::is_tombstone(entry) {
+            if entry.ptr.is_null() {
                 probe.next();
                 continue 'probe;
             }
@@ -653,7 +647,7 @@ where
             }
 
             loop {
-                match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
+                match unsafe { self.update_at(probe.i, entry, Entry::TOMBSTONE, guard) } {
                     // Successfully removed the entry.
                     UpdateStatus::Replaced(entry) => {
                         // Mark the entry as a tombstone.
@@ -897,10 +891,7 @@ where
 
             loop {
                 // Found a non-empty entry being copied.
-                if entry.tag() & Entry::COPYING != 0
-                    && !entry.ptr.is_null()
-                    && !Entry::is_tombstone(entry)
-                {
+                if entry.tag() & Entry::COPYING != 0 && !entry.ptr.is_null() {
                     fence(Ordering::Acquire);
 
                     // Clear every entry in this table that we can, then deal with the copy.
@@ -909,7 +900,7 @@ where
                 }
 
                 // The entry is empty or already deleted.
-                if entry.ptr.is_null() || Entry::is_tombstone(entry) {
+                if entry.ptr.is_null() {
                     continue 'probe;
                 }
 
@@ -917,7 +908,7 @@ where
                 let result = unsafe {
                     self.table.entry(i).compare_exchange(
                         entry.raw,
-                        Entry::tombstone(),
+                        Entry::TOMBSTONE,
                         Ordering::Acquire,
                         Ordering::Relaxed,
                     )
@@ -1210,7 +1201,7 @@ where
                     .unpack();
 
                 // The entry was deleted, keep probing.
-                if Entry::is_tombstone(found) {
+                if found.ptr.is_null() {
                     probe.next();
                     continue 'probe;
                 }
@@ -1270,7 +1261,7 @@ where
                         }
                     }
                     Operation::Remove => {
-                        match unsafe { self.update_at(probe.i, entry, Entry::tombstone(), guard) } {
+                        match unsafe { self.update_at(probe.i, entry, Entry::TOMBSTONE, guard) } {
                             // Successfully removed the entry.
                             UpdateStatus::Replaced(entry) => {
                                 // Mark the entry as a tombstone.
@@ -1693,15 +1684,15 @@ where
                 .unpack()
         };
 
+        // The entry is a tombstone.
+        if entry.raw == Entry::TOMBSTONE {
+            return true;
+        }
+
         // There is nothing to copy, we're done.
         if entry.ptr.is_null() {
             // Mark as a tombstone so readers avoid having to load the entry.
             unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
-            return true;
-        }
-
-        // The entry was deleted.
-        if Entry::is_tombstone(entry) {
             return true;
         }
 
@@ -1814,15 +1805,15 @@ where
                 .unpack()
         };
 
+        // The entry is a tombstone.
+        if entry.raw == Entry::TOMBSTONE {
+            return;
+        }
+
         // There is nothing to copy, we're done.
         if entry.ptr.is_null() {
             // Mark as a tombstone so readers avoid having to load the entry.
             unsafe { self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
-            return;
-        }
-
-        // The entry was deleted.
-        if Entry::is_tombstone(entry) {
             return;
         }
 
@@ -2140,7 +2131,7 @@ where
             };
 
             // The entry was deleted.
-            if Entry::is_tombstone(entry) {
+            if entry.ptr.is_null() {
                 self.i += 1;
                 continue;
             }
@@ -2223,7 +2214,7 @@ unsafe fn drop_entries<K, V>(table: Table<K, V>) {
         let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
         // The entry was copied, or there is nothing to deallocate.
-        if entry.ptr.is_null() || Entry::is_tombstone(entry) || entry.tag() & Entry::COPYING != 0 {
+        if entry.ptr.is_null() || entry.tag() & Entry::COPYING != 0 {
             continue;
         }
 

@@ -53,6 +53,7 @@ pub struct Tagged<T> {
 }
 
 // Creates a `Tagged` from an untagged pointer.
+#[inline]
 pub fn untagged<T>(value: *mut T) -> Tagged<T> {
     Tagged {
         raw: value,
@@ -65,11 +66,13 @@ where
     T: Unpack,
 {
     // Returns the tag portion of this pointer.
+    #[inline]
     pub fn tag(self) -> usize {
         self.raw.addr() & !T::MASK
     }
 
     // Maps the tag of this pointer.
+    #[inline]
     pub fn map_tag(self, f: impl FnOnce(usize) -> usize) -> Self {
         Tagged {
             raw: self.raw.map_addr(f),
@@ -92,6 +95,7 @@ pub trait AtomicPtrFetchOps<T> {
 }
 
 impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
+    #[inline]
     fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T {
         #[cfg(not(miri))]
         {
@@ -180,11 +184,13 @@ impl Default for Counter {
 
 impl Counter {
     // Return the shard for the given thread ID.
+    #[inline]
     pub fn get(&self, thread: usize) -> &AtomicIsize {
         &self.0[thread & (self.0.len() - 1)].value
     }
 
     // Returns the sum of all counter shards.
+    #[inline]
     pub fn sum(&self) -> usize {
         self.0
             .iter()
@@ -209,12 +215,14 @@ impl<T> From<T> for Shared<T> {
 impl<T> Deref for Shared<T> {
     type Target = T;
 
+    #[inline]
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.0.as_ptr() }
     }
 }
 
 impl<T> Drop for Shared<T> {
+    #[inline]
     fn drop(&mut self) {
         let _ = unsafe { Box::from_raw(self.0.as_ptr()) };
     }
