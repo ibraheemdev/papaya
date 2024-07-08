@@ -9,6 +9,8 @@ seize = "0.4.3"
 
 [dev-dependencies]
 rand = "0.8.5"
+base64 = "0.22.1"
+hdrhistogram = "7.5.4"
 dashmap = "5.5.3"
 criterion = "0.5.1"
 tokio = { version = "1.38.0", features = ["fs", "rt"] }
