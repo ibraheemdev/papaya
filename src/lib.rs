@@ -8,4 +8,4 @@ pub use map::{
     Compute, HashMap, HashMapBuilder, HashMapRef, Iter, Keys, OccupiedError, Operation, ResizeMode,
     Values,
 };
-pub use seize::Guard;
+pub use seize::{Collector, Guard};
