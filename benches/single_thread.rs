@@ -29,14 +29,13 @@ fn compare(c: &mut Criterion) {
 
     group.bench_function("papaya", |b| {
         let m = papaya::HashMap::<usize, usize>::default();
-        let m = m.pin();
         for i in RandomKeys::new().take(SIZE) {
-            m.insert(i, i);
+            m.pin().insert(i, i);
         }
 
         b.iter(|| {
             for i in RandomKeys::new().take(SIZE) {
-                black_box(assert_eq!(m.get(&i), Some(&i)));
+                black_box(assert_eq!(m.pin().get(&i), Some(&i)));
             }
         });
     });
