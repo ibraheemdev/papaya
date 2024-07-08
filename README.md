@@ -5,7 +5,7 @@ A fast and ergonomic concurrent hash-table that features:
 - An ergonomic lock-free API — no more deadlocks!
 - Powerful atomic operations.
 - Seamless usage in async contexts.
-- Extremely fast and scalable reads (see [benchmarks]).
+- Extremely scalable low-latency reads (see [performance](#performance)).
 - Predictable latency across all operations.
 - Efficient memory usage, with garbage collection powered by [`seize`].
 
@@ -190,6 +190,6 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 
 `papaya` also aims to provide predictable, consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing]. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
 
-[benchmarks]: TODO
+[benchmarks]: ./BENCHMARKS.md
 [`seize`]: https://docs.rs/seize/latest
 [incremental resizing]: https://docs.rs/papaya/latest/papaya/enum.ResizeMode.html
