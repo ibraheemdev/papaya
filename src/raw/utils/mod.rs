@@ -97,7 +97,6 @@ impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
         {
             use std::sync::atomic::AtomicUsize;
 
-            // mark the entry as copied
             unsafe { &*(self as *const AtomicPtr<T> as *const AtomicUsize) }
                 .fetch_or(value, ordering) as *mut T
         }
@@ -105,7 +104,16 @@ impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
         // Avoid ptr2int under Miri.
         #[cfg(miri)]
         {
-            self.fetch_update(ordering, Ordering::Acquire, |ptr| {
+            // Returns the ordering for the read in an RMW operation.
+            const fn read_ordering(ordering: Ordering) -> Ordering {
+                match ordering {
+                    Ordering::SeqCst => Ordering::SeqCst,
+                    Ordering::AcqRel => Ordering::Acquire,
+                    _ => Ordering::Relaxed,
+                }
+            }
+
+            self.fetch_update(ordering, read_ordering(ordering), |ptr| {
                 Some(ptr.map_addr(|addr| addr | value))
             })
             .unwrap()
