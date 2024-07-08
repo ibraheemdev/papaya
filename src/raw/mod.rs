@@ -141,6 +141,7 @@ impl Entry<(), ()> {
     const BORROWED: usize = 0b100;
 
     // Reclaims an entry.
+    #[inline]
     unsafe fn reclaim<K, V>(link: *mut Link) {
         let entry: *mut Entry<K, V> = link.cast();
         let _entry = unsafe { Box::from_raw(entry) };
@@ -154,12 +155,14 @@ impl<K, V> utils::Unpack for Entry<K, V> {
 
 impl<K, V> Entry<K, V> {
     // Checks whether this entry represents a tombstone.
+    #[inline]
     fn is_tombstone(entry: Tagged<Entry<K, V>>) -> bool {
         // Null pointers are never copied to the new table, so this state is safe to use.
         entry.ptr.is_null() && (entry.tag() & Entry::COPIED != 0)
     }
 
     // Return a sentinel pointer for a deleted entry.
+    #[inline]
     const fn tombstone() -> *mut Entry<K, V> {
         // Null pointers are never copied to the new table, so this state is safe to use.
         Entry::COPIED as _
@@ -177,6 +180,7 @@ enum EntryStatus<K, V> {
 }
 
 impl<K, V> From<Tagged<Entry<K, V>>> for EntryStatus<K, V> {
+    #[inline]
     fn from(entry: Tagged<Entry<K, V>>) -> Self {
         if entry.ptr.is_null() {
             EntryStatus::Null
@@ -206,6 +210,7 @@ enum InsertStatus<K, V> {
 
 impl<K, V, S> HashMap<K, V, S> {
     // Creates new hash-table with the given options.
+    #[inline]
     pub fn new(
         capacity: usize,
         hasher: S,
@@ -241,7 +246,7 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     // Returns a reference to the root hash-table.
-    #[inline(always)]
+    #[inline]
     pub fn root<'g>(&self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
         assert!(
             guard.belongs_to(&self.collector),
@@ -259,23 +264,25 @@ impl<K, V, S> HashMap<K, V, S> {
     }
 
     // Returns a reference to the collector.
+    #[inline]
     pub fn collector(&self) -> &Collector {
         &self.collector
     }
 
     // Returns the number of entries in the table.
+    #[inline]
     pub fn len(&self) -> usize {
         self.count.sum()
     }
 
     // Returns true if incremental resizing is enabled.
-    #[inline(always)]
+    #[inline]
     fn is_incremental(&self) -> bool {
         matches!(self.resize, ResizeMode::Incremental(_))
     }
 
     // Returns a reference to the given table.
-    #[inline(always)]
+    #[inline]
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'_, K, V, S> {
         HashMapRef { table, root: self }
     }
@@ -294,6 +301,7 @@ where
     S: BuildHasher,
 {
     // Returns a reference to the entry corresponding to the key.
+    #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -367,6 +375,7 @@ where
     }
 
     // Inserts a key-value pair into the table.
+    #[inline]
     pub fn insert<'g>(
         &mut self,
         key: K,
@@ -420,6 +429,7 @@ where
     // # Safety
     //
     // The new entry must be a valid pointer.
+    #[inline]
     unsafe fn insert_with<'g>(
         &mut self,
         new_entry: Tagged<Entry<K, V>>,
@@ -567,6 +577,7 @@ where
     }
 
     // Removes a key from the map, returning the entry for the key if the key was previously in the map.
+    #[inline]
     pub fn remove<'g, Q: ?Sized>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
         K: Borrow<Q>,
@@ -578,6 +589,7 @@ where
     // Removes a key from the map, returning the entry for the key if the key was previously in the map.
     //
     // This is a recursive helper for `remove_entry`.
+    #[inline]
     pub fn remove_inner<'g, Q: ?Sized>(
         &self,
         key: &Q,
@@ -728,7 +740,7 @@ where
     }
 
     // Attempts to insert an entry at the given index.
-    #[inline(always)]
+    #[inline]
     unsafe fn insert_at<'g>(
         &self,
         i: usize,
@@ -789,7 +801,7 @@ where
     }
 
     // Attempts to replace the value of an existing entry at the given index.
-    #[inline(always)]
+    #[inline]
     unsafe fn update_at(
         &self,
         i: usize,
@@ -841,6 +853,7 @@ where
     }
 
     // Reserve capacity for `additional` more elements.
+    #[inline]
     pub fn reserve(&mut self, additional: usize, guard: &impl Guard) {
         // The table has not yet been allocated, try to initialize it.
         if self.table.raw.is_null() && self.init(Some(probe::entries_for(additional))) {
@@ -867,6 +880,7 @@ where
     }
 
     // Remove all entries from this table.
+    #[inline]
     pub fn clear(&mut self, guard: &impl Guard) {
         if self.table.raw.is_null() {
             return;
@@ -941,6 +955,7 @@ where
     }
 
     // Returns an iterator over the keys and values of this table.
+    #[inline]
     pub fn iter<'g, G>(&mut self, guard: &'g G) -> Iter<'g, K, V, G>
     where
         G: Guard,
@@ -964,6 +979,7 @@ where
     }
 
     // Returns the h1 and h2 hash for the given key.
+    #[inline]
     fn hash<Q>(&self, key: &Q) -> (usize, u8)
     where
         Q: Hash + ?Sized,
@@ -992,6 +1008,7 @@ where
     V: 'g,
 {
     // Create a new `ComputeState` for the given function.
+    #[inline]
     fn new(compute: F) -> ComputeState<F, K, V, T> {
         ComputeState {
             compute,
@@ -1001,6 +1018,7 @@ where
     }
 
     // Performs a state transition.
+    #[inline]
     fn next(&mut self, entry: Option<*mut Entry<K, V>>) -> Operation<V, T> {
         match entry {
             Some(entry) => match self.update.take() {
@@ -1018,6 +1036,7 @@ where
     }
 
     // Restores the state if an operation fails.
+    #[inline]
     fn restore(&mut self, input: Option<*mut Entry<K, V>>, output: Operation<V, T>) {
         match input {
             Some(input) => self.update = Some(CachedUpdate { input, output }),
@@ -1036,6 +1055,7 @@ where
     S: BuildHasher,
 {
     // Updates an existing entry atomically, returning the value that was inserted.
+    #[inline]
     pub fn update<'g, F>(&mut self, key: K, mut update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: FnMut(&V) -> V,
@@ -1059,6 +1079,7 @@ where
     //
     // Note that `compute` closure is guaranteed to be called for a `None` input only once, allowing the insertion
     // of values that cannot be cloned or reconstructed.
+    #[inline]
     pub fn compute<'g, F, T>(
         &mut self,
         key: K,
@@ -1094,6 +1115,7 @@ where
     // # Safety
     //
     // The new entry must be a valid pointer.
+    #[inline]
     unsafe fn compute_with<'g, F, T>(
         &mut self,
         new_entry: *mut Entry<K, MaybeUninit<V>>,
@@ -1392,6 +1414,7 @@ where
     S: BuildHasher,
 {
     // Returns a reference to the given table.
+    #[inline]
     fn as_ref(&self, table: Table<K, V>) -> HashMapRef<'root, K, V, S> {
         HashMapRef {
             table,
@@ -1400,6 +1423,7 @@ where
     }
 
     // Returns a reference to the next table, if it has already been created.
+    #[inline]
     fn next_table_ref(&self) -> Option<HashMapRef<'root, K, V, S>> {
         let state = self.table.state();
         let next = state.next.load(Ordering::Acquire);
@@ -1412,6 +1436,7 @@ where
     }
 
     // Allocate the initial table.
+    #[cold]
     fn init(&mut self, capacity: Option<usize>) -> bool {
         const CAPACITY: usize = 32;
 
@@ -1442,6 +1467,7 @@ where
     }
 
     // Returns the next table, allocating it has not already been created.
+    #[cold]
     fn get_or_alloc_next(&self, capacity: Option<usize>) -> Table<K, V> {
         const SPIN_ALLOC: usize = 7;
 
@@ -1525,6 +1551,7 @@ where
     //
     // If `copy_all` is `false` in incremental resize mode, this returns the current reference's next table,
     // not necessarily the new root.
+    #[cold]
     fn help_copy(&self, guard: &impl Guard, copy_all: bool) -> Table<K, V> {
         match self.root.resize {
             ResizeMode::Blocking => self.help_copy_blocking(guard),
@@ -1656,6 +1683,7 @@ where
     // Copy the entry at the given index to the new table.
     //
     // Returns `true` if the entry was copied into the table or `false` if the table was full.
+    #[inline]
     fn copy_at_blocking(&self, i: usize, next_table: Table<K, V>, guard: &impl Guard) -> bool {
         // Mark the entry as copying.
         let entry = unsafe {
@@ -1776,6 +1804,7 @@ where
     }
 
     // Copy the entry at the given index to the new table.
+    #[inline]
     fn copy_at_incremental(&self, i: usize, next_table: Table<K, V>, guard: &impl Guard) {
         // Mark the entry as copying.
         let entry = unsafe {
@@ -1825,6 +1854,7 @@ where
     //
     // This is an optimized version of `insert_entry` where the caller is the only writer
     // inserting the given key into the new table, as it has already been marked as copying.
+    #[inline]
     unsafe fn insert_copy(
         &self,
         new_entry: Tagged<Entry<K, V>>,
@@ -1902,6 +1932,7 @@ where
     // Update the copy state and attempt to promote a table to the root.
     //
     // Returns `true` if the table was promoted.
+    #[inline]
     fn try_promote(&self, next: Table<K, V>, copied: usize, guard: &impl Guard) -> bool {
         // Update the copy count.
         let copied = if copied > 0 {
@@ -1963,6 +1994,7 @@ where
     //
     // This is necessary for operations like `iter` or `clear`, where entries in multiple tables
     // can cause lead to incomplete results.
+    #[inline]
     fn linearize(&mut self, guard: &impl Guard) {
         if self.root.is_incremental() {
             // If we're in incremental resize mode, we need to complete any in-progress resizes to
@@ -1975,6 +2007,7 @@ where
     }
 
     // Wait for an incremental copy of a given entry to complete.
+    #[inline]
     fn wait_copied(&self, i: usize) {
         const SPIN_WAIT: usize = 5;
 
@@ -2010,6 +2043,7 @@ where
     /// # Safety
     ///
     /// The entry must be unreachable from the current table.
+    #[inline]
     unsafe fn defer_retire(&self, entry: Tagged<Entry<K, V>>, guard: &impl Guard) {
         match self.root.resize {
             // Safety: In blocking resize mode, we only ever write to the root table, so the entry
@@ -2076,6 +2110,7 @@ where
 {
     type Item = (&'g K, &'g V);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         // The table has not yet been allocated.
         if self.table.raw.is_null() {
@@ -2141,6 +2176,7 @@ where
 }
 
 impl<K, V, G> Clone for Iter<'_, K, V, G> {
+    #[inline]
     fn clone(&self) -> Self {
         Iter {
             i: self.i,
@@ -2151,6 +2187,7 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
 }
 
 impl<K, V, S> Clone for HashMapRef<'_, K, V, S> {
+    #[inline]
     fn clone(&self) -> Self {
         HashMapRef {
             table: self.table,
@@ -2231,13 +2268,13 @@ mod meta {
     pub const TOMBSTONE: u8 = u8::MAX;
 
     // Returns the primary hash for an entry.
-    #[inline(always)]
+    #[inline]
     pub fn h1(hash: u64) -> usize {
         hash as usize
     }
 
     /// Return a byte of hash metadata, used for cheap searches.
-    #[inline(always)]
+    #[inline]
     pub fn h2(hash: u64) -> u8 {
         const MIN_HASH_LEN: usize = if mem::size_of::<usize>() < mem::size_of::<u64>() {
             mem::size_of::<usize>()

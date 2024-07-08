@@ -346,6 +346,7 @@ where
     /// map.pin().insert(2, "b");
     /// assert!(map.len() == 2);
     /// ```
+    #[inline]
     pub fn len(&self) -> usize {
         self.raw.len()
     }
@@ -362,6 +363,7 @@ where
     /// map.pin().insert("a", 1);
     /// assert!(!map.is_empty());
     /// ```
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -543,6 +545,7 @@ where
     /// assert_eq!(map.pin().get_or_insert("a", 3), &3);
     /// assert_eq!(map.pin().get_or_insert("a", 6), &3);
     /// ```
+    #[inline]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> &'g V {
         // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
         // allows us to avoid
@@ -570,6 +573,7 @@ where
     /// assert_eq!(map.pin().get_or_insert_with("a", || 3), &3);
     /// assert_eq!(map.pin().get_or_insert_with("a", || 6), &3);
     /// ```
+    #[inline]
     pub fn get_or_insert_with<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> &'g V
     where
         F: FnOnce() -> V,
@@ -619,6 +623,7 @@ where
     /// map.pin().update("a", |v| v + 1);
     /// assert_eq!(map.pin().get(&"a"), Some(&2));
     /// ```
+    #[inline]
     pub fn update<'g, F>(&self, key: K, update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: Fn(&V) -> V,
@@ -644,6 +649,7 @@ where
     /// assert_eq!(*map.pin().update_or_insert("a", |i| i + 1, 0), 0);
     /// assert_eq!(*map.pin().update_or_insert("a", |i| i + 1, 0), 1);
     /// ```
+    #[inline]
     pub fn update_or_insert<'g, F>(
         &self,
         key: K,
@@ -676,6 +682,7 @@ where
     /// assert_eq!(*map.pin().update_or_insert_with("a", |i| i + 1, || 0), 0);
     /// assert_eq!(*map.pin().update_or_insert_with("a", |i| i + 1, || 0), 1);
     /// ```
+    #[inline]
     pub fn update_or_insert_with<'g, U, F>(
         &self,
         key: K,
@@ -750,6 +757,7 @@ where
     /// });
     /// assert_eq!(map.compute('A', compute), Compute::Removed(&'A', &2));
     /// ```
+    #[inline]
     pub fn compute<'g, F, T>(
         &self,
         key: K,
@@ -838,6 +846,7 @@ where
     /// let map: HashMap<&str, i32> = HashMap::new();
     /// map.pin().reserve(10);
     /// ```
+    #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
         self.raw.root(guard).reserve(additional, guard);
     }
@@ -1379,6 +1388,7 @@ where
 {
     type Item = (&'g K, &'g V);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.raw.next()
     }
@@ -1412,6 +1422,7 @@ where
 {
     type Item = &'g K;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let (key, _) = self.iter.next()?;
         Some(key)
@@ -1442,6 +1453,7 @@ where
 {
     type Item = &'g V;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         let (_, value) = self.iter.next()?;
         Some(value)

@@ -38,6 +38,7 @@ impl Probe {
     const GROUP: usize = 8;
 
     // Initialize the probe sequence, returning the maximum probe limit.
+    #[inline]
     pub fn start(hash: usize, len: usize) -> (Probe, usize) {
         let i = hash & (len - 1);
         let probe = Probe {
