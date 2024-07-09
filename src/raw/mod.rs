@@ -2248,7 +2248,7 @@ unsafe fn drop_table<K, V>(mut table: Table<K, V>) {
     unsafe { Table::dealloc(table) };
 }
 
-// Entry metadata.
+// Entry metadata, inspired by `hashbrown`.
 mod meta {
     use std::mem;
 
