@@ -735,12 +735,12 @@ where
 
     // Attempts to insert an entry at the given index.
     #[inline]
-    unsafe fn insert_at<'g>(
+    unsafe fn insert_at(
         &self,
         i: usize,
         meta: u8,
         new_entry: *mut Entry<K, V>,
-        guard: &'g impl Guard,
+        guard: &impl Guard,
     ) -> InsertStatus<K, V> {
         let entry = unsafe { self.table.entry(i) };
 
