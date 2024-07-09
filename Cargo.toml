@@ -22,3 +22,6 @@ harness = false
 [[bench]]
 name = "latency"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(papaya_stress)', 'cfg(papaya_asan)'] }
