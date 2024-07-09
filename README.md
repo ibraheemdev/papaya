@@ -1,6 +1,6 @@
 # Papaya
 
-A fast and ergonomic concurrent hash-table that features:
+A fast and ergonomic concurrent hash-table for read-heavy workloads.
 
 - An ergonomic lock-free API — no more deadlocks!
 - Powerful atomic operations.

@@ -2,6 +2,12 @@
 name = "papaya"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+authors = ["Ibraheem Ahmed <ibraheem@ibraheem.ca>"]
+description = "A fast and ergonomic concurrent hash-table for read-heavy workloads."
+keywords = ["concurrent", "hashmap", "atomic", "lock-free"]
+repository = "https://github.com/ibraheemdev/papaya"
+readme = "README.md"
 
 [dependencies]
 atomic-wait = "1.1.0"
