@@ -44,6 +44,6 @@ pub fn threads() -> usize {
     if cfg!(miri) {
         2
     } else {
-        std::thread::available_parallelism().unwrap().get() / 2
+        num_cpus::get_physical().next_power_of_two()
     }
 }
