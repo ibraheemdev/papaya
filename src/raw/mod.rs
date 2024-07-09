@@ -1564,12 +1564,6 @@ where
     //
     // Should only be called on the root table.
     fn help_copy_blocking(&self, guard: &impl Guard) -> Table<K, V> {
-        // Make sure we are copying from the root or an ex-root table.
-        debug_assert_eq!(
-            self.table.state().status.load(Ordering::Relaxed),
-            State::PROMOTED
-        );
-
         // Load the next table.
         let next = self.table.state().next.load(Ordering::Acquire);
         debug_assert!(!next.is_null());
