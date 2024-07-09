@@ -1390,7 +1390,7 @@ where
                 state.restore(None, op);
                 return self
                     .as_ref(next_table)
-                    .compute_with(new_entry, state, help_copy, guard);
+                    .compute_with(new_entry, state, false, guard);
             }
             Operation::Remove => panic!("Cannot remove `None` entry."),
             Operation::Abort(value) => return Compute::Aborted(value),
