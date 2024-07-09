@@ -186,9 +186,9 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 
 ## Performance
 
-`papaya` is built with read-heavy workloads in mind. As such, read operations are extremely high throughput and provide consistent performance that scales with concurrency, meaning `papaya` will excel in any workload in which reads are more common than writes. In write heavy workloads, `papaya` will still provide competitive performance despite not being it's primary use case. See the [benchmarks] for details.
+`papaya` is built with read-heavy workloads in mind. As such, read operations are extremely high throughput and provide consistent performance that scales with concurrency, meaning `papaya` will excel in workloads where reads are more common than writes. In write heavy workloads, `papaya` will still provide competitive performance despite not being it's primary use case. See the [benchmarks] for details.
 
-`papaya` also aims to provide predictable, consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing]. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
+`papaya` aims to provide predictable and consistent latency across all operations. Most operations are lock-free, and those that aren't only block under rare and constrained conditions. `papaya` also features [incremental resizing]. Predictable latency is an important part of performance that doesn't often show up in benchmarks, but has significant implications for real-world usage.
 
 [benchmarks]: ./BENCHMARKS.md
 [`seize`]: https://docs.rs/seize/latest
