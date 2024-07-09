@@ -307,10 +307,10 @@ where
 
         // Initialize the probe state.
         let (h1, h2) = self.hash(key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
+        let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
-        while probe.len <= limit {
+        while probe.len <= self.table.limit {
             // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
@@ -323,7 +323,7 @@ where
 
             // Check for a potential match.
             if meta != h2 {
-                probe.next();
+                probe.next(self.table.mask);
                 continue;
             }
 
@@ -333,7 +333,7 @@ where
 
             // The entry was deleted, keep probing.
             if entry.ptr.is_null() {
-                probe.next();
+                probe.next(self.table.mask);
                 continue;
             }
 
@@ -352,7 +352,7 @@ where
                 return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
             }
 
-            probe.next();
+            probe.next(self.table.mask);
         }
 
         // In incremental resize mode, we have to check the next table if we found
@@ -441,11 +441,11 @@ where
 
         // Initialize the probe state.
         let (h1, h2) = self.hash(&new_ref.key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
+        let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
         let copying = 'probe: loop {
-            if probe.len > limit {
+            if probe.len > self.table.limit {
                 break None;
             }
 
@@ -466,7 +466,7 @@ where
 
                     // Otherwise, continue probing.
                     InsertStatus::Found(EntryStatus::Null) => {
-                        probe.next();
+                        probe.next(self.table.mask);
                         continue 'probe;
                     }
                 }
@@ -480,7 +480,7 @@ where
 
                 // The entry was deleted, keep probing.
                 if found.ptr.is_null() {
-                    probe.next();
+                    probe.next(self.table.mask);
                     continue 'probe;
                 }
 
@@ -489,14 +489,14 @@ where
             }
             // Otherwise, continue probing.
             else {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             };
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != new_ref.key } {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             }
 
@@ -526,7 +526,7 @@ where
 
                     // The entry was deleted before we could update it, continue probing.
                     UpdateStatus::Found(EntryStatus::Null) => {
-                        probe.next();
+                        probe.next(self.table.mask);
                         continue 'probe;
                     }
 
@@ -600,11 +600,11 @@ where
 
         // Initialize the probe state.
         let (h1, h2) = self.hash(key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
+        let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
         let copying = 'probe: loop {
-            if probe.len > limit {
+            if probe.len > self.table.limit {
                 break None;
             }
 
@@ -619,7 +619,7 @@ where
 
             // Check for a potential match.
             if meta != h2 {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             }
 
@@ -629,14 +629,14 @@ where
 
             // The entry was deleted, keep probing.
             if entry.ptr.is_null() {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             }
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key.borrow() != key } {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             }
 
@@ -859,7 +859,7 @@ where
                 probe::entries_for(self.root.count.sum().checked_add(additional).unwrap());
 
             // We have enough capacity.
-            if self.table.len >= capacity {
+            if self.table.len() >= capacity {
                 return;
             }
 
@@ -884,7 +884,7 @@ where
         self.linearize(guard);
 
         let mut copying = false;
-        'probe: for i in 0..self.table.len {
+        'probe: for i in 0..self.table.len() {
             // Load the entry to delete.
             let mut entry =
                 unsafe { guard.protect(self.table.entry(i), Ordering::Relaxed) }.unpack();
@@ -1135,11 +1135,11 @@ where
 
         // Initialize the probe state.
         let (h1, h2) = self.hash(key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
+        let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
         let copying = 'probe: loop {
-            if probe.len > limit {
+            if probe.len > self.table.limit {
                 break None;
             }
 
@@ -1188,7 +1188,7 @@ where
                         state.restore(None, Operation::Insert(value));
 
                         // Continue probing.
-                        probe.next();
+                        probe.next(self.table.mask);
                         continue 'probe;
                     }
                 }
@@ -1202,7 +1202,7 @@ where
 
                 // The entry was deleted, keep probing.
                 if found.ptr.is_null() {
-                    probe.next();
+                    probe.next(self.table.mask);
                     continue 'probe;
                 }
 
@@ -1211,14 +1211,14 @@ where
             }
             // Otherwise, continue probing.
             else {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             };
 
             // Check for a full match.
             fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != *key } {
-                probe.next();
+                probe.next(self.table.mask);
                 continue 'probe;
             }
 
@@ -1309,7 +1309,7 @@ where
                                 state.restore(None, Operation::Insert(value));
 
                                 // Continue probing to find an empty slot.
-                                probe.next();
+                                probe.next(self.table.mask);
                                 continue 'probe;
                             }
                             Operation::Remove => panic!("Cannot remove `None` entry."),
@@ -1510,18 +1510,18 @@ where
 
         let next_capacity = match cfg!(papaya_stress) {
             // Never grow the table to stress the incremental resizing algorithm.
-            true => self.table.len,
+            true => self.table.len(),
             // Double the table capacity if we are at least 50% full.
             //
             // Loading the length here is quite expensive, we may want to consider
             // a probabilistic counter to detect high-deletion workloads.
-            false if self.root.len() >= (self.table.len >> 1) => self.table.len << 1,
+            false if self.root.len() >= (self.table.len() >> 1) => self.table.len() << 1,
             // Otherwise keep the capacity the same.
             //
             // This can occur due to poor hash distribution or frequent cycling of
             // insertions and deletions, in which case we want to avoid continuously
             // growing the table.
-            false => self.table.len,
+            false => self.table.len(),
         };
 
         let next_capacity = capacity.unwrap_or(next_capacity);
@@ -1586,11 +1586,11 @@ where
                 return next;
             }
 
-            let copy_chunk = self.table.len.min(4096);
+            let copy_chunk = self.table.len().min(4096);
 
             loop {
                 // Every entry has already been claimed.
-                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
+                if next.state().claim.load(Ordering::Relaxed) >= self.table.len() {
                     break;
                 }
 
@@ -1602,7 +1602,7 @@ where
                 for i in 0..copy_chunk {
                     let i = copy_start + i;
 
-                    if i >= self.table.len {
+                    if i >= self.table.len() {
                         break;
                     }
 
@@ -1733,7 +1733,7 @@ where
 
             loop {
                 // Every entry has already been claimed.
-                if next.state().claim.load(Ordering::Relaxed) >= self.table.len {
+                if next.state().claim.load(Ordering::Relaxed) >= self.table.len() {
                     break;
                 }
 
@@ -1745,7 +1745,7 @@ where
                 for i in 0..chunk {
                     let i = copy_start + i;
 
-                    if i >= self.table.len {
+                    if i >= self.table.len() {
                         break;
                     }
 
@@ -1857,10 +1857,10 @@ where
 
         // Initialize the probe state.
         let (h1, h2) = self.hash(key);
-        let (mut probe, limit) = Probe::start(h1, self.table.len);
+        let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
-        while probe.len <= limit {
+        while probe.len <= self.table.limit {
             // Load the entry metadata first for cheap searches.
             let meta = unsafe { self.table.meta(probe.i) }.load(Ordering::Acquire);
 
@@ -1907,7 +1907,7 @@ where
             }
 
             // Continue probing.
-            probe.next();
+            probe.next(self.table.mask);
         }
 
         if !resize {
@@ -1933,7 +1933,7 @@ where
         };
 
         // If we copied all the entries in the table, we can try to promote.
-        if copied == self.table.len {
+        if copied == self.table.len() {
             let root = self.root.table.load(Ordering::Relaxed);
 
             // Only promote root copies.
@@ -2110,7 +2110,7 @@ where
 
         loop {
             // Iterated over every entry in the table, we're done.
-            if self.i >= self.table.len {
+            if self.i >= self.table.len() {
                 return None;
             }
 
@@ -2210,7 +2210,7 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
 
 // Drop all entries in this table.
 unsafe fn drop_entries<K, V>(table: Table<K, V>) {
-    for i in 0..table.len {
+    for i in 0..table.len() {
         let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
         // The entry was copied, or there is nothing to deallocate.

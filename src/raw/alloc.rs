@@ -5,7 +5,7 @@ use std::{alloc, mem, ptr};
 
 use seize::Collector;
 
-use super::State;
+use super::{probe, State};
 
 // A hash-table laid out in a single allocation.
 #[repr(transparent)]
@@ -18,7 +18,8 @@ unsafe impl seize::AsLink for RawTable {}
 #[repr(C)]
 struct TableLayout {
     link: seize::Link,
-    len: usize,
+    mask: usize,
+    limit: usize,
     capacity: usize,
     state: State,
     meta: [AtomicU8; 0],
@@ -28,8 +29,10 @@ struct TableLayout {
 // Manages a table allocation.
 #[repr(C)]
 pub struct Table<T> {
-    // The exposed length of the table.
-    pub len: usize,
+    // Mask for the table length.
+    pub mask: usize,
+    // The probe limit.
+    pub limit: usize,
     // The raw table pointer.
     pub raw: *mut RawTable,
     // The true (padded) table capacity.
@@ -53,6 +56,8 @@ impl<T> Table<T> {
 
         // Pad the meta table to fulfill the alignment requirement of an entry.
         let capacity = (len + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
+        let mask = len - 1;
+        let limit = probe::limit(len);
 
         unsafe {
             let layout = Self::layout(capacity);
@@ -66,7 +71,8 @@ impl<T> Table<T> {
             // Write the table state.
             ptr.cast::<TableLayout>().write(TableLayout {
                 link: collector.link(),
-                len,
+                mask,
+                limit,
                 capacity,
                 state: State {
                     collector,
@@ -82,7 +88,8 @@ impl<T> Table<T> {
                 .write_bytes(super::meta::EMPTY, capacity);
 
             Table {
-                len,
+                mask,
+                limit,
                 capacity,
                 raw: ptr.cast::<RawTable>(),
                 _t: PhantomData,
@@ -91,12 +98,13 @@ impl<T> Table<T> {
     }
 
     // Creates a `Table` from a raw pointer.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn from_raw(raw: *mut RawTable) -> Table<T> {
         if raw.is_null() {
             return Table {
                 raw,
-                len: 0,
+                mask: 0,
+                limit: 0,
                 capacity: 0,
                 _t: PhantomData,
             };
@@ -106,14 +114,15 @@ impl<T> Table<T> {
 
         Table {
             raw,
-            len: layout.len,
+            mask: layout.mask,
+            limit: layout.limit,
             capacity: layout.capacity,
             _t: PhantomData,
         }
     }
 
     // Returns the metadata entry at the given index.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn meta(&self, i: usize) -> &AtomicU8 {
         debug_assert!(i < self.capacity);
         &*self
@@ -124,7 +133,7 @@ impl<T> Table<T> {
     }
 
     // Returns the entry at the given index.
-    #[inline(always)]
+    #[inline]
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
         let offset = mem::size_of::<TableLayout>()
             + mem::size_of::<u8>() * self.capacity
@@ -134,12 +143,20 @@ impl<T> Table<T> {
         &*self.raw.add(offset).cast::<AtomicPtr<T>>()
     }
 
+    /// Returns the length of the table.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.mask + 1
+    }
+
     // Returns a reference to the table state.
+    #[inline]
     pub fn state(&self) -> &State {
         unsafe { &(*self.raw.cast::<TableLayout>()).state }
     }
 
     // Returns a mutable reference to the table state.
+    #[inline]
     pub fn state_mut(&mut self) -> &mut State {
         unsafe { &mut (*self.raw.cast::<TableLayout>()).state }
     }
@@ -166,7 +183,8 @@ fn layout() {
         let collector = seize::Collector::new();
         let table: Table<u8> = Table::alloc(4, &collector);
         let table: Table<u8> = Table::from_raw(table.raw);
-        assert_eq!(table.len, 4);
+        assert_eq!(table.mask, 3);
+        assert_eq!(table.len(), 4);
         // The capacity is padded for pointer alignment.
         assert_eq!(table.capacity, 8);
         Table::dealloc(table);

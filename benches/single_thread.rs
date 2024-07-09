@@ -28,7 +28,10 @@ fn compare(c: &mut Criterion) {
     }
 
     group.bench_function("papaya", |b| {
-        let m = papaya::HashMap::<usize, usize>::default();
+        let m = papaya::HashMap::<usize, usize>::builder()
+            .collector(seize::Collector::new().epoch_frequency(None))
+            .build();
+
         for i in RandomKeys::new().take(SIZE) {
             m.pin().insert(i, i);
         }
