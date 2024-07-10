@@ -246,6 +246,7 @@ impl<K, V, S> HashMap<K, V, S> {
             "accessed map with incorrect guard"
         );
 
+        // Load the root table.
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
 
@@ -329,7 +330,7 @@ where
 
             // Load the full entry.
             let entry =
-                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }.unpack();
 
             // The entry was deleted, keep probing.
             if entry.ptr.is_null() {
@@ -338,7 +339,6 @@ where
             }
 
             // Check for a full match.
-            fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key.borrow() } == key {
                 // The entry was copied to the new table.
                 //
@@ -475,7 +475,7 @@ where
             else if meta == h2 {
                 // Load the full entry.
                 let found = guard
-                    .protect(self.table.entry(probe.i), Ordering::Relaxed)
+                    .protect(self.table.entry(probe.i), Ordering::Acquire)
                     .unpack();
 
                 // The entry was deleted, keep probing.
@@ -494,7 +494,6 @@ where
             };
 
             // Check for a full match.
-            fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != new_ref.key } {
                 probe.next(self.table.mask);
                 continue 'probe;
@@ -625,7 +624,7 @@ where
 
             // Load the full entry.
             let mut entry =
-                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Relaxed) }.unpack();
+                unsafe { guard.protect(self.table.entry(probe.i), Ordering::Acquire) }.unpack();
 
             // The entry was deleted, keep probing.
             if entry.ptr.is_null() {
@@ -634,7 +633,6 @@ where
             }
 
             // Check for a full match.
-            fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key.borrow() != key } {
                 probe.next(self.table.mask);
                 continue 'probe;
@@ -749,7 +747,7 @@ where
             ptr::null_mut(),
             new_entry,
             Ordering::Release,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
             // Successfully claimed the entry.
             Ok(_) => {
@@ -810,7 +808,7 @@ where
             current.raw,
             new_entry,
             Ordering::Release,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
             // Successfully updated.
             Ok(_) => unsafe {
@@ -835,7 +833,6 @@ where
             // The entry was copied.
             EntryStatus::Copied(entry) => {
                 // Acquire the next table.
-                fence(Ordering::Acquire);
                 EntryStatus::Copied(entry)
             }
 
@@ -887,13 +884,11 @@ where
         'probe: for i in 0..self.table.len() {
             // Load the entry to delete.
             let mut entry =
-                unsafe { guard.protect(self.table.entry(i), Ordering::Relaxed) }.unpack();
+                unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }.unpack();
 
             loop {
                 // Found a non-empty entry being copied.
                 if entry.tag() & Entry::COPYING != 0 && !entry.ptr.is_null() {
-                    fence(Ordering::Acquire);
-
                     // Clear every entry in this table that we can, then deal with the copy.
                     copying = true;
                     continue 'probe;
@@ -909,8 +904,8 @@ where
                     self.table.entry(i).compare_exchange(
                         entry.raw,
                         Entry::TOMBSTONE,
+                        Ordering::Release,
                         Ordering::Acquire,
-                        Ordering::Relaxed,
                     )
                 };
 
@@ -1197,7 +1192,7 @@ where
             else if meta == h2 {
                 // Load the full entry.
                 let found = guard
-                    .protect(self.table.entry(probe.i), Ordering::Relaxed)
+                    .protect(self.table.entry(probe.i), Ordering::Acquire)
                     .unpack();
 
                 // The entry was deleted, keep probing.
@@ -1216,7 +1211,6 @@ where
             };
 
             // Check for a full match.
-            fence(Ordering::Acquire);
             if unsafe { (*entry.ptr).key != *key } {
                 probe.next(self.table.mask);
                 continue 'probe;
@@ -1463,11 +1457,10 @@ where
         const SPIN_ALLOC: usize = 7;
 
         let state = self.table.state();
-        let next = state.next.load(Ordering::Relaxed);
+        let next = state.next.load(Ordering::Acquire);
 
         // The next table is already allocated.
         if !next.is_null() {
-            fence(Ordering::Acquire);
             return unsafe { Table::from_raw(next) };
         }
 
@@ -1486,10 +1479,9 @@ where
                         hint::spin_loop();
                     }
 
-                    let next = state.next.load(Ordering::Relaxed);
+                    let next = state.next.load(Ordering::Acquire);
                     if !next.is_null() {
                         // The table was initialized.
-                        fence(Ordering::Acquire);
                         return unsafe { Table::from_raw(next) };
                     }
 
@@ -1501,10 +1493,9 @@ where
             }
         };
 
-        let next = state.next.load(Ordering::Relaxed);
+        let next = state.next.load(Ordering::Acquire);
         if !next.is_null() {
             // The table was allocated while we were waiting for the lock.
-            fence(Ordering::Acquire);
             return unsafe { Table::from_raw(next) };
         }
 
@@ -1674,7 +1665,7 @@ where
         let entry = unsafe {
             self.table
                 .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::Release)
+                .fetch_or(Entry::COPYING, Ordering::AcqRel)
                 .unpack()
         };
 
@@ -1691,7 +1682,6 @@ where
         }
 
         // Copy the value to the new table.
-        fence(Ordering::Acquire);
         unsafe {
             self.as_ref(next_table)
                 .insert_copy(entry.ptr.unpack(), false, guard)
@@ -1765,9 +1755,8 @@ where
             for spun in 0.. {
                 const SPIN_WAIT: usize = 7;
 
-                let status = next.state().status.load(Ordering::Acquire);
-
                 // The copy has completed.
+                let status = next.state().status.load(Ordering::Acquire);
                 if status == State::PROMOTED {
                     return next;
                 }
@@ -1795,7 +1784,7 @@ where
         let entry = unsafe {
             self.table
                 .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::Release)
+                .fetch_or(Entry::COPYING, Ordering::AcqRel)
                 .unpack()
         };
 
@@ -1815,7 +1804,6 @@ where
         let new_entry = entry.map_tag(|addr| addr | Entry::BORROWED);
 
         // Copy the value to the new table.
-        fence(Ordering::Acquire);
         unsafe {
             self.as_ref(next_table)
                 .insert_copy(new_entry, true, guard)
@@ -1867,7 +1855,7 @@ where
                     ptr::null_mut(),
                     new_entry.raw,
                     Ordering::Release,
-                    Ordering::Relaxed,
+                    Ordering::Acquire,
                 ) {
                     // Successfully inserted.
                     Ok(_) => {
@@ -1933,7 +1921,7 @@ where
             // Only promote root copies.
             //
             // We can't promote a nested copy before it's parent has finished, as
-            // it may not contain all entries.
+            // it may not contain all the entries in the table.
             if self.table.raw == root {
                 // Try to update the root.
                 if self
@@ -2120,7 +2108,7 @@ where
             // Load the entry.
             let entry = unsafe {
                 self.guard
-                    .protect(self.table.entry(self.i), Ordering::Relaxed)
+                    .protect(self.table.entry(self.i), Ordering::Acquire)
                     .unpack()
             };
 
@@ -2131,8 +2119,6 @@ where
             }
 
             // Read the key and value.
-            fence(Ordering::Acquire);
-            debug_assert!(!entry.ptr.is_null());
             let entry = unsafe { (&(*entry.ptr).key, &(*entry.ptr).value) };
 
             self.i += 1;
