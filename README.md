@@ -1,8 +1,12 @@
 # `papaya`
 
+[<img alt="crates.io" src="https://img.shields.io/crates/v/papaya?style=for-the-badge" height="25">](https://crates.io/crates/papaya)
+[<img alt="github" src="https://img.shields.io/badge/github-papaya-blue?style=for-the-badge" height="25">](https://github.com/ibraheemdev/papaya)
+[<img alt="docs.rs" src="https://img.shields.io/docsrs/papaya?style=for-the-badge" height="25">](https://docs.rs/papaya)
+
 A fast and ergonomic concurrent hash-table for read-heavy workloads.
 
-See [the documentation](https://docs.rs/papaya/latest) for usage details.
+See [the documentation](https://docs.rs/papaya/latest) to get started.
 
 ## Features
 
