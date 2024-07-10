@@ -214,6 +214,7 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 [benchmarks]: https://github.com/ibraheemdev/papaya/blob/master/BENCHMARKS.md
 */
 
+#![deny(missing_debug_implementations, missing_docs, dead_code)]
 // We use some polyfills for unstable APIs related to strict-provenance.
 #![allow(unstable_name_collisions)]
 // Stylistic preferences.

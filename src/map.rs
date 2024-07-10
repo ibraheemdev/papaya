@@ -123,11 +123,22 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
     }
 }
 
+impl<K, V, S> fmt::Debug for HashMapBuilder<K, V, S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HashMapBuilder")
+            .field("capacity", &self.capacity)
+            .field("collector", &self.collector)
+            .field("resize_mode", &self.resize_mode)
+            .finish()
+    }
+}
+
 /// Resize behavior for a [`HashMap`].
 ///
 /// Hash maps must resize when the underlying table becomes full, migrating all key and value pairs
 /// to a new table. This type allows you to configure the resizing behavior when passed to
 /// [`HashMapBuilder::resize_mode`].
+#[derive(Debug)]
 pub enum ResizeMode {
     /// Writers copy a constant number of key/value pairs to the new table before making
     /// progress.
@@ -1358,6 +1369,18 @@ where
     #[inline]
     pub fn values(&self) -> Values<'_, K, V, G> {
         self.map.values(&self.guard)
+    }
+}
+
+impl<K, V, S, G> fmt::Debug for HashMapRef<'_, K, V, S, G>
+where
+    K: Hash + Eq + fmt::Debug,
+    V: fmt::Debug,
+    S: BuildHasher,
+    G: Guard,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
