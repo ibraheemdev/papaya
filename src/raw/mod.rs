@@ -246,11 +246,22 @@ impl<K, V, S> HashMap<K, V, S> {
             "accessed map with incorrect guard"
         );
 
+        // Safety: verified that the guard belongs to our collector.
+        unsafe { self.root_unchecked(guard) }
+    }
+
+    // Returns a reference to the root hash-table.
+    //
+    // # Safety
+    //
+    // The guard must belong to this table's collector.
+    #[inline]
+    pub unsafe fn root_unchecked<'g>(&self, guard: &'g impl Guard) -> HashMapRef<'g, K, V, S> {
         // Load the root table.
         let raw = guard.protect(&self.table, Ordering::Acquire);
         let table = unsafe { Table::<K, V>::from_raw(raw) };
 
-        // Safety: We verified above that the guard belongs to our collector, so
+        // Safety: The caller guarantees that the guard comes from our collector, so
         // &'g Guard implies &'g self. This makes bounds a little nicer for users.
         unsafe {
             mem::transmute::<HashMapRef<'_, K, V, S>, HashMapRef<'g, K, V, S>>(self.as_ref(table))

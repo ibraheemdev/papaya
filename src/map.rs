@@ -435,7 +435,10 @@ where
         K: Borrow<Q> + 'g, // TODO: this bound is necessary because `raw::HashMap::get` returns the full entry.
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.root(guard).get(key, guard).map(|(_, v)| v)
+        match self.raw.root(guard).get(key, guard) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -559,8 +562,7 @@ where
     #[inline]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> &'g V {
         // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
-        // allows us to avoid
-        // the closure indirection.
+        // allows us to avoid the closure indirection.
         match self.try_insert(key, value, guard) {
             Ok(inserted) => inserted,
             Err(OccupiedError { current, .. }) => current,
@@ -1177,7 +1179,7 @@ where
     /// See [`HashMap::len`] for details.
     #[inline]
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.map.raw.len()
     }
 
     /// Returns `true` if the map is empty. Otherwise returns `false`.
@@ -1185,7 +1187,7 @@ where
     /// See [`HashMap::is_empty`] for details.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        self.len() == 0
     }
 
     /// Returns `true` if the map contains a value for the specified key.
@@ -1197,7 +1199,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.contains_key(key, &self.guard)
+        self.get(key).is_some()
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -1209,7 +1211,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.get(key, &self.guard)
+        match self.root().get(key, &self.guard) {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
     }
 
     /// Returns the key-value pair corresponding to the supplied key.
@@ -1221,7 +1226,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.get_key_value(key, &self.guard)
+        self.root().get(key, &self.guard)
     }
 
     /// Inserts a key-value pair into the map.
@@ -1229,7 +1234,11 @@ where
     /// See [`HashMap::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
-        self.map.insert(key, value, &self.guard)
+        match self.root().insert(key, value, true, &self.guard) {
+            InsertResult::Inserted(_) => None,
+            InsertResult::Replaced(value) => Some(value),
+            InsertResult::Error { .. } => unreachable!(),
+        }
     }
 
     /// Tries to insert a key-value pair into the map, and returns
@@ -1238,14 +1247,29 @@ where
     /// See [`HashMap::try_insert`] for details.
     #[inline]
     pub fn try_insert(&self, key: K, value: V) -> Result<&V, OccupiedError<'_, V>> {
-        self.map.try_insert(key, value, &self.guard)
+        match self.root().insert(key, value, false, &self.guard) {
+            InsertResult::Inserted(value) => Ok(value),
+            InsertResult::Error {
+                current,
+                not_inserted,
+            } => Err(OccupiedError {
+                current,
+                not_inserted,
+            }),
+            InsertResult::Replaced(_) => unreachable!(),
+        }
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
     ///
     /// See [`HashMap::get_or_insert`] for details.
     pub fn get_or_insert(&self, key: K, value: V) -> &V {
-        self.map.get_or_insert(key, value, &self.guard)
+        // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
+        // allows us to avoid the closure indirection.
+        match self.try_insert(key, value) {
+            Ok(inserted) => inserted,
+            Err(OccupiedError { current, .. }) => current,
+        }
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value
@@ -1256,7 +1280,19 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.map.get_or_insert_with(key, f, &self.guard)
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Return the existing value.
+            Some((_, current)) => Operation::Abort(current),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute) {
+            Compute::Aborted(value) => value,
+            Compute::Inserted(_, value) => value,
+            _ => unreachable!(),
+        }
     }
 
     /// Updates an existing entry atomically.
@@ -1266,7 +1302,7 @@ where
     where
         F: Fn(&V) -> V,
     {
-        self.map.update(key, update, &self.guard)
+        self.root().update(key, update, &self.guard)
     }
 
     /// Updates an existing entry or inserts a default value.
@@ -1276,7 +1312,7 @@ where
     where
         F: Fn(&V) -> V,
     {
-        self.map.update_or_insert(key, update, value, &self.guard)
+        self.update_or_insert_with(key, update, || value)
     }
 
     /// Updates an existing entry or inserts a default value computed from a closure.
@@ -1287,7 +1323,21 @@ where
         F: FnOnce() -> V,
         U: Fn(&V) -> V,
     {
-        self.map.update_or_insert_with(key, update, f, &self.guard)
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Perform the update.
+            Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute) {
+            Compute::Updated {
+                new: (_, value), ..
+            } => value,
+            Compute::Inserted(_, value) => value,
+            _ => unreachable!(),
+        }
     }
 
     // Updates an entry with a compare-and-swap (CAS) function.
@@ -1298,7 +1348,7 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        self.map.compute(key, compute, &self.guard)
+        self.root().compute(key, compute, &self.guard)
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -1311,7 +1361,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.remove(key, &self.guard)
+        match self.root().remove(key, &self.guard) {
+            Some((_, value)) => Some(value),
+            None => None,
+        }
     }
 
     /// Removes a key from the map, returning the stored key and value if the
@@ -1324,7 +1377,7 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.map.remove_entry(key, &self.guard)
+        self.root().remove(key, &self.guard)
     }
 
     /// Clears the map, removing all key-value pairs.
@@ -1332,7 +1385,7 @@ where
     /// See [`HashMap::clear`] for details.
     #[inline]
     pub fn clear(&self) {
-        self.map.clear(&self.guard)
+        self.root().clear(&self.guard)
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -1341,7 +1394,7 @@ where
     /// See [`HashMap::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
-        self.map.reserve(additional, &self.guard)
+        self.root().reserve(additional, &self.guard)
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -1350,7 +1403,9 @@ where
     /// See [`HashMap::iter`] for details.
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, V, G> {
-        self.map.iter(&self.guard)
+        Iter {
+            raw: self.root().iter(&self.guard),
+        }
     }
 
     /// An iterator visiting all keys in arbitrary order.
@@ -1359,7 +1414,7 @@ where
     /// See [`HashMap::keys`] for details.
     #[inline]
     pub fn keys(&self) -> Keys<'_, K, V, G> {
-        self.map.keys(&self.guard)
+        Keys { iter: self.iter() }
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -1368,7 +1423,14 @@ where
     /// See [`HashMap::values`] for details.
     #[inline]
     pub fn values(&self) -> Values<'_, K, V, G> {
-        self.map.values(&self.guard)
+        Values { iter: self.iter() }
+    }
+
+    #[inline]
+    fn root(&self) -> raw::HashMapRef<'_, K, V, S> {
+        // Safety: A `HashMapRef` can only be crated through `HashMap::pin` or
+        // `HashMap::pin_owned`, so we know the guard belongs to our collector.
+        unsafe { self.map.raw.root_unchecked(&self.guard) }
     }
 }
 
