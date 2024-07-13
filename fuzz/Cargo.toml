@@ -1,0 +1,22 @@
+[package]
+name = "papaya-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { features = ["derive"], version = "1.0" }
+
+[dependencies.papaya]
+path = ".."
+
+[[bin]]
+name = "std"
+path = "fuzz_targets/std.rs"
+test = false
+doc = false
+bench = false
