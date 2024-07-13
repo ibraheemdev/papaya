@@ -77,7 +77,7 @@ impl<T> Table<T> {
             // Allocate the table, zeroing the entries.
             let ptr = alloc::alloc_zeroed(layout);
             if ptr.is_null() {
-                alloc::handle_alloc_error(layout);
+                return Err(AllocationError::OutOfMemory);
             }
 
             // Write the table state.
