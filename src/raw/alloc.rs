@@ -65,7 +65,9 @@ impl<T> Table<T> {
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
         // Pad the meta table to fulfill the alignment requirement of an entry.
-        let capacity = (len + mem::align_of::<*mut T>() - 1) & !(mem::align_of::<*mut T>() - 1);
+        let capacity = (len + mem::align_of::<*mut T>() - 1)
+            .checked_add(!(mem::align_of::<*mut T>() - 1))
+            .ok_or(AllocationError::Overflow)?;
         let mask = len - 1;
         let limit = probe::limit(len);
 
