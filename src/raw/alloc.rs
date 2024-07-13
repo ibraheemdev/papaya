@@ -48,9 +48,19 @@ impl<T> Clone for Table<T> {
     }
 }
 
+#[derive(Debug)]
+pub enum AllocationError {
+    NotPowerOfTwo,
+    Overflow,
+    OutOfMemory,
+}
+
 impl<T> Table<T> {
     // Allocate a table with the provided length.
-    pub fn alloc(len: usize, collector: &Collector) -> Table<T> {
+    pub fn alloc(len: usize, collector: &Collector) -> Result<Table<T>, AllocationError> {
+        if !len.is_power_of_two() {
+            return Err(AllocationError::NotPowerOfTwo);
+        }
         assert!(len.is_power_of_two());
         assert!(mem::align_of::<seize::Link>() % mem::align_of::<*mut T>() == 0);
 
@@ -87,13 +97,13 @@ impl<T> Table<T> {
                 .cast::<u8>()
                 .write_bytes(super::meta::EMPTY, capacity);
 
-            Table {
+            Ok(Table {
                 mask,
                 limit,
                 capacity,
                 raw: ptr.cast::<RawTable>(),
                 _t: PhantomData,
-            }
+            })
         }
     }
 
