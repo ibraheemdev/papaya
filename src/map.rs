@@ -173,7 +173,7 @@ impl Default for ResizeMode {
 impl<K, V> HashMap<K, V> {
     /// Creates an empty `HashMap`.
     ///
-    /// The hash map is initially crated with a capacity of 0, so it will not allocate
+    /// The hash map is initially created with a capacity of 0, so it will not allocate
     /// until it is first inserted into.
     ///
     /// # Examples
@@ -1384,7 +1384,7 @@ where
 
     #[inline]
     fn root(&self) -> raw::HashMapRef<'_, K, V, S> {
-        // Safety: A `HashMapRef` can only be crated through `HashMap::pin` or
+        // Safety: A `HashMapRef` can only be created through `HashMap::pin` or
         // `HashMap::pin_owned`, so we know the guard belongs to our collector.
         unsafe { self.map.raw.root_unchecked(&self.guard) }
     }
