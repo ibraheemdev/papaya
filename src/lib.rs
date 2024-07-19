@@ -223,6 +223,9 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 mod map;
 mod raw;
 
+#[cfg(feature = "serde")]
+mod serde_impls;
+
 pub use map::{
     Compute, HashMap, HashMapBuilder, HashMapRef, Iter, Keys, OccupiedError, Operation, ResizeMode,
     Values,
