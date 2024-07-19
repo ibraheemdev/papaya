@@ -13,18 +13,19 @@ use common::{threads, with_map};
 
 // Call `contains_key` in parallel for a shared set of keys.
 #[test]
+#[ignore]
 fn contains_key_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
-        _ => 1 << 14,
+        _ => 1 << 19,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     with_map(|map| {
         for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
             let map = map();
-            let mut content = [0; ENTRIES];
+            let mut content = vec![0; ENTRIES];
 
             {
                 let guard = map.guard();
@@ -54,13 +55,14 @@ fn contains_key_stress() {
 
 // Call `insert` in parallel with each thread inserting a distinct set of keys.
 #[test]
+#[ignore]
 fn insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
-        _ => 1 << 14,
+        _ => 1 << 17,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
     struct Random(usize);
@@ -93,6 +95,7 @@ fn insert_stress() {
 
 // Call `insert` in parallel on a small shared set of keys.
 #[test]
+#[ignore]
 fn insert_overwrite_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
@@ -100,7 +103,7 @@ fn insert_overwrite_stress() {
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 9,
         _ => 1 << 10,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
@@ -173,14 +176,15 @@ fn insert_overwrite_stress() {
 
 // Call `update` in parallel for a small shared set of keys.
 #[test]
+#[ignore]
 fn update_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
-        _ => 1 << 11,
+        _ => 1 << 10,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
@@ -230,13 +234,14 @@ fn update_stress() {
 // Call `update` in parallel for a shared set of keys, with a single thread dedicated
 // to inserting unrelated keys. This is likely to cause interference with incremental resizing.
 #[test]
+#[ignore]
 fn update_insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
-        _ => 1 << 14,
+        _ => 1 << 18,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
 
     with_map(|map| {
         let map = map();
@@ -289,14 +294,15 @@ fn update_insert_stress() {
 // Call `update_or_insert` in parallel for a small shared set of keys.
 // Stresses the `insert` -> `update` transition in `compute`.
 #[test]
+#[ignore]
 fn update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
-        _ => 1 << 11,
+        _ => 1 << 10,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
 
     let threads = threads();
 
@@ -344,14 +350,15 @@ fn update_or_insert_stress() {
 //
 // Stresses the `update` <-> `insert` transition in `compute`.
 #[test]
+#[ignore]
 fn remove_update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 4,
-        _ => 1 << 7,
+        _ => 1 << 9,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let threads = threads();
 
@@ -424,14 +431,15 @@ fn remove_update_or_insert_stress() {
 //
 // Stresses the `remove` <-> `update` transition in `compute`.
 #[test]
+#[ignore]
 fn conditional_remove_update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 4,
-        _ => 1 << 7,
+        _ => 1 << 9,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let threads = threads();
 
@@ -506,14 +514,15 @@ fn conditional_remove_update_or_insert_stress() {
 
 // Call `remove` and `insert` in parallel for a shared set of keys.
 #[test]
+#[ignore]
 fn insert_remove_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 7,
-        _ => 1 << 7,
+        _ => 1 << 9,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
@@ -573,11 +582,12 @@ fn insert_remove_stress() {
 // and a dedicated thread for inserting unrelated keys. This is likely to cause interference
 // with incremental resizing.
 #[test]
+#[ignore]
 fn remove_mixed_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
-        _ => 1 << 14,
+        _ => 1 << 17,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
 
@@ -654,15 +664,81 @@ fn remove_mixed_stress() {
     });
 }
 
+// Performs insert and remove operations with each thread operating on a distinct set of keys.
+#[test]
+#[ignore]
+fn insert_remove_chunk_stress() {
+    const ENTRIES: usize = match () {
+        _ if cfg!(miri) => 48,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ => 1 << 17,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
+
+    let run =
+        |barrier: &Barrier, chunk: Range<usize>, map: &HashMap<usize, usize>, threads: usize| {
+            barrier.wait();
+
+            for i in chunk.clone() {
+                assert_eq!(map.pin().insert(i, i), None);
+            }
+
+            for i in chunk.clone() {
+                assert_eq!(map.pin().get(&i), Some(&i));
+            }
+
+            for i in chunk.clone() {
+                assert_eq!(map.pin().remove(&i), Some(&i));
+            }
+
+            for i in chunk.clone() {
+                assert_eq!(map.pin().get(&i), None);
+            }
+
+            if !cfg!(papaya_stress) {
+                for (&k, &v) in map.pin().iter() {
+                    assert!(k < ENTRIES * threads);
+                    assert!(v == k);
+                }
+            }
+        };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+            let threads = threads();
+            let barrier = Barrier::new(threads);
+
+            thread::scope(|s| {
+                for i in 0..threads {
+                    let map = &map;
+                    let barrier = &barrier;
+
+                    let chunk = (ENTRIES * i)..(ENTRIES * (i + 1));
+                    s.spawn(move || run(barrier, chunk, map, threads));
+                }
+            });
+
+            if !cfg!(papaya_stress) {
+                let got: Vec<_> = map.pin().into_iter().map(|(&k, &v)| (k, v)).collect();
+                assert_eq!(got, []);
+            }
+
+            assert_eq!(map.len(), 0);
+        }
+    });
+}
+
 // Performs a mix of operations with each thread operating on a distinct set of keys.
 #[test]
+#[ignore]
 fn mixed_chunk_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 48,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
-        _ => 1 << 14,
+        _ => 1 << 16,
     };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let run =
         |barrier: &Barrier, chunk: Range<usize>, map: &HashMap<usize, usize>, threads: usize| {
@@ -735,14 +811,15 @@ fn mixed_chunk_stress() {
 // Performs a mix of operations with each thread operating on a specific entry within
 // a distinct set of keys. This is more likely to cause interference with incremental resizing.
 #[test]
+#[ignore]
 fn mixed_entry_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 100,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
-        _ => 1 << 10,
+        _ => 1 << 11,
     };
     const OPERATIONS: usize = if cfg!(miri) { 1 } else { 72 };
-    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
 
     let run =
         |barrier: &Barrier, chunk: Range<usize>, map: &HashMap<usize, usize>, threads: usize| {
@@ -798,14 +875,15 @@ fn mixed_entry_stress() {
 
 // Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
 #[test]
+#[ignore]
 fn everything() {
     const SIZE: usize = match () {
         _ if cfg!(miri) => 1 << 5,
         _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 8,
-        _ => 1 << 16,
+        _ => 1 << 20,
     };
     // there must be more things absent than present!
-    const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 5 } else { 1 << 17 };
+    const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 6 } else { 1 << 22 };
     const ABSENT_MASK: usize = ABSENT_SIZE - 1;
 
     let mut rng = rand::thread_rng();

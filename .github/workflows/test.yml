@@ -42,6 +42,9 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
+      # run stress tests serially, as they individually spawn many threads to provoke contention
+      - name: stress tests
+        run: cargo test -- --ignored --test-threads 1
   os-check:
     # run cargo test on mac and windows
     runs-on: ${{ matrix.os }}
@@ -68,3 +71,6 @@ jobs:
         run: cargo generate-lockfile
       - name: cargo test
         run: cargo test --locked --all-features --all-targets
+      # run stress tests serially, as they individually spawn many threads to provoke contention
+      - name: stress tests
+        run: cargo test -- --ignored --test-threads 1
