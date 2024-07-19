@@ -1519,7 +1519,12 @@ where
     // Returns the next table, allocating it has not already been created.
     #[cold]
     fn get_or_alloc_next(&self, capacity: Option<usize>) -> Table<K, V> {
-        const SPIN_ALLOC: usize = 7;
+        // Avoid spinning in tests, which can hide race conditions.
+        const SPIN_ALLOC: usize = if cfg!(any(test, debug_assertions)) {
+            1
+        } else {
+            7
+        };
 
         let state = self.table.state();
         let next = state.next.load(Ordering::Acquire);
@@ -1690,7 +1695,12 @@ where
 
             // We copied all that we can, wait for the table to be promoted.
             for spun in 0.. {
-                const SPIN_WAIT: usize = 7;
+                // Avoid spinning in tests, which can hide race conditions.
+                const SPIN_WAIT: usize = if cfg!(any(test, debug_assertions)) {
+                    1
+                } else {
+                    7
+                };
 
                 let status = next.state().status.load(Ordering::Relaxed);
 
@@ -1818,7 +1828,12 @@ where
             }
 
             for spun in 0.. {
-                const SPIN_WAIT: usize = 7;
+                // Avoid spinning in tests, which can hide race conditions.
+                const SPIN_WAIT: usize = if cfg!(any(test, debug_assertions)) {
+                    1
+                } else {
+                    7
+                };
 
                 // The copy has completed.
                 let status = next.state().status.load(Ordering::Acquire);
@@ -1885,7 +1900,7 @@ where
         unsafe { self.table.entry(i).store(copied, Ordering::SeqCst) };
 
         // Notify any writers that the copy has completed.
-        self.table.state().parker.unpark(entry.ptr.addr());
+        unsafe { self.table.state().parker.unpark(self.table.entry(i)) };
     }
 
     // Copy an entry into the table, returning the index it was inserted into.
@@ -2047,14 +2062,18 @@ where
     // Wait for an incremental copy of a given entry to complete.
     #[inline]
     fn wait_copied(&self, i: usize) {
-        const SPIN_WAIT: usize = 5;
+        // Avoid spinning in tests, which can hide race conditions.
+        const SPIN_WAIT: usize = if cfg!(any(test, debug_assertions)) {
+            1
+        } else {
+            5
+        };
 
         let parker = &self.table.state().parker;
         let entry = unsafe { self.table.entry(i) };
 
         // Spin for a short while, waiting for the entry to be copied.
-        let mut spun = 0;
-        let addr = loop {
+        for spun in 0..SPIN_WAIT {
             for _ in 0..(spun * spun) {
                 hint::spin_loop();
             }
@@ -2064,15 +2083,10 @@ where
             if entry.tag() & Entry::COPIED != 0 {
                 return;
             }
-
-            spun += 1;
-            if spun > SPIN_WAIT {
-                break entry.ptr as usize;
-            }
-        };
+        }
 
         // Park until the copy completes.
-        parker.park(addr, entry, |entry| entry.addr() & Entry::COPIED == 0);
+        parker.park(entry, |entry| entry.addr() & Entry::COPIED == 0);
     }
 
     /// Retire an entry that was removed from the current table, but may still be reachable from
