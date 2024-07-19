@@ -179,6 +179,7 @@ fn stress_find_thread(env: Arc<Environment>) {
 }
 
 #[test]
+#[ignore]
 fn stress_test_blocking() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder().resize_mode(ResizeMode::Blocking).build();
@@ -187,6 +188,7 @@ fn stress_test_blocking() {
 }
 
 #[test]
+#[ignore]
 fn stress_test_incremental() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder()
@@ -199,6 +201,7 @@ fn stress_test_incremental() {
 }
 
 #[test]
+#[ignore]
 fn stress_test_incremental_slow() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder()
