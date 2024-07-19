@@ -1051,12 +1051,35 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
+    /// Returns a reference to the value corresponding to the key, or inserts a default value
+    /// computed from a closure.
+    #[inline]
+    pub fn get_or_insert_with<'g, F>(&mut self, key: K, f: F, guard: &'g impl Guard) -> &'g V
+    where
+        F: FnOnce() -> V,
+        K: 'g,
+    {
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Return the existing value.
+            Some((_, current)) => Operation::Abort(current),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Aborted(value) => value,
+            Compute::Inserted(_, value) => value,
+            _ => unreachable!(),
+        }
+    }
+
     // Updates an existing entry atomically, returning the value that was inserted.
     #[inline]
     pub fn update<'g, F>(&mut self, key: K, mut update: F, guard: &'g impl Guard) -> Option<&'g V>
     where
         F: FnMut(&V) -> V,
-        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+        K: 'g,
     {
         let compute = |entry| match entry {
             Some((_, value)) => Operation::Insert(update(value)),
@@ -1068,6 +1091,37 @@ where
                 new: (_, value), ..
             } => Some(value),
             Compute::Aborted(_) => None,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Updates an existing entry or inserts a default value computed from a closure.
+    #[inline]
+    pub fn update_or_insert_with<'g, U, F>(
+        &mut self,
+        key: K,
+        update: U,
+        f: F,
+        guard: &'g impl Guard,
+    ) -> &'g V
+    where
+        F: FnOnce() -> V,
+        U: Fn(&V) -> V,
+        K: 'g,
+    {
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // Perform the update.
+            Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
+            // Insert the initial value.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Updated {
+                new: (_, value), ..
+            } => value,
+            Compute::Inserted(_, value) => value,
             _ => unreachable!(),
         }
     }

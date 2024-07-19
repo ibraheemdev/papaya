@@ -432,7 +432,7 @@ where
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g, // TODO: this bound is necessary because `raw::HashMap::get` returns the full entry.
+        K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
     {
         match self.raw.root(guard).get(key, guard) {
@@ -590,21 +590,9 @@ where
     pub fn get_or_insert_with<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> &'g V
     where
         F: FnOnce() -> V,
-        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+        K: 'g,
     {
-        let mut f = Some(f);
-        let compute = |entry| match entry {
-            // Return the existing value.
-            Some((_, current)) => Operation::Abort(current),
-            // Insert the initial value.
-            None => Operation::Insert((f.take().unwrap())()),
-        };
-
-        match self.compute(key, compute, guard) {
-            Compute::Aborted(value) => value,
-            Compute::Inserted(_, value) => value,
-            _ => unreachable!(),
-        }
+        self.raw.root(guard).get_or_insert_with(key, f, guard)
     }
 
     /// Updates an existing entry atomically.
@@ -672,7 +660,7 @@ where
     ) -> &'g V
     where
         F: Fn(&V) -> V,
-        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+        K: 'g,
     {
         self.update_or_insert_with(key, update, || value, guard)
     }
@@ -706,23 +694,11 @@ where
     where
         F: FnOnce() -> V,
         U: Fn(&V) -> V,
-        K: 'g, // TODO: this bound is necessary because `HashMap::compute` returns the full entry.
+        K: 'g,
     {
-        let mut f = Some(f);
-        let compute = |entry| match entry {
-            // Perform the update.
-            Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
-            // Insert the initial value.
-            None => Operation::Insert((f.take().unwrap())()),
-        };
-
-        match self.compute(key, compute, guard) {
-            Compute::Updated {
-                new: (_, value), ..
-            } => value,
-            Compute::Inserted(_, value) => value,
-            _ => unreachable!(),
-        }
+        self.raw
+            .root(guard)
+            .update_or_insert_with(key, update, f, guard)
     }
 
     /// Updates an entry with a compare-and-swap (CAS) function.
@@ -803,7 +779,7 @@ where
     #[inline]
     pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g, // TODO: this bound is necessary because `raw::HashMap::remove` returns the full entry.
+        K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
     {
         match self.raw.root(guard).remove(key, guard) {
@@ -1263,6 +1239,7 @@ where
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
     ///
     /// See [`HashMap::get_or_insert`] for details.
+    #[inline]
     pub fn get_or_insert(&self, key: K, value: V) -> &V {
         // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
         // allows us to avoid the closure indirection.
@@ -1276,28 +1253,18 @@ where
     /// computed from a closure.
     ///
     /// See [`HashMap::get_or_insert_with`] for details.
+    #[inline]
     pub fn get_or_insert_with<F>(&self, key: K, f: F) -> &V
     where
         F: FnOnce() -> V,
     {
-        let mut f = Some(f);
-        let compute = |entry| match entry {
-            // Return the existing value.
-            Some((_, current)) => Operation::Abort(current),
-            // Insert the initial value.
-            None => Operation::Insert((f.take().unwrap())()),
-        };
-
-        match self.compute(key, compute) {
-            Compute::Aborted(value) => value,
-            Compute::Inserted(_, value) => value,
-            _ => unreachable!(),
-        }
+        self.root().get_or_insert_with(key, f, &self.guard)
     }
 
     /// Updates an existing entry atomically.
     ///
     /// See [`HashMap::update`] for details.
+    #[inline]
     pub fn update<F>(&self, key: K, update: F) -> Option<&V>
     where
         F: Fn(&V) -> V,
@@ -1308,6 +1275,7 @@ where
     /// Updates an existing entry or inserts a default value.
     ///
     /// See [`HashMap::update_or_insert`] for details.
+    #[inline]
     pub fn update_or_insert<F>(&self, key: K, update: F, value: V) -> &V
     where
         F: Fn(&V) -> V,
@@ -1318,26 +1286,14 @@ where
     /// Updates an existing entry or inserts a default value computed from a closure.
     ///
     /// See [`HashMap::update_or_insert_with`] for details.
+    #[inline]
     pub fn update_or_insert_with<U, F>(&self, key: K, update: U, f: F) -> &V
     where
         F: FnOnce() -> V,
         U: Fn(&V) -> V,
     {
-        let mut f = Some(f);
-        let compute = |entry| match entry {
-            // Perform the update.
-            Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
-            // Insert the initial value.
-            None => Operation::Insert((f.take().unwrap())()),
-        };
-
-        match self.compute(key, compute) {
-            Compute::Updated {
-                new: (_, value), ..
-            } => value,
-            Compute::Inserted(_, value) => value,
-            _ => unreachable!(),
-        }
+        self.root()
+            .update_or_insert_with(key, update, f, &self.guard)
     }
 
     // Updates an entry with a compare-and-swap (CAS) function.
