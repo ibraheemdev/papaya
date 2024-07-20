@@ -782,6 +782,9 @@ where
                 match EntryStatus::from(found) {
                     EntryStatus::Value(found) | EntryStatus::Copied(found) => {
                         // An entry was inserted, we have to hash it to get the metadata.
+                        //
+                        // The logic is the same for copied entries here as we have to
+                        // check if the key matches and continue the update in the new table.
                         let hash = self.root.hasher.hash_one(&(*found.ptr).key);
                         (meta::h2(hash), EntryStatus::Value(found))
                     }
@@ -842,10 +845,10 @@ where
             }
 
             // The entry was copied.
-            EntryStatus::Copied(entry) => {
-                // Acquire the next table.
-                EntryStatus::Copied(entry)
-            }
+            //
+            // We don't need to protect the entry as we never access it,
+            // we wait for it to be copied and continue in the new table.
+            EntryStatus::Copied(entry) => EntryStatus::Copied(entry),
 
             // The entry was deleted.
             removed => removed,
