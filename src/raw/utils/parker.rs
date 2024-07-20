@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, Thread};
 
@@ -13,20 +13,29 @@ use std::thread::{self, Thread};
 // a bottleneck.
 #[derive(Default)]
 pub struct Parker {
-    pending: AtomicUsize,
+    pending: AtomicU64,
     state: Mutex<State>,
 }
 
 #[derive(Default)]
 struct State {
-    count: usize,
-    threads: HashMap<usize, HashMap<usize, Thread>>,
+    count: u64,
+    threads: HashMap<usize, HashMap<u64, Thread>>,
 }
 
 impl Parker {
     // Block the current thread until the park condition is false.
-    pub fn park<T>(&self, key: usize, atomic: &AtomicPtr<T>, should_park: impl Fn(*mut T) -> bool) {
+    pub fn park<T>(&self, atomic: &AtomicPtr<T>, should_park: impl Fn(*mut T) -> bool) {
+        let key = atomic as *const _ as usize;
+
         loop {
+            // Announce our thread.
+            //
+            // This must be done before inserting our thread to prevent
+            // incorrect decrements if we are unparked in-between inserting
+            // the thread and incrementing the counter.
+            self.pending.fetch_add(1, Ordering::SeqCst);
+
             // Insert our thread into the parker.
             let id = {
                 let state = &mut *self.state.lock().unwrap();
@@ -38,20 +47,21 @@ impl Parker {
                 state.count
             };
 
-            self.pending.fetch_add(1, Ordering::SeqCst);
-
             // Check the park condition.
             if !should_park(atomic.load(Ordering::SeqCst)) {
                 // Don't need to park, remove our thread if it wasn't already unparked.
-                let mut state = self.state.lock().unwrap();
-                if state
-                    .threads
-                    .get_mut(&key)
-                    .and_then(|threads| threads.remove(&id))
-                    .is_some()
-                {
+                let thread = {
+                    let mut state = self.state.lock().unwrap();
+                    state
+                        .threads
+                        .get_mut(&key)
+                        .and_then(|threads| threads.remove(&id))
+                };
+
+                if thread.is_some() {
                     self.pending.fetch_sub(1, Ordering::Relaxed);
                 }
+
                 return;
             }
 
@@ -76,18 +86,26 @@ impl Parker {
         }
     }
 
-    // Unpark all threads under the given key.
+    // Unpark all threads waiting on the given atomic.
     //
     // Note that any modifications must be `SeqCst` to be visible to unparked threads.
-    pub fn unpark(&self, key: usize) {
+    pub fn unpark<T>(&self, atomic: &AtomicPtr<T>) {
+        let key = atomic as *const _ as usize;
+
         // Fast-path, no one waiting to be unparked.
         if self.pending.load(Ordering::SeqCst) == 0 {
             return;
         }
 
-        let mut state = self.state.lock().unwrap();
-        if let Some(threads) = state.threads.remove(&key) {
-            self.pending.fetch_sub(threads.len(), Ordering::Relaxed);
+        // Remove and unpark any threads waiting on the atomic.
+        let threads = {
+            let mut state = self.state.lock().unwrap();
+            state.threads.remove(&key)
+        };
+
+        if let Some(threads) = threads {
+            let unparked = threads.len() as u64;
+            self.pending.fetch_sub(unparked, Ordering::Relaxed);
 
             for (_, thread) in threads {
                 thread.unpark();
