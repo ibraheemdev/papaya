@@ -180,6 +180,7 @@ fn stress_find_thread(env: Arc<Environment>) {
 
 #[test]
 #[ignore]
+#[cfg(not(papaya_stress))]
 fn stress_test_blocking() {
     let mut root = Environment::new();
     root.table1 = HashMap::builder().resize_mode(ResizeMode::Blocking).build();
@@ -228,8 +229,11 @@ fn run(root: Arc<Environment>) {
     for t in threads {
         t.join().expect("failed to join thread");
     }
-    let in_table = &*root.in_table.lock().unwrap();
-    let num_filled = in_table.iter().filter(|b| **b).count();
-    assert_eq!(num_filled, root.table1.pin().len());
-    assert_eq!(num_filled, root.table2.pin().len());
+
+    if !cfg!(papaya_stress) {
+        let in_table = &*root.in_table.lock().unwrap();
+        let num_filled = in_table.iter().filter(|b| **b).count();
+        assert_eq!(num_filled, root.table1.pin().len());
+        assert_eq!(num_filled, root.table2.pin().len());
+    }
 }

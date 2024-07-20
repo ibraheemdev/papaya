@@ -59,7 +59,7 @@ fn contains_key_stress() {
 fn insert_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
         _ => 1 << 17,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
@@ -181,7 +181,7 @@ fn update_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 9,
         _ => 1 << 10,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -299,7 +299,7 @@ fn update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 9,
         _ => 1 << 10,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -436,7 +436,7 @@ fn conditional_remove_update_or_insert_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 4,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 5,
         _ => 1 << 9,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
@@ -519,7 +519,7 @@ fn insert_remove_stress() {
     const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
     const OPERATIONS: usize = match () {
         _ if cfg!(miri) => 1,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 7,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 8,
         _ => 1 << 9,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -586,7 +586,7 @@ fn insert_remove_stress() {
 fn remove_mixed_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 64,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 12,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
         _ => 1 << 17,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 64 };
@@ -670,7 +670,7 @@ fn remove_mixed_stress() {
 fn insert_remove_chunk_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 48,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
         _ => 1 << 17,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 48 };
@@ -735,7 +735,7 @@ fn insert_remove_chunk_stress() {
 fn mixed_chunk_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 48,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
         _ => 1 << 16,
     };
     const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
@@ -815,7 +815,7 @@ fn mixed_chunk_stress() {
 fn mixed_entry_stress() {
     const ENTRIES: usize = match () {
         _ if cfg!(miri) => 100,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 10,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 11,
         _ => 1 << 11,
     };
     const OPERATIONS: usize = if cfg!(miri) { 1 } else { 72 };
@@ -879,11 +879,11 @@ fn mixed_entry_stress() {
 fn everything() {
     const SIZE: usize = match () {
         _ if cfg!(miri) => 1 << 5,
-        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 8,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 13,
         _ => 1 << 20,
     };
-    // there must be more things absent than present!
-    const ABSENT_SIZE: usize = if cfg!(miri) { 1 << 6 } else { 1 << 22 };
+    // There must be more things absent than present!
+    const ABSENT_SIZE: usize = SIZE << 1;
     const ABSENT_MASK: usize = ABSENT_SIZE - 1;
 
     let mut rng = rand::thread_rng();

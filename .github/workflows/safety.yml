@@ -42,13 +42,24 @@ jobs:
         name: Enable debug symbols
       - name: cargo test -Zsanitizer=address
         # only --lib --tests b/c of https://github.com/rust-lang/rust/issues/53945
-        run: RUSTFLAGS="--cfg papaya_asan" cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu
         env:
           ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
-          RUSTFLAGS: "-Z sanitizer=address"
+          RUSTFLAGS: "-Z sanitizer=address --cfg papaya_asan"
+      - name: stress tests -Zsanitizer=address
+        run: cargo test --lib --tests --all-features --target x86_64-unknown-linux-gnu -- --ignored --test-threads 1
+        env:
+          ASAN_OPTIONS: "detect_odr_violation=0:detect_leaks=0"
+          RUSTFLAGS: "-Z sanitizer=address --cfg papaya_asan"
       - name: cargo test -Zsanitizer=leak
         if: always()
         run: cargo test --all-features --target x86_64-unknown-linux-gnu
+        env:
+          LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
+          RUSTFLAGS: "-Z sanitizer=leak"
+      - name: stress tests -Zsanitizer=leak
+        if: always()
+        run: cargo test --all-features --target x86_64-unknown-linux-gnu -- --ignored --test-threads 1
         env:
           LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
