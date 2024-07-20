@@ -71,7 +71,7 @@ jobs:
     # run resize stress tests on linux and mac
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
-    name: ${{ matrix.os }} / stable
+    name: ${{ matrix.os }} / stress
     strategy:
       fail-fast: false
       matrix:
