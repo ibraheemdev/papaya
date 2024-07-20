@@ -78,6 +78,7 @@ jobs:
           toolchain: ${{ env.NIGHTLY }}
           components: miri
       - name: cargo miri test
-        run: cargo miri test
+        run: cargo miri test -- --ignored
         env:
-          MIRIFLAGS: ""
+          # need this until feature(strict_provenance_atomic_ptr) is stabilized
+          MIRIFLAGS: "-Zmiri-permissive-provenance"

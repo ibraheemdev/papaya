@@ -420,7 +420,7 @@ fn concurrent_update() {
 }
 
 #[test]
-#[cfg_attr(miri, ignore)]
+#[cfg(not(miri))]
 fn concurrent_resize_and_get() {
     if cfg!(papaya_stress) {
         return;
