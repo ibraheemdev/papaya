@@ -672,6 +672,17 @@ fn from_iter_empty() {
 }
 
 #[test]
+fn from_iter_repeated() {
+    use std::iter::FromIterator;
+
+    let entries = vec![(0, 1), (0, 2), (0, 3)];
+    let map: HashMap<_, _> = HashMap::from_iter(entries.into_iter());
+    let map = map.pin();
+    assert_eq!(map.len(), 1);
+    assert_eq!(map.iter().collect::<Vec<_>>(), vec![(&0, &3)])
+}
+
+#[test]
 fn len() {
     with_map::<usize, usize>(|map| {
         let map = map();

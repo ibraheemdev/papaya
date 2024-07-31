@@ -1086,16 +1086,19 @@ where
         let mut iter = iter.into_iter();
 
         if let Some((key, value)) = iter.next() {
-            // safety: we own `map`
-            let guard = unsafe { seize::unprotected() };
-
             let (lower, _) = iter.size_hint();
             let map = HashMap::with_capacity_and_hasher(lower.saturating_add(1), S::default());
 
-            map.insert(key, value, &guard);
-
-            for (key, value) in iter {
-                map.insert(key, value, &guard);
+            // Ideally we could use an unprotected guard here. However, `insert`
+            // returns references to values that were replaced and retired, so
+            // we need a "real" guard. A `raw_insert` method that strictly returns
+            // pointers would fix this.
+            {
+                let map = map.pin();
+                map.insert(key, value);
+                for (key, value) in iter {
+                    map.insert(key, value);
+                }
             }
 
             map
