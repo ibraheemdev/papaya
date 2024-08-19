@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
 use std::sync::atomic::{fence, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::{hint, ptr};
+use std::{hint, panic, ptr};
 
 use self::alloc::RawTable;
 use self::probe::Probe;
@@ -1048,6 +1048,51 @@ where
     }
 }
 
+// A lazy initialized `Entry` allocation.
+enum LazyEntry<K, V> {
+    // An uninitialized entry, containing just the owned key.
+    Uninit(K),
+    // An allocated entry.
+    Init(*mut Entry<K, MaybeUninit<V>>),
+}
+
+impl<K, V> LazyEntry<K, V> {
+    // Returns a reference to the entry's key.
+    #[inline]
+    fn key(&self) -> &K {
+        match self {
+            LazyEntry::Uninit(key) => key,
+            LazyEntry::Init(entry) => unsafe { &(**entry).key },
+        }
+    }
+
+    // Initializes the entry if it has not already been initialized, returning the pointer.
+    #[inline]
+    fn init(&mut self, collector: &Collector) -> *mut Entry<K, MaybeUninit<V>> {
+        match self {
+            LazyEntry::Init(entry) => *entry,
+            LazyEntry::Uninit(key) => {
+                // Safety: we read the current key with `ptr::read` and overwrite the
+                // state with `ptr::write`. We also make sure to abort if the allocator
+                // panics, ensuring the current value is not dropped twice.
+                unsafe {
+                    let key = ptr::read(key);
+                    let entry = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        Box::into_raw(Box::new(Entry {
+                            link: collector.link(),
+                            value: MaybeUninit::uninit(),
+                            key,
+                        }))
+                    }))
+                    .unwrap_or_else(|_| std::process::abort());
+                    ptr::write(self, LazyEntry::Init(entry));
+                    entry
+                }
+            }
+        }
+    }
+}
+
 // Update operations.
 impl<'root, K, V, S> HashMapRef<'root, K, V, S>
 where
@@ -1143,22 +1188,21 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        // Initialize the entry we will be inserting.
-        let entry = Box::into_raw(Box::new(Entry {
-            key,
-            link: self.root.collector.link(),
-            value: MaybeUninit::uninit(),
-        }));
+        // Lazy initialize the entry allocation.
+        let mut entry = LazyEntry::Uninit(key);
 
         // Perform the update.
         //
         // Safety: We just allocated the entry above.
-        let result = unsafe { self.compute_with(entry, ComputeState::new(compute), true, guard) };
+        let result =
+            unsafe { self.compute_with(&mut entry, ComputeState::new(compute), true, guard) };
 
         // Deallocate the entry if it was not inserted.
         if matches!(result, Compute::Removed(..) | Compute::Aborted(_)) {
-            // Safety: We allocated this box above and it was not inserted into the map.
-            let _ = unsafe { Box::from_raw(entry) };
+            if let LazyEntry::Init(entry) = entry {
+                // Safety: We allocated this box above and it was not inserted into the map.
+                let _ = unsafe { Box::from_raw(entry) };
+            }
         }
 
         result
@@ -1172,7 +1216,7 @@ where
     #[inline]
     unsafe fn compute_with<'g, F, T>(
         &mut self,
-        new_entry: *mut Entry<K, MaybeUninit<V>>,
+        new_entry: &mut LazyEntry<K, V>,
         mut state: ComputeState<F, K, V, T>,
         help_copy: bool,
         guard: &'g impl Guard,
@@ -1193,11 +1237,8 @@ where
             self.init(None);
         }
 
-        // Safety: The new entry is guaranteed to be valid by the caller.
-        let key = unsafe { &(*new_entry).key };
-
         // Initialize the probe state.
-        let (h1, h2) = self.hash(key);
+        let (h1, h2) = self.hash(new_entry.key());
         let mut probe = Probe::start(h1, self.table.mask);
 
         // Probe until we reach the limit.
@@ -1218,6 +1259,7 @@ where
                     Operation::Abort(value) => return Compute::Aborted(value),
                 };
 
+                let new_entry = new_entry.init(&self.root.collector);
                 unsafe { (*new_entry).value = MaybeUninit::new(value) }
 
                 // Attempt to insert.
@@ -1279,7 +1321,7 @@ where
             };
 
             // Check for a full match.
-            if unsafe { (*entry.ptr).key != *key } {
+            if unsafe { (*entry.ptr).key != *new_entry.key() } {
                 probe.next(self.table.mask);
                 continue 'probe;
             }
@@ -1297,6 +1339,7 @@ where
 
                     // Update the value.
                     Operation::Insert(value) => {
+                        let new_entry = new_entry.init(&self.root.collector);
                         unsafe { (*new_entry).value = MaybeUninit::new(value) }
 
                         // Try to perform the update.
