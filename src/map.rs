@@ -858,6 +858,31 @@ where
         self.raw.root(guard).clear(guard)
     }
 
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// In other words, remove all pairs `(k, v)` for which `f(&k, &v)` returns `false`.
+    /// The elements are visited in unsorted (and unspecified) order.
+    ///
+    /// Note the function may be called more than once for a given key if its value is
+    /// concurrently modified during removal.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x * 10)).collect();
+    /// map.pin().retain(|&k, _| k % 2 == 0);
+    /// assert_eq!(map.len(), 4);
+    /// ```
+    #[inline]
+    pub fn retain<F>(&mut self, f: F, guard: &impl Guard)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.raw.root(guard).retain(f, guard)
+    }
+
     /// An iterator visiting all key-value pairs in arbitrary order.
     /// The iterator element type is `(&K, &V)`.
     ///
@@ -1345,6 +1370,17 @@ where
     #[inline]
     pub fn clear(&self) {
         self.root().clear(&self.guard)
+    }
+
+    /// Retains only the elements specified by the predicate.
+    ///
+    /// See [`HashMap::retain`] for details.
+    #[inline]
+    pub fn retain<F>(&mut self, f: F)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.root().retain(f, &self.guard)
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted

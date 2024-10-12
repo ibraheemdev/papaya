@@ -901,15 +901,15 @@ where
                 unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }.unpack();
 
             loop {
-                // Found a non-empty entry being copied.
-                if entry.tag() & Entry::COPYING != 0 && !entry.ptr.is_null() {
-                    // Clear every entry in this table that we can, then deal with the copy.
-                    copying = true;
+                // The entry is empty or already deleted.
+                if entry.ptr.is_null() {
                     continue 'probe;
                 }
 
-                // The entry is empty or already deleted.
-                if entry.ptr.is_null() {
+                // Found a non-empty entry being copied.
+                if entry.tag() & Entry::COPYING != 0 {
+                    // Clear every entry in this table that we can, then deal with the copy.
+                    copying = true;
                     continue 'probe;
                 }
 
@@ -951,6 +951,95 @@ where
         if copying {
             let next_table = self.help_copy(guard, true);
             return self.as_ref(next_table).clear(guard);
+        }
+    }
+
+    // Retains only the elements specified by the predicate..
+    #[inline]
+    pub fn retain<F>(&mut self, mut f: F, guard: &impl Guard)
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        if self.table.raw.is_null() {
+            return;
+        }
+
+        // Get a clean copy of the table to delete from.
+        self.linearize(guard);
+
+        let mut copying = false;
+        'probe: for i in 0..self.table.len() {
+            // Load the entry metadata first to ensure consistency with calls to `get`
+            // for entries that are retained.
+            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+
+            // The entry is empty or deleted.
+            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
+                continue 'probe;
+            }
+
+            // Load the entry to delete.
+            let mut entry =
+                unsafe { guard.protect(self.table.entry(i), Ordering::Acquire) }.unpack();
+
+            loop {
+                // The entry is empty or already deleted.
+                if entry.ptr.is_null() {
+                    continue 'probe;
+                }
+
+                // Found a non-empty entry being copied.
+                if entry.tag() & Entry::COPYING != 0 {
+                    // Clear every entry in this table that we can, then deal with the copy.
+                    copying = true;
+                    continue 'probe;
+                }
+
+                let entry_ref = unsafe { &*entry.raw };
+
+                // Should we retain this entry?
+                if f(&entry_ref.key, &entry_ref.value) {
+                    continue 'probe;
+                }
+
+                // Try to delete the entry.
+                let result = unsafe {
+                    self.table.entry(i).compare_exchange(
+                        entry.raw,
+                        Entry::TOMBSTONE,
+                        Ordering::Release,
+                        Ordering::Acquire,
+                    )
+                };
+
+                match result {
+                    // Successfully deleted the entry.
+                    Ok(_) => unsafe {
+                        // Update the metadata table.
+                        self.table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+
+                        // Decrement the table length.
+                        let count = self.root.count.get(guard.thread_id());
+                        count.fetch_sub(1, Ordering::Relaxed);
+
+                        // Safety: We just removed the old value from this table.
+                        self.defer_retire(entry, guard);
+
+                        continue 'probe;
+                    },
+
+                    // Lost to a concurrent update, retry.
+                    Err(found) => entry = found.unpack(),
+                }
+            }
+        }
+
+        // A resize prevented us from deleting all the entries in this table.
+        //
+        // Complete the resize and retry in the new table.
+        if copying {
+            let next_table = self.help_copy(guard, true);
+            return self.as_ref(next_table).retain(f, guard);
         }
     }
 

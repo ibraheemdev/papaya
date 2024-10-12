@@ -690,7 +690,7 @@ fn len() {
         for i in 0..len {
             map.pin().insert(i, i + 1);
         }
-        assert_eq!(map.pin().len(), len);
+        assert_eq!(map.len(), len);
     });
 }
 
@@ -711,6 +711,54 @@ fn iter() {
         let mut got: Vec<_> = map.pin().iter().map(|(&k, &v)| (k, v)).collect();
         got.sort();
         assert_eq!(v, got);
+    });
+}
+
+#[test]
+fn retain_empty() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        map.pin().retain(|_, _| false);
+        assert_eq!(map.len(), 0);
+    });
+}
+
+#[test]
+fn retain_all_false() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        for i in 0..10 {
+            map.pin().insert(i, i);
+        }
+        map.pin().retain(|_, _| false);
+        assert_eq!(map.len(), 0);
+    });
+}
+
+#[test]
+fn retain_all_true() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        for i in 0..10 {
+            map.pin().insert(i, i);
+        }
+        map.pin().retain(|_, _| true);
+        assert_eq!(map.len(), 10);
+    });
+}
+
+#[test]
+fn retain_some() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        for i in 0..10 {
+            map.pin().insert(i, i);
+        }
+        map.pin().retain(|_, v| *v >= 5);
+        assert_eq!(map.len(), 5);
+        let mut got: Vec<_> = map.pin().values().copied().collect();
+        got.sort();
+        assert_eq!(got, [5, 6, 7, 8, 9]);
     });
 }
 
