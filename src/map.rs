@@ -159,6 +159,9 @@ pub enum ResizeMode {
     ///
     /// If insert latency is not a concern, such as if the keys in your map are stable, enabling blocking
     /// resizes may yield better performance.
+    ///
+    /// Blocking resizing may also be a better option if you rely heavily on iteration or similar
+    /// operations, as they require completing any in-progress resizes for consistency.
     Blocking,
 }
 
@@ -842,6 +845,10 @@ where
 
     /// Clears the map, removing all key-value pairs.
     ///
+    /// Note that this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
+    ///
     /// # Examples
     ///
     /// ```
@@ -866,6 +873,10 @@ where
     /// Note the function may be called more than once for a given key if its value is
     /// concurrently modified during removal.
     ///
+    /// Additionally, this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
+    ///
     /// # Examples
     ///
     /// ```
@@ -885,6 +896,10 @@ where
 
     /// An iterator visiting all key-value pairs in arbitrary order.
     /// The iterator element type is `(&K, &V)`.
+    ///
+    /// Note that this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
     ///
     /// # Examples
     ///
@@ -913,6 +928,10 @@ where
     /// An iterator visiting all keys in arbitrary order.
     /// The iterator element type is `&K`.
     ///
+    /// Note that this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
+    ///
     /// # Examples
     ///
     /// ```
@@ -940,6 +959,10 @@ where
 
     /// An iterator visiting all values in arbitrary order.
     /// The iterator element type is `&V`.
+    ///
+    /// Note that this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
     ///
     /// # Examples
     ///

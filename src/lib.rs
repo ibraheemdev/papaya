@@ -81,6 +81,8 @@ Due to the concurrent nature of the map, read and write operations may overlap i
 
 Aggregate operations, such as iterators, rely on a weak snapshot of the table and return results reflecting the state of the table at or some point after the creation of the iterator. This means that they may, but are not guaranteed to, reflect concurrent modifications to the table that occur during iteration. Similarly, operations such as `clear` and `clone` rely on iteration and may not produce "perfect" results if the map is being concurrently modified.
 
+Note that to obtain a stable snapshot of the table, aggregate table operations require completing any in-progress resizes. If you rely heavily on iteration or similar operations you should consider configuring [`ResizeMode::Blocking`].
+
 # Atomic Operations
 
 As mentioned above, `papaya` does not support locking keys to prevent access, which makes performing complex operations more challenging. Instead, `papaya` exposes a number of atomic operations. The most basic of these is [`HashMap::update`], which can be used to update an existing value in the map using a closure:
