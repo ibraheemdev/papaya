@@ -894,6 +894,8 @@ where
         // Get a clean copy of the table to delete from.
         self.linearize(guard);
 
+        // Note that this method is not implemented in terms of `retain(|_, _| true)` to avoid
+        // loading entry metadata, as there is no need to provide consistency with `get`.
         let mut copying = false;
         'probe: for i in 0..self.table.len() {
             // Load the entry to delete.

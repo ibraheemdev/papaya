@@ -873,6 +873,115 @@ fn mixed_entry_stress() {
     });
 }
 
+// Clears the map during concurrent insertion.
+//
+// This test is relatively vague as there are few guarantees observable from concurrent calls
+// to `clear` but still useful for Miri.
+#[test]
+#[ignore]
+fn clear_stress() {
+    if cfg!(papaya_stress) {
+        return;
+    }
+
+    const ENTRIES: usize = match () {
+        _ if cfg!(miri) => 64,
+        _ if cfg!(papaya_asan) => 1 << 12,
+        _ => 1 << 17,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
+
+    #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
+    struct Random(usize);
+
+    fn random() -> Random {
+        Random(rand::thread_rng().gen())
+    }
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+            let threads = threads();
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                for _ in 0..(threads - 1) {
+                    s.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..ENTRIES {
+                            let key = random();
+                            map.pin().insert(key, key);
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..(threads * 20) {
+                        map.pin().clear();
+                    }
+                });
+            });
+
+            map.pin().clear();
+            assert_eq!(map.len(), 0);
+            assert_eq!(map.pin().iter().count(), 0);
+        }
+    });
+}
+
+// Retains the map during concurrent insertion.
+#[test]
+#[ignore]
+fn retain_stress() {
+    if cfg!(papaya_stress) {
+        return;
+    }
+
+    const ENTRIES: usize = match () {
+        _ if cfg!(miri) => 64,
+        _ if cfg!(papaya_asan) => 1 << 12,
+        _ => 1 << 17,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
+
+    #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
+    struct Random(usize);
+
+    fn random() -> Random {
+        Random(rand::thread_rng().gen())
+    }
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+            let threads = threads();
+            let barrier = Barrier::new(threads);
+            thread::scope(|s| {
+                for _ in 0..(threads - 1) {
+                    s.spawn(|| {
+                        barrier.wait();
+                        for _ in 0..ENTRIES {
+                            let key = random();
+                            map.insert(key, key, &map.guard());
+                            assert!(map.contains_key(&key, &map.guard()));
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..(threads * 20) {
+                        map.pin().retain(|_, _| true);
+                    }
+                });
+            });
+
+            assert_eq!(map.len(), ENTRIES * (threads - 1));
+            assert_eq!(map.pin().iter().count(), ENTRIES * (threads - 1));
+        }
+    });
+}
+
 // Adapted from: https://github.com/jonhoo/flurry/tree/main/tests/jdk
 #[test]
 #[ignore]
