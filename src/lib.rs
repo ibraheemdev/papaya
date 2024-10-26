@@ -224,6 +224,7 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 
 mod map;
 mod raw;
+mod set;
 
 #[cfg(feature = "serde")]
 mod serde_impls;
@@ -233,3 +234,4 @@ pub use map::{
     Values,
 };
 pub use seize::{Guard, LocalGuard, OwnedGuard};
+pub use set::{HashSet, HashSetBuilder, HashSetRef};
