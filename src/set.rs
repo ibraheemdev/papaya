@@ -8,10 +8,10 @@ use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
-/// A concurrent hash table.
+/// A concurrent hash set.
 ///
-/// Most hash table operations require a [`Guard`](crate::Guard), which can be acquired through
-/// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate#usage)
+/// Most hash set operations require a [`Guard`](crate::Guard), which can be acquired through
+/// [`HashSet::guard`] or using the [`HashSet::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
 pub struct HashSet<K, S = RandomState> {
     raw: raw::HashMap<K, (), S>,
@@ -24,16 +24,16 @@ pub struct HashSet<K, S = RandomState> {
 unsafe impl<K: Send, S: Send> Send for HashSet<K, S> {}
 unsafe impl<K: Sync, S: Sync> Sync for HashSet<K, S> {}
 
-/// A builder for a [`HashMap`].
+/// A builder for a [`HashSet`].
 ///
 /// # Examples
 ///
 /// ```rust
-/// use papaya::{HashMap, ResizeMode};
+/// use papaya::{HashSet, ResizeMode};
 /// use seize::Collector;
 /// use std::collections::hash_map::RandomState;
 ///
-/// let map: HashMap<i32, i32> = HashMap::builder()
+/// let set: HashSet<i32> = HashSet::builder()
 ///     // Set the initial capacity.
 ///     .capacity(2048)
 ///     // Set the hasher.
@@ -42,7 +42,7 @@ unsafe impl<K: Sync, S: Sync> Sync for HashSet<K, S> {}
 ///     .resize_mode(ResizeMode::Blocking)
 ///     // Set a custom garbage collector.
 ///     .collector(Collector::new().batch_size(128))
-///     // Construct the hash map.
+///     // Construct the hash set.
 ///     .build();
 /// ```
 pub struct HashSetBuilder<K, S = RandomState> {
@@ -57,12 +57,12 @@ impl<K> HashSetBuilder<K> {
     /// Set the hash builder used to hash keys.
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
-    /// to allow HashMaps to be resistant to attacks that cause many collisions
+    /// to allow HashSets to be resistant to attacks that cause many collisions
     /// and very poor performance. Setting it manually using this function can
     /// expose a DoS attack vector.
     ///
     /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
-    /// the HashMap to be useful, see its documentation for details.
+    /// the HashSet to be useful, see its documentation for details.
     pub fn hasher<S>(self, hasher: S) -> HashSetBuilder<K, S> {
         HashSetBuilder {
             hasher,
@@ -75,11 +75,11 @@ impl<K> HashSetBuilder<K> {
 }
 
 impl<K, S> HashSetBuilder<K, S> {
-    /// Set the initial capacity of the map.
+    /// Set the initial capacity of the set.
     ///
-    /// The table should be able to hold at least `capacity` elements before resizing.
-    /// However, the capacity is an estimate, and the table may prematurely resize due
-    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
+    /// The set should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the set may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash set will not allocate.
     pub fn capacity(self, capacity: usize) -> HashSetBuilder<K, S> {
         HashSetBuilder {
             capacity,
@@ -90,7 +90,7 @@ impl<K, S> HashSetBuilder<K, S> {
         }
     }
 
-    /// Set the resizing mode of the map. See [`ResizeMode`] for details.
+    /// Set the resizing mode of the set. See [`ResizeMode`] for details.
     pub fn resize_mode(self, resize_mode: ResizeMode) -> Self {
         HashSetBuilder {
             resize_mode,
@@ -105,7 +105,7 @@ impl<K, S> HashSetBuilder<K, S> {
     ///
     /// This method may be useful when you want more control over garbage collection.
     ///
-    /// Note that all `Guard` references used to access the map must be produced by
+    /// Note that all `Guard` references used to access the set must be produced by
     /// the provided `collector`.
     pub fn collector(self, collector: Collector) -> Self {
         HashSetBuilder {
@@ -117,7 +117,7 @@ impl<K, S> HashSetBuilder<K, S> {
         }
     }
 
-    /// Construct a [`HashMap`] from the builder, using the configured options.
+    /// Construct a [`HashSet`] from the builder, using the configured options.
     pub fn build(self) -> HashSet<K, S> {
         HashSet {
             raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
@@ -153,15 +153,15 @@ impl<K> HashSet<K> {
 
     /// Creates an empty `HashSet` with the specified capacity.
     ///
-    /// The table should be able to hold at least `capacity` elements before resizing.
-    /// However, the capacity is an estimate, and the table may prematurely resize due
-    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
+    /// The set should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the set may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash set will not allocate.
     ///
     /// # Examples
     ///
     /// ```
     /// use papaya::HashSet;
-    /// let map: HashSet<&str> = HashSet::with_capacity(10);
+    /// let set: HashSet<&str> = HashSet::with_capacity(10);
     /// ```
     pub fn with_capacity(capacity: usize) -> HashSet<K> {
         HashSet::with_capacity_and_hasher(capacity, RandomState::new())
@@ -196,7 +196,7 @@ impl<K, S> HashSet<K, S> {
     /// keys.
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
-    /// to allow HashMaps to be resistant to attacks that cause many collisions
+    /// to allow HashSets to be resistant to attacks that cause many collisions
     /// and very poor performance. Setting it manually using this function can
     /// expose a DoS attack vector.
     ///
@@ -210,37 +210,37 @@ impl<K, S> HashSet<K, S> {
     /// use std::hash::RandomState;
     ///
     /// let s = RandomState::new();
-    /// let map = HashSet::with_hasher(s);
-    /// map.pin().insert(1);
+    /// let set = HashSet::with_hasher(s);
+    /// set.pin().insert(1);
     /// ```
     pub fn with_hasher(hash_builder: S) -> HashSet<K, S> {
         HashSet::with_capacity_and_hasher(0, hash_builder)
     }
 
-    /// Creates an empty `HashMap` with at least the specified capacity, using
+    /// Creates an empty `HashSet` with at least the specified capacity, using
     /// `hash_builder` to hash the keys.
     ///
-    /// The table should be able to hold at least `capacity` elements before resizing.
-    /// However, the capacity is an estimate, and the table may prematurely resize due
-    /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
+    /// The set should be able to hold at least `capacity` elements before resizing.
+    /// However, the capacity is an estimate, and the set may prematurely resize due
+    /// to poor hash distribution. If `capacity` is 0, the hash set will not allocate.
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
-    /// to allow HashMaps to be resistant to attacks that cause many collisions
+    /// to allow HashSets to be resistant to attacks that cause many collisions
     /// and very poor performance. Setting it manually using this function can
     /// expose a DoS attack vector.
     ///
     /// The `hasher` passed should implement the [`BuildHasher`] trait for
-    /// the HashMap to be useful, see its documentation for details.
+    /// the HashSet to be useful, see its documentation for details.
     ///
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     /// use std::hash::RandomState;
     ///
     /// let s = RandomState::new();
-    /// let map = HashMap::with_capacity_and_hasher(10, s);
-    /// map.pin().insert(1, 2);
+    /// let set = HashSet::with_capacity_and_hasher(10, s);
+    /// set.pin().insert(1);
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashSet<K, S> {
         HashSet {
@@ -253,7 +253,7 @@ impl<K, S> HashSet<K, S> {
         }
     }
 
-    /// Returns a pinned reference to the map.
+    /// Returns a pinned reference to the set.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
@@ -261,13 +261,13 @@ impl<K, S> HashSet<K, S> {
     pub fn pin(&self) -> HashSetRef<'_, K, S, LocalGuard<'_>> {
         HashSetRef {
             guard: self.guard(),
-            map: self,
+            set: self,
         }
     }
 
-    /// Returns a pinned reference to the map.
+    /// Returns a pinned reference to the set.
     ///
-    /// Unlike [`HashMap::pin`], the returned reference implements `Send` and `Sync`,
+    /// Unlike [`HashSet::pin`], the returned reference implements `Send` and `Sync`,
     /// allowing it to be held across `.await` points in work-stealing schedulers.
     /// This is especially useful for iterators.
     ///
@@ -277,11 +277,11 @@ impl<K, S> HashSet<K, S> {
     pub fn pin_owned(&self) -> HashSetRef<'_, K, S, OwnedGuard<'_>> {
         HashSetRef {
             guard: self.owned_guard(),
-            map: self,
+            set: self,
         }
     }
 
-    /// Returns a guard for use with this map.
+    /// Returns a guard for use with this set.
     ///
     /// Note that holding on to a guard prevents garbage collection.
     /// See the [crate-level documentation](crate#usage) for details.
@@ -290,7 +290,7 @@ impl<K, S> HashSet<K, S> {
         self.raw.collector().enter()
     }
 
-    /// Returns an owned guard for use with this map.
+    /// Returns an owned guard for use with this set.
     ///
     /// Owned guards implement `Send` and `Sync`, allowing them to be held across
     /// `.await` points in work-stealing schedulers. This is especially useful
@@ -309,44 +309,44 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    /// Returns the number of entries in the map.
+    /// Returns the number of entries in the set.
     ///
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
+    /// let set = HashSet::new();
     ///
-    /// map.pin().insert(1, "a");
-    /// map.pin().insert(2, "b");
-    /// assert!(map.len() == 2);
+    /// set.pin().insert(1);
+    /// set.pin().insert(2);
+    /// assert!(set.len() == 2);
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
         self.raw.len()
     }
 
-    /// Returns `true` if the map is empty. Otherwise returns `false`.
+    /// Returns `true` if the set is empty. Otherwise returns `false`.
     ///
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
-    /// assert!(map.is_empty());
-    /// map.pin().insert("a", 1);
-    /// assert!(!map.is_empty());
+    /// let set = HashSet::new();
+    /// assert!(set.is_empty());
+    /// set.pin().insert("a");
+    /// assert!(!set.is_empty());
     /// ```
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Returns `true` if the map contains a value for the specified key.
+    /// Returns `true` if the set contains a value for the specified key.
     ///
-    /// The key may be any borrowed form of the map's key type, but
+    /// The key may be any borrowed form of the set's key type, but
     /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
     /// the key type.
     ///
@@ -357,16 +357,16 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// m.insert(1, "a");
-    /// assert_eq!(m.contains_key(&1), true);
-    /// assert_eq!(m.contains_key(&2), false);
+    /// let set = HashSet::new();
+    /// let m = set.pin();
+    /// m.insert(1);
+    /// assert_eq!(m.contains(&1), true);
+    /// assert_eq!(m.contains(&2), false);
     /// ```
     #[inline]
-    pub fn contains_key<Q>(&self, key: &Q, guard: &impl Guard) -> bool
+    pub fn contains<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -376,7 +376,7 @@ where
 
     /// Returns a reference to the value corresponding to the key.
     ///
-    /// The key may be any borrowed form of the map's key type, but
+    /// The key may be any borrowed form of the set's key type, but
     /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
     /// the key type.
     ///
@@ -386,12 +386,12 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// m.insert(1, "a");
-    /// assert_eq!(m.get(&1), Some(&"a"));
+    /// let set = HashSet::new();
+    /// let m = set.pin();
+    /// m.insert(1);
+    /// assert_eq!(m.get(&1), Some(&1));
     /// assert_eq!(m.get(&2), None);
     /// ```
     #[inline]
@@ -406,11 +406,11 @@ where
         }
     }
 
-    /// Inserts a key-value pair into the map.
+    /// Inserts a value into the set.
     ///
-    /// If the map did not have this key present, [`None`] is returned.
+    /// If the set did not have this key present, [`None`] is returned.
     ///
-    /// If the map did have this key present, the value is updated, and the old
+    /// If the set did have this key present, the value is updated, and the old
     /// value is returned. The key is not updated, though; this matters for
     /// types that can be `==` without being identical. See the [standard library
     /// documentation] for details.
@@ -420,18 +420,18 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
-    /// assert_eq!(map.pin().insert(37, "a"), None);
-    /// assert_eq!(map.pin().is_empty(), false);
+    /// let set = HashSet::new();
+    /// assert_eq!(set.pin().insert(37), true);
+    /// assert_eq!(set.pin().is_empty(), false);
     ///
-    /// // note: you can also re-use a map pin like so:
-    /// let m = map.pin();
+    /// // note: you can also re-use a set pin like so:
+    /// let m = set.pin();
     ///
-    /// m.insert(37, "b");
-    /// assert_eq!(m.insert(37, "c"), Some(&"b"));
-    /// assert_eq!(m.get(&37), Some(&"c"));
+    /// m.insert(37);
+    /// assert_eq!(m.insert(37), false);
+    /// assert_eq!(m.get(&37), Some(&37));
     /// ```
     #[inline]
     pub fn insert(&self, key: K, guard: &impl Guard) -> bool {
@@ -442,22 +442,22 @@ where
         }
     }
 
-    /// Removes a key from the map, returning the value at the key if the key
-    /// was previously in the map.
+    /// Removes a key from the set, returning the value at the key if the key
+    /// was previously in the set.
     ///
-    /// The key may be any borrowed form of the map's key type, but
+    /// The key may be any borrowed form of the set's key type, but
     /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
     /// the key type.
     ///
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
-    /// map.pin().insert(1, "a");
-    /// assert_eq!(map.pin().remove(&1), Some(&"a"));
-    /// assert_eq!(map.pin().remove(&1), None);
+    /// let set = HashSet::new();
+    /// set.pin().insert(1);
+    /// assert_eq!(set.pin().remove(&1), true);
+    /// assert_eq!(set.pin().remove(&1), false);
     /// ```
     #[inline]
     pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> bool
@@ -472,10 +472,10 @@ where
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
-    /// in the `HashMap`.
+    /// in the `HashSet`.
     ///
-    /// After calling this method, the table should be able to hold at least `capacity` elements
-    /// before resizing. However, the capacity is an estimate, and the table may prematurely resize
+    /// After calling this method, the set should be able to hold at least `capacity` elements
+    /// before resizing. However, the capacity is an estimate, and the set may prematurely resize
     /// due to poor hash distribution. The collection may also reserve more space to avoid frequent
     /// reallocations.
     ///
@@ -486,17 +486,17 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map: HashMap<&str, i32> = HashMap::new();
-    /// map.pin().reserve(10);
+    /// let set: HashSet<&str> = HashSet::new();
+    /// set.pin().reserve(10);
     /// ```
     #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
         self.raw.root(guard).reserve(additional, guard);
     }
 
-    /// Clears the map, removing all key-value pairs.
+    /// Clears the set, removing all values.
     ///
     /// Note that this method will block until any in-progress resizes are
     /// completed before proceeding. See the [consistency](crate#consistency)
@@ -505,13 +505,13 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::new();
+    /// let set = HashSet::new();
     ///
-    /// map.pin().insert(1, "a");
-    /// map.pin().clear();
-    /// assert!(map.pin().is_empty());
+    /// set.pin().insert(1);
+    /// set.pin().clear();
+    /// assert!(set.pin().is_empty());
     /// ```
     #[inline]
     pub fn clear(&self, guard: &impl Guard) {
@@ -520,7 +520,7 @@ where
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// In other words, remove all pairs `(k, v)` for which `f(&k, &v)` returns `false`.
+    /// In other words, remove all values `v` for which `f(&v)` returns `false`.
     /// The elements are visited in unsorted (and unspecified) order.
     ///
     /// Note the function may be called more than once for a given key if its value is
@@ -533,11 +533,13 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let mut map: HashMap<i32, i32> = (0..8).map(|x| (x, x * 10)).collect();
-    /// map.pin().retain(|&k, _| k % 2 == 0);
-    /// assert_eq!(map.len(), 4);
+    /// let mut set: HashSet<i32> = (0..8).collect();
+    /// set.pin().retain(|&v| v % 2 == 0);
+    /// assert_eq!(set.len(), 4);
+    /// assert_eq!(set.pin().contains(&1), false);
+    /// assert_eq!(set.pin().contains(&2), true);
     /// ```
     #[inline]
     pub fn retain<F>(&mut self, mut f: F, guard: &impl Guard)
@@ -547,8 +549,7 @@ where
         self.raw.root(guard).retain(|k, _| f(k), guard)
     }
 
-    /// An iterator visiting all key-value pairs in arbitrary order.
-    /// The iterator element type is `(&K, &V)`.
+    /// An iterator visiting all values in arbitrary order.
     ///
     /// Note that this method will block until any in-progress resizes are
     /// completed before proceeding. See the [consistency](crate#consistency)
@@ -557,16 +558,16 @@ where
     /// # Examples
     ///
     /// ```
-    /// use papaya::HashMap;
+    /// use papaya::HashSet;
     ///
-    /// let map = HashMap::from([
-    ///     ("a", 1),
-    ///     ("b", 2),
-    ///     ("c", 3),
+    /// let set = HashSet::from([
+    ///     "a",
+    ///     "b",
+    ///     "c"
     /// ]);
     ///
-    /// for (key, val) in map.pin().iter() {
-    ///     println!("key: {key} val: {val}");
+    /// for val in set.pin().iter() {
+    ///     println!("val: {val}");
     /// }
     #[inline]
     pub fn iter<'g, G>(&self, guard: &'g G) -> Iter<'g, K, G>
@@ -579,17 +580,6 @@ where
     }
 }
 
-
-/// An error returned by [`try_insert`](HashMap::try_insert) when the key already exists.
-///
-/// Contains the existing value, and the value that was not inserted.
-#[derive(Debug, PartialEq, Eq)]
-pub struct OccupiedError<'a, V: 'a> {
-    /// The value in the map that was already present.
-    pub current: &'a V,
-    /// The value which was not inserted, because the entry was already occupied.
-    pub not_inserted: V,
-}
 
 impl<K, S> PartialEq for HashSet<K, S>
 where
@@ -632,10 +622,10 @@ where
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
-        // from `hashbrown::HashMap::extend`:
+        // from `hashbrown::HashSet::extend`:
         // Keys may be already present or show multiple times in the iterator.
-        // Reserve the entire hint lower bound if the map is empty.
-        // Otherwise reserve half the hint (rounded up), so the map
+        // Reserve the entire hint lower bound if the set is empty.
+        // Otherwise reserve half the hint (rounded up), so the set
         // will only resize twice in the worst case.
         let iter = iter.into_iter();
         let reserve = if self.is_empty() {
@@ -682,21 +672,21 @@ where
 
         if let Some(key) = iter.next() {
             let (lower, _) = iter.size_hint();
-            let map = HashSet::with_capacity_and_hasher(lower.saturating_add(1), S::default());
+            let set = HashSet::with_capacity_and_hasher(lower.saturating_add(1), S::default());
 
             // Ideally we could use an unprotected guard here. However, `insert`
             // returns references to values that were replaced and retired, so
             // we need a "real" guard. A `raw_insert` method that strictly returns
             // pointers would fix this.
             {
-                let map = map.pin();
-                map.insert(key);
+                let set = set.pin();
+                set.insert(key);
                 for key in iter {
-                    map.insert(key);
+                    set.insert(key);
                 }
             }
 
-            map
+            set
         } else {
             Self::default()
         }
@@ -726,48 +716,48 @@ where
     }
 }
 
-/// A pinned reference to a [`HashMap`].
+/// A pinned reference to a [`HashSet`].
 ///
-/// This type is created with [`HashMap::pin`] and can be used to easily access a [`HashMap`]
+/// This type is created with [`HashSet::pin`] and can be used to easily access a [`HashSet`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
-pub struct HashSetRef<'map, K, S, G> {
+pub struct HashSetRef<'set, K, S, G> {
     guard: G,
-    map: &'map HashSet<K, S>,
+    set: &'set HashSet<K, S>,
 }
 
-impl<'map, K, S, G> HashSetRef<'map, K, S, G>
+impl<'set, K, S, G> HashSetRef<'set, K, S, G>
 where
     K: Hash + Eq,
     S: BuildHasher,
     G: Guard,
 {
-    /// Returns a reference to the inner [`HashMap`].
+    /// Returns a reference to the inner [`HashSet`].
     #[inline]
-    pub fn map(&self) -> &'map HashSet<K, S> {
-        self.map
+    pub fn set(&self) -> &'set HashSet<K, S> {
+        self.set
     }
 
-    /// Returns the number of entries in the map.
+    /// Returns the number of entries in the set.
     ///
-    /// See [`HashMap::len`] for details.
+    /// See [`HashSet::len`] for details.
     #[inline]
     pub fn len(&self) -> usize {
-        self.map.raw.len()
+        self.set.raw.len()
     }
 
-    /// Returns `true` if the map is empty. Otherwise returns `false`.
+    /// Returns `true` if the set is empty. Otherwise returns `false`.
     ///
-    /// See [`HashMap::is_empty`] for details.
+    /// See [`HashSet::is_empty`] for details.
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Returns `true` if the map contains a value for the specified key.
+    /// Returns `true` if the set contains a value for the specified key.
     ///
-    /// See [`HashMap::contains_key`] for details.
+    /// See [`HashSet::contains`] for details.
     #[inline]
-    pub fn contains_key<Q>(&self, key: &Q) -> bool
+    pub fn contains<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
@@ -777,7 +767,7 @@ where
 
     /// Returns a reference to the value corresponding to the key.
     ///
-    /// See [`HashMap::get`] for details.
+    /// See [`HashSet::get`] for details.
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&K>
     where
@@ -790,9 +780,9 @@ where
         }
     }
 
-    /// Inserts a key-value pair into the map.
+    /// Inserts a key-value pair into the set.
     ///
-    /// See [`HashMap::insert`] for details.
+    /// See [`HashSet::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K) -> bool {
         match self.root().insert(key, (), true, &self.guard) {
@@ -802,10 +792,10 @@ where
         }
     }
 
-    /// Removes a key from the map, returning the value at the key if the key
-    /// was previously in the map.
+    /// Removes a key from the set, returning the value at the key if the key
+    /// was previously in the set.
     ///
-    /// See [`HashMap::remove`] for details.
+    /// See [`HashSet::remove`] for details.
     #[inline]
     pub fn remove<Q>(&self, key: &Q) -> bool
     where
@@ -818,9 +808,9 @@ where
         }
     }
 
-    /// Clears the map, removing all key-value pairs.
+    /// Clears the set, removing all values.
     ///
-    /// See [`HashMap::clear`] for details.
+    /// See [`HashSet::clear`] for details.
     #[inline]
     pub fn clear(&self) {
         self.root().clear(&self.guard)
@@ -828,7 +818,7 @@ where
 
     /// Retains only the elements specified by the predicate.
     ///
-    /// See [`HashMap::retain`] for details.
+    /// See [`HashSet::retain`] for details.
     #[inline]
     pub fn retain<F>(&mut self, mut f: F)
     where
@@ -838,18 +828,18 @@ where
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
-    /// in the map.
+    /// in the set.
     ///
-    /// See [`HashMap::reserve`] for details.
+    /// See [`HashSet::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
         self.root().reserve(additional, &self.guard)
     }
 
-    /// An iterator visiting all key-value pairs in arbitrary order.
+    /// An iterator visiting all values in arbitrary order.
     /// The iterator element type is `(&K, &V)`.
     ///
-    /// See [`HashMap::iter`] for details.
+    /// See [`HashSet::iter`] for details.
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, G> {
         Iter {
@@ -859,9 +849,9 @@ where
 
     #[inline]
     fn root(&self) -> raw::HashMapRef<'_, K, (), S> {
-        // Safety: A `HashMapRef` can only be created through `HashMap::pin` or
-        // `HashMap::pin_owned`, so we know the guard belongs to our collector.
-        unsafe { self.map.raw.root_unchecked(&self.guard) }
+        // Safety: A `HashSetRef` can only be created through `HashSet::pin` or
+        // `HashSet::pin_owned`, so we know the guard belongs to our collector.
+        unsafe { self.set.raw.root_unchecked(&self.guard) }
     }
 }
 
@@ -890,9 +880,9 @@ where
     }
 }
 
-/// An iterator over a map's entries.
+/// An iterator over a set's entries.
 ///
-/// This struct is created by the [`iter`](HashMap::iter) method on [`HashMap`]. See its documentation for details.
+/// This struct is created by the [`iter`](HashSet::iter) method on [`HashSet`]. See its documentation for details.
 pub struct Iter<'g, K, G> {
     raw: raw::Iter<'g, K, (), G>,
 }
