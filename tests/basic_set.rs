@@ -569,13 +569,13 @@ mod hasher {
                 set.insert(i, &guard);
             }
 
-            assert!(!set.contains_key(&i32::min_value(), &guard));
-            assert!(!set.contains_key(&(range.start - 1), &guard));
+            assert!(!set.contains(&i32::min_value(), &guard));
+            assert!(!set.contains(&(range.start - 1), &guard));
             for i in range.clone() {
-                assert!(set.contains_key(&i, &guard));
+                assert!(set.contains(&i, &guard));
             }
-            assert!(!set.contains_key(&range.end, &guard));
-            assert!(!set.contains_key(&i32::max_value(), &guard));
+            assert!(!set.contains(&range.end, &guard));
+            assert!(!set.contains(&i32::max_value(), &guard));
         });
     }
 
