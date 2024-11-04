@@ -644,7 +644,7 @@ where
 
 impl<'a, K, S> Extend<&'a K> for &HashSet<K, S>
 where
-    K: Copy + Hash + Eq,
+    K: Copy + Hash + Eq + 'a,
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = &'a K>>(&mut self, iter: T) {
