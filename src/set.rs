@@ -580,7 +580,6 @@ where
     }
 }
 
-
 impl<K, S> PartialEq for HashSet<K, S>
 where
     K: Hash + Eq,
