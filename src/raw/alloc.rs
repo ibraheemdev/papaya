@@ -128,19 +128,21 @@ impl<T> Table<T> {
         &*self
             .raw
             .add(mem::size_of::<TableLayout>())
-            .add(i * mem::size_of::<u8>())
+            .add(i)
             .cast::<AtomicU8>()
     }
 
     // Returns the entry at the given index.
     #[inline]
     pub unsafe fn entry(&self, i: usize) -> &AtomicPtr<T> {
-        let offset = mem::size_of::<TableLayout>()
-            + mem::size_of::<u8>() * self.capacity
-            + i * mem::size_of::<AtomicPtr<T>>();
-
         debug_assert!(i < self.capacity);
-        &*self.raw.add(offset).cast::<AtomicPtr<T>>()
+
+        &*self
+            .raw
+            .add(mem::size_of::<TableLayout>())
+            .add(self.capacity)
+            .add(i * mem::size_of::<AtomicPtr<T>>())
+            .cast::<AtomicPtr<T>>()
     }
 
     /// Returns the length of the table.
