@@ -89,3 +89,4 @@ jobs:
         run: cargo test --locked -- --ignored --test-threads 1
         env:
           RUSTFLAGS: "--cfg papaya_stress"
+          RUST_MIN_STACK: 8192000 # avoid stack overflows on macOS
