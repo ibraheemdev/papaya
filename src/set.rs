@@ -17,10 +17,9 @@ pub struct HashSet<K, S = RandomState> {
     raw: raw::HashMap<K, (), S>,
 }
 
-// Safety: We only ever hand out &K/V through shared references to the map,
+// Safety: We only ever hand out &K through shared references to the map,
 // so normal Send/Sync rules apply. We never expose owned or mutable references
 // to keys or values.
-// TODO
 unsafe impl<K: Send, S: Send> Send for HashSet<K, S> {}
 unsafe impl<K: Sync, S: Sync> Sync for HashSet<K, S> {}
 
