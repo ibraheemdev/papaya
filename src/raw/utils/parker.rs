@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, Thread};
 
@@ -25,7 +25,7 @@ struct State {
 
 impl Parker {
     // Block the current thread until the park condition is false.
-    pub fn park<T>(&self, atomic: &AtomicPtr<T>, should_park: impl Fn(*mut T) -> bool) {
+    pub fn park<T>(&self, atomic: &impl Atomic<T>, should_park: impl Fn(T) -> bool) {
         let key = atomic as *const _ as usize;
 
         loop {
@@ -89,7 +89,7 @@ impl Parker {
     // Unpark all threads waiting on the given atomic.
     //
     // Note that any modifications must be `SeqCst` to be visible to unparked threads.
-    pub fn unpark<T>(&self, atomic: &AtomicPtr<T>) {
+    pub fn unpark<T>(&self, atomic: &impl Atomic<T>) {
         let key = atomic as *const _ as usize;
 
         // Fast-path, no one waiting to be unparked.
@@ -111,5 +111,23 @@ impl Parker {
                 thread.unpark();
             }
         }
+    }
+}
+
+/// A generic atomic variable.
+pub trait Atomic<T> {
+    /// Load the value using the given ordering.
+    fn load(&self, ordering: Ordering) -> T;
+}
+
+impl<T> Atomic<*mut T> for AtomicPtr<T> {
+    fn load(&self, ordering: Ordering) -> *mut T {
+        self.load(ordering)
+    }
+}
+
+impl Atomic<u8> for AtomicU8 {
+    fn load(&self, ordering: Ordering) -> u8 {
+        self.load(ordering)
     }
 }
