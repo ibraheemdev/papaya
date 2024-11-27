@@ -1,18 +1,29 @@
 #![allow(dead_code)]
 
 use papaya::{HashMap, HashSet, ResizeMode};
+use seize::Collector;
 
 // Run the test on different configurations of a `HashMap`.
 pub fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
+    let collector = Collector::new().batch_size(128);
+
     // Blocking resize mode.
     if !cfg!(papaya_stress) {
-        test(&(|| HashMap::builder().resize_mode(ResizeMode::Blocking).build()));
+        test(
+            &(|| {
+                HashMap::builder()
+                    .collector(collector.clone())
+                    .resize_mode(ResizeMode::Blocking)
+                    .build()
+            }),
+        );
     }
 
     // Incremental resize mode with a small chunk to stress operations on nested tables.
     test(
         &(|| {
             HashMap::builder()
+                .collector(collector.clone())
                 .resize_mode(ResizeMode::Incremental(1))
                 .build()
         }),
@@ -23,6 +34,7 @@ pub fn with_map<K, V>(mut test: impl FnMut(&dyn Fn() -> HashMap<K, V>)) {
     test(
         &(|| {
             HashMap::builder()
+                .collector(collector.clone())
                 .resize_mode(ResizeMode::Incremental(128))
                 .build()
         }),
