@@ -11,7 +11,7 @@ readme = "README.md"
 exclude = ["assets/*"]
 
 [dependencies]
-seize = "O.4"
+seize = "0.4"
 atomic-wait = "1"
 serde = { version = "1", optional = true }
 
