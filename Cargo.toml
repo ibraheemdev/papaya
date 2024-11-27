@@ -11,7 +11,7 @@ readme = "README.md"
 exclude = ["assets/*"]
 
 [dependencies]
-seize = { git = "https://github.com/ibraheemdev/seize" }
+seize = "O.4"
 atomic-wait = "1"
 serde = { version = "1", optional = true }
 
