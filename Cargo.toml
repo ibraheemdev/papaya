@@ -11,19 +11,19 @@ readme = "README.md"
 exclude = ["assets/*"]
 
 [dependencies]
-seize = "0.4.4"
-atomic-wait = "1.1.0"
-serde = { version = "1.0.204", optional = true }
+seize = "0.4"
+atomic-wait = "1"
+serde = { version = "1", optional = true }
 
 [dev-dependencies]
-rand = "0.8.5"
-base64 = "0.22.1"
-hdrhistogram = "7.5.4"
-dashmap = "5.5.3"
-criterion = "0.5.1"
-tokio = { version = "1.38.0", features = ["fs", "rt"] }
-num_cpus = "1.16.0"
-serde_json = "1.0.120"
+rand = "0.8"
+base64 = "0.22"
+hdrhistogram = "7"
+dashmap = "5"
+criterion = "0.5"
+tokio = { version = "1", features = ["fs", "rt"] }
+num_cpus = "1"
+serde_json = "1"
 
 [features]
 default = []
