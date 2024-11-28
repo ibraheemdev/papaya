@@ -438,7 +438,10 @@ where
         K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
     {
-        match self.raw.root(guard).get(key, guard) {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        match unsafe { self.raw.get(key, guard) } {
             Some((_, v)) => Some(v),
             None => None,
         }
@@ -470,7 +473,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.root(guard).get(key, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.get(key, guard) }
     }
 
     /// Inserts a key-value pair into the map.
@@ -502,7 +508,10 @@ where
     /// ```
     #[inline]
     pub fn insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
-        match self.raw.root(guard).insert(key, value, true, guard) {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        match unsafe { self.raw.insert(key, value, true, guard) } {
             InsertResult::Inserted(_) => None,
             InsertResult::Replaced(value) => Some(value),
             InsertResult::Error { .. } => unreachable!(),
@@ -535,7 +544,10 @@ where
         value: V,
         guard: &'g impl Guard,
     ) -> Result<&'g V, OccupiedError<'g, V>> {
-        match self.raw.root(guard).insert(key, value, false, guard) {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        match unsafe { self.raw.insert(key, value, false, guard) } {
             InsertResult::Inserted(value) => Ok(value),
             InsertResult::Error {
                 current,
@@ -564,6 +576,8 @@ where
     /// ```
     #[inline]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> &'g V {
+        self.raw.check_guard(guard);
+
         // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
         // allows us to avoid the closure indirection.
         match self.try_insert(key, value, guard) {
@@ -595,7 +609,10 @@ where
         F: FnOnce() -> V,
         K: 'g,
     {
-        self.raw.root(guard).get_or_insert_with(key, f, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.get_or_insert_with(key, f, guard) }
     }
 
     /// Updates an existing entry atomically.
@@ -633,7 +650,10 @@ where
         F: Fn(&V) -> V,
         K: 'g,
     {
-        self.raw.root(guard).update(key, update, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.update(key, update, guard) }
     }
 
     /// Updates an existing entry or inserts a default value.
@@ -665,6 +685,8 @@ where
         F: Fn(&V) -> V,
         K: 'g,
     {
+        self.raw.check_guard(guard);
+
         self.update_or_insert_with(key, update, || value, guard)
     }
 
@@ -699,9 +721,10 @@ where
         U: Fn(&V) -> V,
         K: 'g,
     {
-        self.raw
-            .root(guard)
-            .update_or_insert_with(key, update, f, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.update_or_insert_with(key, update, f, guard) }
     }
 
     /// Updates an entry with a compare-and-swap (CAS) function.
@@ -759,7 +782,10 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        self.raw.root(guard).compute(key, compute, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.compute(key, compute, guard) }
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -785,7 +811,10 @@ where
         K: Borrow<Q> + 'g,
         Q: Hash + Eq + ?Sized,
     {
-        match self.raw.root(guard).remove(key, guard) {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        match unsafe { self.raw.remove(key, guard) } {
             Some((_, value)) => Some(value),
             None => None,
         }
@@ -815,7 +844,10 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.raw.root(guard).remove(key, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.remove(key, guard) }
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -840,7 +872,10 @@ where
     /// ```
     #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
-        self.raw.root(guard).reserve(additional, guard);
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.reserve(additional, guard) };
     }
 
     /// Clears the map, removing all key-value pairs.
@@ -862,7 +897,10 @@ where
     /// ```
     #[inline]
     pub fn clear(&self, guard: &impl Guard) {
-        self.raw.root(guard).clear(guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.clear(guard) }
     }
 
     /// Retains only the elements specified by the predicate.
@@ -891,7 +929,10 @@ where
     where
         F: FnMut(&K, &V) -> bool,
     {
-        self.raw.root(guard).retain(f, guard)
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.retain(f, guard) }
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -920,8 +961,11 @@ where
     where
         G: Guard,
     {
+        self.raw.check_guard(guard);
+
         Iter {
-            raw: self.raw.root(guard).iter(guard),
+            // Safety: Checked the guard above.
+            raw: unsafe { self.raw.iter(guard) },
         }
     }
 
@@ -952,6 +996,8 @@ where
     where
         G: Guard,
     {
+        self.raw.check_guard(guard);
+
         Keys {
             iter: self.iter(guard),
         }
@@ -984,6 +1030,8 @@ where
     where
         G: Guard,
     {
+        self.raw.check_guard(guard);
+
         Values {
             iter: self.iter(guard),
         }
@@ -1238,7 +1286,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        match self.root().get(key, &self.guard) {
+        // Safety: `self.guard` was created from our map.
+        match unsafe { self.map.raw.get(key, &self.guard) } {
             Some((_, v)) => Some(v),
             None => None,
         }
@@ -1253,7 +1302,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.root().get(key, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.get(key, &self.guard) }
     }
 
     /// Inserts a key-value pair into the map.
@@ -1261,7 +1311,8 @@ where
     /// See [`HashMap::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
-        match self.root().insert(key, value, true, &self.guard) {
+        // Safety: `self.guard` was created from our map.
+        match unsafe { self.map.raw.insert(key, value, true, &self.guard) } {
             InsertResult::Inserted(_) => None,
             InsertResult::Replaced(value) => Some(value),
             InsertResult::Error { .. } => unreachable!(),
@@ -1274,7 +1325,8 @@ where
     /// See [`HashMap::try_insert`] for details.
     #[inline]
     pub fn try_insert(&self, key: K, value: V) -> Result<&V, OccupiedError<'_, V>> {
-        match self.root().insert(key, value, false, &self.guard) {
+        // Safety: `self.guard` was created from our map.
+        match unsafe { self.map.raw.insert(key, value, false, &self.guard) } {
             InsertResult::Inserted(value) => Ok(value),
             InsertResult::Error {
                 current,
@@ -1309,7 +1361,8 @@ where
     where
         F: FnOnce() -> V,
     {
-        self.root().get_or_insert_with(key, f, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.get_or_insert_with(key, f, &self.guard) }
     }
 
     /// Updates an existing entry atomically.
@@ -1320,7 +1373,8 @@ where
     where
         F: Fn(&V) -> V,
     {
-        self.root().update(key, update, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.update(key, update, &self.guard) }
     }
 
     /// Updates an existing entry or inserts a default value.
@@ -1343,8 +1397,12 @@ where
         F: FnOnce() -> V,
         U: Fn(&V) -> V,
     {
-        self.root()
-            .update_or_insert_with(key, update, f, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe {
+            self.map
+                .raw
+                .update_or_insert_with(key, update, f, &self.guard)
+        }
     }
 
     // Updates an entry with a compare-and-swap (CAS) function.
@@ -1355,7 +1413,8 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        self.root().compute(key, compute, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.compute(key, compute, &self.guard) }
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -1368,7 +1427,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        match self.root().remove(key, &self.guard) {
+        // Safety: `self.guard` was created from our map.
+        match unsafe { self.map.raw.remove(key, &self.guard) } {
             Some((_, value)) => Some(value),
             None => None,
         }
@@ -1384,7 +1444,8 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.root().remove(key, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.remove(key, &self.guard) }
     }
 
     /// Clears the map, removing all key-value pairs.
@@ -1392,7 +1453,8 @@ where
     /// See [`HashMap::clear`] for details.
     #[inline]
     pub fn clear(&self) {
-        self.root().clear(&self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.clear(&self.guard) }
     }
 
     /// Retains only the elements specified by the predicate.
@@ -1403,7 +1465,8 @@ where
     where
         F: FnMut(&K, &V) -> bool,
     {
-        self.root().retain(f, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.retain(f, &self.guard) }
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -1412,7 +1475,8 @@ where
     /// See [`HashMap::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
-        self.root().reserve(additional, &self.guard)
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.reserve(additional, &self.guard) }
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -1422,7 +1486,8 @@ where
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, V, G> {
         Iter {
-            raw: self.root().iter(&self.guard),
+            // Safety: `self.guard` was created from our map.
+            raw: unsafe { self.map.raw.iter(&self.guard) },
         }
     }
 
@@ -1442,13 +1507,6 @@ where
     #[inline]
     pub fn values(&self) -> Values<'_, K, V, G> {
         Values { iter: self.iter() }
-    }
-
-    #[inline]
-    fn root(&self) -> raw::HashMapRef<'_, K, V, S> {
-        // Safety: A `HashMapRef` can only be created through `HashMap::pin` or
-        // `HashMap::pin_owned`, so we know the guard belongs to our collector.
-        unsafe { self.map.raw.root_unchecked(&self.guard) }
     }
 }
 
