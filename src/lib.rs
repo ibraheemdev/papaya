@@ -217,7 +217,7 @@ The `Guard` trait supports both local and owned guards. Note the `'guard` lifeti
 */
 
 #![deny(missing_debug_implementations, missing_docs, dead_code)]
-// We use some polyfills for unstable APIs related to strict-provenance.
+// Polyfills for unstable APIs related to strict-provenance.
 #![allow(unstable_name_collisions)]
 // Stylistic preferences.
 #![allow(clippy::multiple_bound_locations, clippy::single_match)]

@@ -1,6 +1,6 @@
 use std::alloc::Layout;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicPtr, AtomicU8};
+use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::{alloc, mem, ptr};
 
 use seize::Collector;
@@ -161,6 +161,18 @@ impl<T> Table<T> {
     #[inline]
     pub fn state_mut(&mut self) -> &mut State {
         unsafe { &mut (*self.raw.cast::<TableLayout>()).state }
+    }
+
+    // Returns a pointer to the next table, if it has already been created.
+    #[inline]
+    pub fn next_table(&self) -> Option<Self> {
+        let next = self.state().next.load(Ordering::Acquire);
+
+        if !next.is_null() {
+            return unsafe { Some(Table::from_raw(next)) };
+        }
+
+        None
     }
 
     // Deallocate the table.
