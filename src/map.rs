@@ -398,10 +398,9 @@ where
     /// use papaya::HashMap;
     ///
     /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// m.insert(1, "a");
-    /// assert_eq!(m.contains_key(&1), true);
-    /// assert_eq!(m.contains_key(&2), false);
+    /// map.pin().insert(1, "a");
+    /// assert_eq!(map.pin().contains_key(&1), true);
+    /// assert_eq!(map.pin().contains_key(&2), false);
     /// ```
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q, guard: &impl Guard) -> bool
@@ -427,10 +426,9 @@ where
     /// use papaya::HashMap;
     ///
     /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// m.insert(1, "a");
-    /// assert_eq!(m.get(&1), Some(&"a"));
-    /// assert_eq!(m.get(&2), None);
+    /// map.pin().insert(1, "a");
+    /// assert_eq!(map.pin().get(&1), Some(&"a"));
+    /// assert_eq!(map.pin().get(&2), None);
     /// ```
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
@@ -462,10 +460,9 @@ where
     /// use papaya::HashMap;
     ///
     /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// m.insert(1, "a");
-    /// assert_eq!(m.get_key_value(&1), Some((&1, &"a")));
-    /// assert_eq!(m.get_key_value(&2), None);
+    /// map.pin().insert(1, "a");
+    /// assert_eq!(map.pin().get_key_value(&1), Some((&1, &"a")));
+    /// assert_eq!(map.pin().get_key_value(&2), None);
     /// ```
     #[inline]
     pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
@@ -499,12 +496,9 @@ where
     /// assert_eq!(map.pin().insert(37, "a"), None);
     /// assert_eq!(map.pin().is_empty(), false);
     ///
-    /// // note: you can also re-use a map pin like so:
-    /// let m = map.pin();
-    ///
-    /// m.insert(37, "b");
-    /// assert_eq!(m.insert(37, "c"), Some(&"b"));
-    /// assert_eq!(m.get(&37), Some(&"c"));
+    /// map.pin().insert(37, "b");
+    /// assert_eq!(map.pin().insert(37, "c"), Some(&"b"));
+    /// assert_eq!(map.pin().get(&37), Some(&"c"));
     /// ```
     #[inline]
     pub fn insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
@@ -530,10 +524,11 @@ where
     /// use papaya::HashMap;
     ///
     /// let map = HashMap::new();
-    /// let m = map.pin();
-    /// assert_eq!(m.try_insert(37, "a").unwrap(), &"a");
+    /// let map = map.pin();
     ///
-    /// let err = m.try_insert(37, "b").unwrap_err();
+    /// assert_eq!(map.try_insert(37, "a").unwrap(), &"a");
+    ///
+    /// let err = map.try_insert(37, "b").unwrap_err();
     /// assert_eq!(err.current, &"a");
     /// assert_eq!(err.not_inserted, "b");
     /// ```

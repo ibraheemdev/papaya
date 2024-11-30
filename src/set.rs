@@ -359,10 +359,9 @@ where
     /// use papaya::HashSet;
     ///
     /// let set = HashSet::new();
-    /// let m = set.pin();
-    /// m.insert(1);
-    /// assert_eq!(m.contains(&1), true);
-    /// assert_eq!(m.contains(&2), false);
+    /// set.pin().insert(1);
+    /// assert_eq!(set.pin().contains(&1), true);
+    /// assert_eq!(set.pin().contains(&2), false);
     /// ```
     #[inline]
     pub fn contains<Q>(&self, key: &Q, guard: &impl Guard) -> bool
@@ -388,10 +387,9 @@ where
     /// use papaya::HashSet;
     ///
     /// let set = HashSet::new();
-    /// let m = set.pin();
-    /// m.insert(1);
-    /// assert_eq!(m.get(&1), Some(&1));
-    /// assert_eq!(m.get(&2), None);
+    /// set.pin().insert(1);
+    /// assert_eq!(set.pin().get(&1), Some(&1));
+    /// assert_eq!(set.pin().get(&2), None);
     /// ```
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g K>
@@ -428,12 +426,9 @@ where
     /// assert_eq!(set.pin().insert(37), true);
     /// assert_eq!(set.pin().is_empty(), false);
     ///
-    /// // note: you can also re-use a set pin like so:
-    /// let m = set.pin();
-    ///
-    /// m.insert(37);
-    /// assert_eq!(m.insert(37), false);
-    /// assert_eq!(m.get(&37), Some(&37));
+    /// set.pin().insert(37);
+    /// assert_eq!(set.pin().insert(37), false);
+    /// assert_eq!(set.pin().get(&37), Some(&37));
     /// ```
     #[inline]
     pub fn insert(&self, key: K, guard: &impl Guard) -> bool {
