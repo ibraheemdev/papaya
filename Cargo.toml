@@ -1,13 +1,14 @@
 [package]
 name = "papaya"
-version = "0.1.4"
-edition = "2021"
-license = "MIT"
+version = "0.1.5"
 authors = ["Ibraheem Ahmed <ibraheem@ibraheem.ca>"]
 description = "A fast and ergonomic concurrent hash-table for read-heavy workloads."
-keywords = ["concurrent", "hashmap", "atomic", "lock-free"]
-repository = "https://github.com/ibraheemdev/papaya"
+edition = "2021"
+license = "MIT"
 readme = "README.md"
+repository = "https://github.com/ibraheemdev/papaya"
+categories = ["algorithms", "concurrency", "data-structures"]
+keywords = ["concurrent", "hashmap", "atomic", "lock-free"]
 exclude = ["assets/*"]
 
 [dependencies]
