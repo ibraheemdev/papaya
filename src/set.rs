@@ -408,12 +408,11 @@ where
 
     /// Inserts a value into the set.
     ///
-    /// If the set did not have this key present, [`None`] is returned.
+    /// If the set did not have this key present, `true` is returned.
     ///
-    /// If the set did have this key present, the value is updated, and the old
-    /// value is returned. The key is not updated, though; this matters for
-    /// types that can be `==` without being identical. See the [standard library
-    /// documentation] for details.
+    /// If the set did have this key present, `false` is returned and the old
+    /// value is not updated. This matters for types that can be `==` without
+    /// being identical. See the [standard library documentation] for details.
     ///
     /// [standard library documentation]: https://doc.rust-lang.org/std/collections/index.html#insert-and-complex-keys
     ///
