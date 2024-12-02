@@ -680,8 +680,6 @@ where
                     {
                         // Successfully removed the entry.
                         UpdateStatus::Replaced(entry) => {
-                            let tid = guard.thread_id();
-
                             // Mark the entry as a tombstone.
                             //
                             // Note that this might end up being overwritten by the metadata hash
@@ -694,9 +692,7 @@ where
                             };
 
                             // Decrement the table length.
-                            let tid = guard.thread_id();
-                            let count = &self.count;
-                            let count = count.get(tid);
+                            let count = self.count.get(guard.thread_id());
                             count.fetch_sub(1, Ordering::Relaxed);
 
                             let entry = unsafe { &(*entry.ptr) };
