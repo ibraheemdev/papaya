@@ -681,7 +681,6 @@ where
                         // Successfully removed the entry.
                         UpdateStatus::Replaced(entry) => {
                             let tid = guard.thread_id();
-                            dbg!(tid);
 
                             // Mark the entry as a tombstone.
                             //
