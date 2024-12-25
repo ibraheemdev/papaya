@@ -16,11 +16,23 @@ pub struct HashMap<K, V, S = RandomState> {
     raw: raw::HashMap<K, V, S>,
 }
 
-// Safety: We only ever hand out &K/V through shared references to the map,
-// so normal Send/Sync rules apply. We never expose owned or mutable references
-// to keys or values.
+// Safety: `HashMap` acts as a single-threaded collection on a single thread.
+// References to keys and values cannot outlive the map's lifetime on a given
+// thread.
 unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
-unsafe impl<K: Sync, V: Sync, S: Sync> Sync for HashMap<K, V, S> {}
+
+// Safety: We only ever hand out `&{K, V}` through shared references to the map,
+// and never `&mut {K, V}` except through synchronized memory reclamation.
+//
+// However, we require `{K, V}: Send` as keys and values may be removed and dropped
+// on a different thread than they were created on through shared access to the
+// `HashMap`.
+//
+// Additionally, `HashMap` owns its `seize::Collector` and never exposes it,
+// so multiple threads cannot be involved in reclamation without sharing the
+// `HashMap` itself. If this was not true, we would require stricter bounds
+// on `HashMap` operations themselves.
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {}
 
 /// A builder for a [`HashMap`].
 ///
