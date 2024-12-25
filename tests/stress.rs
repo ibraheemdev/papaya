@@ -329,7 +329,7 @@ fn update_or_insert_stress() {
                         barrier.wait();
                         let guard = map.guard();
                         for i in &entries[range] {
-                            map.update_or_insert(i, |v| v + 1, 1, &guard);
+                            map.update_or_insert(*i, |v| v + 1, 1, &guard);
                         }
                     });
                 }

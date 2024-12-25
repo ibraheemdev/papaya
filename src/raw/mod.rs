@@ -4,13 +4,12 @@ mod utils;
 
 use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{fence, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{hint, panic, ptr};
 
-use self::alloc::RawTable;
+use self::alloc::{RawTable, Table};
 use self::probe::Probe;
 use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, Shared, StrictProvenance, Tagged};
 use crate::map::{Compute, Operation, ResizeMode};
@@ -20,28 +19,28 @@ use seize::{AsLink, Collector, Guard, Link};
 // A lock-free hash-table.
 pub struct HashMap<K, V, S> {
     // A pointer to the root table.
-    table: AtomicPtr<RawTable>,
+    table: AtomicPtr<RawTable<Entry<K, V>>>,
+
     // Collector for memory reclamation.
     //
     // The collector is allocated as it's aliased by each table,
     // in case it needs to be accessed during reclamation.
     collector: Shared<Collector>,
+
     // The resize mode, either blocking or incremental.
     resize: ResizeMode,
+
     // The number of keys in the table.
     count: Counter,
+
     // Hasher for keys.
     pub hasher: S,
-    _kv: PhantomData<(K, V)>,
 }
 
-// The hash-table allocation.
-pub type Table<K, V> = self::alloc::Table<Entry<K, V>>;
-
 // Hash-table state.
-pub struct State {
+pub struct State<T> {
     // The next table used for resizing.
-    pub next: AtomicPtr<RawTable>,
+    pub next: AtomicPtr<RawTable<T>>,
     // A lock acquired to allocate the next table.
     pub allocating: Mutex<()>,
     // The number of entries that have been copied to the next table.
@@ -59,8 +58,8 @@ pub struct State {
     pub collector: *const Collector,
 }
 
-impl Default for State {
-    fn default() -> State {
+impl<T> Default for State<T> {
+    fn default() -> State<T> {
         State {
             next: AtomicPtr::new(ptr::null_mut()),
             allocating: Mutex::new(()),
@@ -74,7 +73,7 @@ impl Default for State {
     }
 }
 
-impl State {
+impl State<()> {
     // A resize is in-progress.
     pub const PENDING: u8 = 0;
 
@@ -222,12 +221,11 @@ impl<K, V, S> HashMap<K, V, S> {
                 hasher,
                 table: AtomicPtr::new(ptr::null_mut()),
                 count: Counter::default(),
-                _kv: PhantomData,
             };
         }
 
         // Initialize the table and mark it as the root.
-        let mut table = Table::<K, V>::alloc(probe::entries_for(capacity), &collector);
+        let mut table = Table::alloc(probe::entries_for(capacity), &collector);
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
         HashMap {
@@ -236,7 +234,6 @@ impl<K, V, S> HashMap<K, V, S> {
             collector,
             table: AtomicPtr::new(table.raw),
             count: Counter::default(),
-            _kv: PhantomData,
         }
     }
 
@@ -251,10 +248,10 @@ impl<K, V, S> HashMap<K, V, S> {
 
     // Returns a reference to the root hash-table.
     #[inline]
-    fn root(&self, guard: &impl Guard) -> Table<K, V> {
+    fn root(&self, guard: &impl Guard) -> Table<Entry<K, V>> {
         // Load the root table.
         let raw = guard.protect(&self.table, Ordering::Acquire);
-        unsafe { Table::<K, V>::from_raw(raw) }
+        unsafe { Table::from_raw(raw) }
     }
 
     // Returns a reference to the collector.
@@ -545,7 +542,7 @@ where
         i: usize,
         mut entry: Tagged<Entry<K, V>>,
         new_entry: *mut Entry<K, V>,
-        table: Table<K, V>,
+        table: Table<Entry<K, V>>,
         guard: &impl Guard,
     ) -> UpdateStatus<K, V> {
         loop {
@@ -566,9 +563,9 @@ where
         &self,
         copying: Option<usize>,
         help_copy: &mut bool,
-        table: Table<K, V>,
+        table: Table<Entry<K, V>>,
         guard: &impl Guard,
-    ) -> Table<K, V> {
+    ) -> Table<Entry<K, V>> {
         // If went over the probe limit or found a copied entry, trigger a resize.
         let mut next_table = self.get_or_alloc_next(None, table);
 
@@ -727,9 +724,9 @@ where
         &self,
         copying: Option<usize>,
         help_copy: &mut bool,
-        table: Table<K, V>,
+        table: Table<Entry<K, V>>,
         guard: &impl Guard,
-    ) -> Option<Table<K, V>> {
+    ) -> Option<Table<Entry<K, V>>> {
         let next_table = match self.resize {
             ResizeMode::Blocking => match copying {
                 // The entry we want to perform the operation on is being copied.
@@ -777,7 +774,7 @@ where
         i: usize,
         meta: u8,
         new_entry: *mut Entry<K, V>,
-        table: Table<K, V>,
+        table: Table<Entry<K, V>>,
         guard: &impl Guard,
     ) -> InsertStatus<K, V> {
         let entry = unsafe { table.entry(i) };
@@ -842,7 +839,7 @@ where
         i: usize,
         current: Tagged<Entry<K, V>>,
         new_entry: *mut Entry<K, V>,
-        table: Table<K, V>,
+        table: Table<Entry<K, V>>,
         guard: &impl Guard,
     ) -> UpdateStatus<K, V> {
         let entry = unsafe { table.entry(i) };
@@ -1639,11 +1636,11 @@ where
     // Allocate the initial table.
     #[cold]
     #[inline(never)]
-    fn init(&self, capacity: Option<usize>) -> Table<K, V> {
+    fn init(&self, capacity: Option<usize>) -> Table<Entry<K, V>> {
         const CAPACITY: usize = 32;
 
         // Allocate the table and mark it as the root.
-        let mut new = Table::<K, V>::alloc(capacity.unwrap_or(CAPACITY), &self.collector);
+        let mut new = Table::alloc(capacity.unwrap_or(CAPACITY), &self.collector);
         *new.state_mut().status.get_mut() = State::PROMOTED;
 
         // Race to write the initial table.
@@ -1670,7 +1667,11 @@ where
     // Returns the next table, allocating it has not already been created.
     #[cold]
     #[inline(never)]
-    fn get_or_alloc_next(&self, capacity: Option<usize>, table: Table<K, V>) -> Table<K, V> {
+    fn get_or_alloc_next(
+        &self,
+        capacity: Option<usize>,
+        table: Table<Entry<K, V>>,
+    ) -> Table<Entry<K, V>> {
         // Avoid spinning in tests, which can hide race conditions.
         const SPIN_ALLOC: usize = if cfg!(any(test, debug_assertions)) {
             1
@@ -1757,7 +1758,12 @@ where
     // not necessarily the new root.
     #[cold]
     #[inline(never)]
-    fn help_copy(&self, copy_all: bool, table: &Table<K, V>, guard: &impl Guard) -> Table<K, V> {
+    fn help_copy(
+        &self,
+        copy_all: bool,
+        table: &Table<Entry<K, V>>,
+        guard: &impl Guard,
+    ) -> Table<Entry<K, V>> {
         match self.resize {
             ResizeMode::Blocking => self.help_copy_blocking(table, guard),
             ResizeMode::Incremental(chunk) => {
@@ -1777,11 +1783,15 @@ where
     // Help along the resize operation until it completes and the next table is promoted.
     //
     // Should only be called on the root table.
-    fn help_copy_blocking(&self, table: &Table<K, V>, guard: &impl Guard) -> Table<K, V> {
+    fn help_copy_blocking(
+        &self,
+        table: &Table<Entry<K, V>>,
+        guard: &impl Guard,
+    ) -> Table<Entry<K, V>> {
         // Load the next table.
         let next = table.state().next.load(Ordering::Acquire);
         debug_assert!(!next.is_null());
-        let mut next = unsafe { Table::<K, V>::from_raw(next) };
+        let mut next = unsafe { Table::from_raw(next) };
 
         'copy: loop {
             // Make sure we are copying to the correct table.
@@ -1893,8 +1903,8 @@ where
     fn copy_at_blocking(
         &self,
         i: usize,
-        table: &Table<K, V>,
-        next_table: &Table<K, V>,
+        table: &Table<Entry<K, V>>,
+        next_table: &Table<Entry<K, V>>,
         guard: &impl Guard,
     ) -> bool {
         // Mark the entry as copying.
@@ -1927,7 +1937,12 @@ where
     // Help along an in-progress resize incrementally by copying a chunk of entries.
     //
     // Returns the table that was copied to.
-    fn help_copy_incremental(&self, chunk: usize, block: bool, guard: &impl Guard) -> Table<K, V> {
+    fn help_copy_incremental(
+        &self,
+        chunk: usize,
+        block: bool,
+        guard: &impl Guard,
+    ) -> Table<Entry<K, V>> {
         // Always help the highest priority root resize.
         let table = self.root(guard);
 
@@ -1939,7 +1954,7 @@ where
             return table;
         }
 
-        let next = unsafe { Table::<K, V>::from_raw(next) };
+        let next = unsafe { Table::from_raw(next) };
 
         loop {
             // The copy already completed.
@@ -2021,8 +2036,8 @@ where
     fn copy_at_incremental(
         &self,
         i: usize,
-        table: &Table<K, V>,
-        next_table: &Table<K, V>,
+        table: &Table<Entry<K, V>>,
+        next_table: &Table<Entry<K, V>>,
         guard: &impl Guard,
     ) {
         // Mark the entry as copying.
@@ -2075,9 +2090,9 @@ where
         &self,
         new_entry: Tagged<Entry<K, V>>,
         resize: bool,
-        table: &Table<K, V>,
+        table: &Table<Entry<K, V>>,
         guard: &impl Guard,
-    ) -> Option<(Table<K, V>, usize)> {
+    ) -> Option<(Table<Entry<K, V>>, usize)> {
         // Safety: The new entry is guaranteed to be valid by the caller.
         let key = unsafe { &(*new_entry.ptr).key };
 
@@ -2153,8 +2168,8 @@ where
     // Returns `true` if the table was promoted.
     fn try_promote(
         &self,
-        table: &Table<K, V>,
-        next: &Table<K, V>,
+        table: &Table<Entry<K, V>>,
+        next: &Table<Entry<K, V>>,
         copied: usize,
         guard: &impl Guard,
     ) -> bool {
@@ -2191,9 +2206,8 @@ where
                         // Note that we do not drop entries because they have been copied to the
                         // new root.
                         guard.defer_retire(table.raw, |link| {
-                            let raw: *mut RawTable = link.cast();
-                            let table = Table::<K, V>::from_raw(raw);
-                            drop_table::<K, V>(table);
+                            let raw: *mut RawTable<Entry<K, V>> = link.cast();
+                            drop_table(Table::from_raw(raw));
                         });
                     }
                 }
@@ -2213,7 +2227,7 @@ where
     // This is necessary for operations like `iter` or `clear`, where entries in multiple tables
     // can cause lead to incomplete results.
     #[inline]
-    fn linearize(&self, mut table: Table<K, V>, guard: &impl Guard) -> Table<K, V> {
+    fn linearize(&self, mut table: Table<Entry<K, V>>, guard: &impl Guard) -> Table<Entry<K, V>> {
         if self.is_incremental() {
             // If we're in incremental resize mode, we need to complete any in-progress resizes to
             // ensure we don't miss any entries in the next table. We can't iterate over both because
@@ -2229,7 +2243,7 @@ where
     // Wait for an incremental copy of a given entry to complete.
     #[cold]
     #[inline(never)]
-    fn wait_copied(&self, i: usize, table: &Table<K, V>) {
+    fn wait_copied(&self, i: usize, table: &Table<Entry<K, V>>) {
         // Avoid spinning in tests, which can hide race conditions.
         const SPIN_WAIT: usize = if cfg!(any(test, debug_assertions)) {
             1
@@ -2267,7 +2281,7 @@ where
     unsafe fn defer_retire(
         &self,
         entry: Tagged<Entry<K, V>>,
-        table: &Table<K, V>,
+        table: &Table<Entry<K, V>>,
         guard: &impl Guard,
     ) {
         match self.resize {
@@ -2304,7 +2318,7 @@ where
                 //
                 // Find the table we are copying from, searching from the root.
                 fence(Ordering::Acquire);
-                let mut prev = unsafe { Table::<K, V>::from_raw(root) };
+                let mut prev = unsafe { Table::from_raw(root) };
 
                 loop {
                     let next = prev.next_table().unwrap();
@@ -2325,7 +2339,7 @@ where
 // An iterator over the keys and values of this table.
 pub struct Iter<'g, K, V, G> {
     i: usize,
-    table: Table<K, V>,
+    table: Table<Entry<K, V>>,
     guard: &'g G,
 }
 
@@ -2421,17 +2435,17 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
 
         // Drop all nested tables and entries.
         while !raw.is_null() {
-            let mut table = unsafe { Table::<K, V>::from_raw(raw) };
+            let mut table = unsafe { Table::from_raw(raw) };
             let next = *table.state_mut().next.get_mut();
-            unsafe { drop_entries::<K, V>(table) };
-            unsafe { drop_table::<K, V>(table) };
+            unsafe { drop_entries(table) };
+            unsafe { drop_table(table) };
             raw = next;
         }
     }
 }
 
 // Drop all entries in this table.
-unsafe fn drop_entries<K, V>(table: Table<K, V>) {
+unsafe fn drop_entries<K, V>(table: Table<Entry<K, V>>) {
     for i in 0..table.len() {
         let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
@@ -2446,7 +2460,7 @@ unsafe fn drop_entries<K, V>(table: Table<K, V>) {
 }
 
 // Drop the table allocation.
-unsafe fn drop_table<K, V>(mut table: Table<K, V>) {
+unsafe fn drop_table<K, V>(mut table: Table<Entry<K, V>>) {
     // Safety: `drop_table` is being called from `reclaim_all` in `Drop` or
     // a table is being reclaimed by our thread. In both cases, the collector
     // is still alive and safe to access through the state pointer.
