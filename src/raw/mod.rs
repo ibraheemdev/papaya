@@ -289,13 +289,34 @@ where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
+        let hash = self.hasher.hash_one(key);
+        self.get_by_hash(hash, |key_ref| key_ref == key, guard)
+    }
+
+    // Returns a reference to the entry with the given `hash` and which
+    // satisfies the equality function passed.
+    //
+    // # Safety
+    //
+    // The guard must be valid to use with this map.
+    #[inline]
+    pub unsafe fn get_by_hash<'g, Q>(
+        &self,
+        hash: u64,
+        eq: impl Fn(&Q) -> bool,
+        guard: &'g impl Guard,
+    ) -> Option<(&'g K, &'g V)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let mut table = self.root(guard);
 
         if table.raw.is_null() {
             return None;
         }
 
-        let (h1, h2) = self.hash(key);
+        let (h1, h2) = (meta::h1(hash), meta::h2(hash));
 
         loop {
             // Initialize the probe state.
@@ -319,7 +340,7 @@ where
                     }
 
                     // Check for a full match.
-                    if unsafe { (*entry.ptr).key.borrow() } == key {
+                    if eq(unsafe { (*entry.ptr).key.borrow() }) {
                         // The entry was copied to the new table.
                         //
                         // In blocking resize mode we do not need to perform self check as all writes block

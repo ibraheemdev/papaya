@@ -457,6 +457,37 @@ where
         }
     }
 
+    /// Returns a reference to the value with the given `hash` and which
+    /// satisfies the equality function passed.
+    ///
+    /// This function is similar to [`Self::get()`], but provides a shortcut
+    /// for lookups where instantiation of keys is expensive. For instance, if
+    /// creating the key requires allocation, this can be avoided by using
+    /// this method.
+    ///
+    /// As a caller, you are responsible for using the correct hasher, and
+    /// making sure the equality function only returns `true` for the key you
+    /// are looking for.
+    #[inline]
+    pub fn get_by_hash<'g, Q>(
+        &self,
+        hash: u64,
+        eq: impl Fn(&Q) -> bool,
+        guard: &'g impl Guard,
+    ) -> Option<&'g V>
+    where
+        K: Borrow<Q> + 'g,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        match unsafe { self.raw.get_by_hash(hash, eq, guard) } {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
     /// Returns the key-value pair corresponding to the supplied key.
     ///
     /// The supplied key may be any borrowed form of the map's key type, but
@@ -1295,6 +1326,23 @@ where
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.map.raw.get(key, &self.guard) } {
+            Some((_, v)) => Some(v),
+            None => None,
+        }
+    }
+
+    /// Returns a reference to the value with the given `hash` and which
+    /// satisfies the equality function passed.
+    ///
+    /// See [`HashMap::get_by_hash`] for details.
+    #[inline]
+    pub fn get_by_hash<Q>(&self, hash: u64, eq: impl Fn(&Q) -> bool) -> Option<&V>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        // Safety: `self.guard` was created from our map.
+        match unsafe { self.map.raw.get_by_hash(hash, eq, &self.guard) } {
             Some((_, v)) => Some(v),
             None => None,
         }
