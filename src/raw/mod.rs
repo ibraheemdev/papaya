@@ -286,29 +286,7 @@ where
     #[inline]
     pub unsafe fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        let hash = self.hasher.hash_one(key);
-        self.get_by_hash(hash, |key_ref| key_ref == key, guard)
-    }
-
-    // Returns a reference to the entry with the given `hash` and which
-    // satisfies the equality function passed.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
-    #[inline]
-    pub unsafe fn get_by_hash<'g, Q>(
-        &self,
-        hash: u64,
-        eq: impl Fn(&Q) -> bool,
-        guard: &'g impl Guard,
-    ) -> Option<(&'g K, &'g V)>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         let mut table = self.root(guard);
 
@@ -316,7 +294,7 @@ where
             return None;
         }
 
-        let (h1, h2) = (meta::h1(hash), meta::h2(hash));
+        let (h1, h2) = self.hash(key);
 
         loop {
             // Initialize the probe state.
@@ -340,7 +318,7 @@ where
                     }
 
                     // Check for a full match.
-                    if eq(unsafe { (*entry.ptr).key.borrow() }) {
+                    if key.equivalent(unsafe { &(*entry.ptr).key }) {
                         // The entry was copied to the new table.
                         //
                         // In blocking resize mode we do not need to perform self check as all writes block
@@ -2354,6 +2332,34 @@ where
                 }
             }
         }
+    }
+}
+
+/// Key equivalence trait.
+///
+/// This trait allows hash table lookups to be customized. It has one blanket
+/// implementation that uses the regular solution with `Borrow` and `Eq`, just
+/// like [std::collections::HashMap] does, so that you can pass `&str` to lookup
+/// into a map with `String` keys and so on.
+///
+/// ## Contract
+///
+/// The implementor must hash like K, if it is hashable.
+pub trait Equivalent<K>
+where
+    K: ?Sized,
+{
+    /// Compares `self` to `key` and returns whether they are equal.
+    fn equivalent(&self, key: &K) -> bool;
+}
+
+impl<Q, K> Equivalent<K> for Q
+where
+    Q: Eq + ?Sized,
+    K: Borrow<Q> + ?Sized,
+{
+    fn equivalent(&self, key: &K) -> bool {
+        self.eq(key.borrow())
     }
 }
 

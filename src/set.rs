@@ -1,4 +1,5 @@
 use crate::raw::{self, InsertResult};
+use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use crate::map::ResizeMode;
@@ -394,44 +395,12 @@ where
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g K>
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
         // Safety: Checked the guard above.
         match unsafe { self.raw.get(key, guard) } {
-            Some((k, _)) => Some(k),
-            None => None,
-        }
-    }
-
-    /// Returns a reference to the value with the given `hash` and which
-    /// satisfies the equality function passed.
-    ///
-    /// This function is similar to [`Self::get()`], but provides a shortcut
-    /// for lookups where instantiation of keys is expensive. For instance, if
-    /// creating the key requires allocation, this can be avoided by using
-    /// this method.
-    ///
-    /// As a caller, you are responsible for using the correct hasher, and
-    /// making sure the equality function only returns `true` for the key you
-    /// are looking for.
-    #[inline]
-    pub fn get_by_hash<'g, Q>(
-        &self,
-        hash: u64,
-        eq: impl Fn(&Q) -> bool,
-        guard: &'g impl Guard,
-    ) -> Option<&'g K>
-    where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.get_by_hash(hash, eq, guard) } {
             Some((k, _)) => Some(k),
             None => None,
         }
@@ -815,28 +784,10 @@ where
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&K>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.set.raw.get(key, &self.guard) } {
-            Some((k, _)) => Some(k),
-            None => None,
-        }
-    }
-
-    /// Returns a reference to the value with the given `hash` and which
-    /// satisfies the equality function passed.
-    ///
-    /// See [`HashSet::get_by_hash`] for details.
-    #[inline]
-    pub fn get_by_hash<Q>(&self, hash: u64, eq: impl Fn(&Q) -> bool) -> Option<&K>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.set.raw.get_by_hash(hash, eq, &self.guard) } {
             Some((k, _)) => Some(k),
             None => None,
         }
