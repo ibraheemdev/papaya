@@ -367,8 +367,7 @@ where
     #[inline]
     pub fn contains<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key, guard).is_some()
     }
@@ -772,8 +771,7 @@ where
     #[inline]
     pub fn contains<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key).is_some()
     }
