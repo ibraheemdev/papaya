@@ -12,6 +12,7 @@ keywords = ["concurrent", "hashmap", "atomic", "lock-free"]
 exclude = ["assets/*"]
 
 [dependencies]
+equivalent = "1"
 seize = "0.4"
 serde = { version = "1", optional = true }
 
@@ -34,7 +35,10 @@ inherits = "release"
 debug-assertions = true
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(papaya_stress)', 'cfg(papaya_asan)'] }
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(papaya_stress)',
+    'cfg(papaya_asan)',
+] }
 
 [[bench]]
 name = "single_thread"

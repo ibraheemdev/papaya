@@ -13,6 +13,7 @@ use self::alloc::{RawTable, Table};
 use self::probe::Probe;
 use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, Shared, StrictProvenance, Tagged};
 use crate::map::{Compute, Operation, ResizeMode};
+use crate::Equivalent;
 
 use seize::{AsLink, Collector, Guard, Link};
 
@@ -2332,34 +2333,6 @@ where
                 }
             }
         }
-    }
-}
-
-/// Key equivalence trait.
-///
-/// This trait allows hash table lookups to be customized. It has one blanket
-/// implementation that uses the regular solution with `Borrow` and `Eq`, just
-/// like [std::collections::HashMap] does, so that you can pass `&str` to lookup
-/// into a map with `String` keys and so on.
-///
-/// ## Contract
-///
-/// The implementor must hash like K, if it is hashable.
-pub trait Equivalent<K>
-where
-    K: ?Sized,
-{
-    /// Compares `self` to `key` and returns whether they are equal.
-    fn equivalent(&self, key: &K) -> bool;
-}
-
-impl<Q, K> Equivalent<K> for Q
-where
-    Q: Eq + ?Sized,
-    K: Borrow<Q> + ?Sized,
-{
-    fn equivalent(&self, key: &K) -> bool {
-        self.eq(key.borrow())
     }
 }
 
