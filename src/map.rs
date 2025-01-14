@@ -814,8 +814,8 @@ where
     #[inline]
     pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        K: 'g,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -847,8 +847,8 @@ where
     #[inline]
     pub fn remove_entry<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        K: 'g,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 

@@ -458,10 +458,9 @@ where
     /// assert_eq!(set.pin().remove(&1), false);
     /// ```
     #[inline]
-    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> bool
+    pub fn remove<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 

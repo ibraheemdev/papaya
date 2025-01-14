@@ -2,7 +2,6 @@ mod alloc;
 mod probe;
 mod utils;
 
-use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{fence, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
@@ -607,14 +606,9 @@ where
     //
     // The guard must be valid to use with this map.
     #[inline]
-    pub unsafe fn remove<'g, Q: ?Sized>(
-        &self,
-        key: &Q,
-        guard: &'g impl Guard,
-    ) -> Option<(&'g K, &'g V)>
+    pub unsafe fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         let mut table = self.root(guard);
 
@@ -661,7 +655,7 @@ where
                 }
 
                 // Check for a full match.
-                if unsafe { (*entry.ptr).key.borrow() != key } {
+                if !key.equivalent(unsafe { &(*entry.ptr).key }) {
                     probe.next(table.mask);
                     continue 'probe;
                 }
