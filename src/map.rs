@@ -1,4 +1,5 @@
 use crate::raw::{self, InsertResult};
+use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use std::borrow::Borrow;
@@ -417,8 +418,7 @@ where
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key, guard).is_some()
     }
@@ -445,8 +445,8 @@ where
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        K: 'g,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -479,8 +479,7 @@ where
     #[inline]
     pub fn get_key_value<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -815,8 +814,8 @@ where
     #[inline]
     pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g V>
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        K: 'g,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -848,8 +847,8 @@ where
     #[inline]
     pub fn remove_entry<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        K: 'g,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -1278,8 +1277,7 @@ where
     #[inline]
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key).is_some()
     }
@@ -1290,8 +1288,7 @@ where
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.map.raw.get(key, &self.guard) } {
@@ -1306,8 +1303,7 @@ where
     #[inline]
     pub fn get_key_value<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         unsafe { self.map.raw.get(key, &self.guard) }

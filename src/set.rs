@@ -1,4 +1,5 @@
 use crate::raw::{self, InsertResult};
+use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use crate::map::ResizeMode;
@@ -366,8 +367,7 @@ where
     #[inline]
     pub fn contains<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key, guard).is_some()
     }
@@ -394,8 +394,7 @@ where
     #[inline]
     pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<&'g K>
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -459,10 +458,9 @@ where
     /// assert_eq!(set.pin().remove(&1), false);
     /// ```
     #[inline]
-    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> bool
+    pub fn remove<Q>(&self, key: &Q, guard: &impl Guard) -> bool
     where
-        K: Borrow<Q> + 'g,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.raw.check_guard(guard);
 
@@ -772,8 +770,7 @@ where
     #[inline]
     pub fn contains<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         self.get(key).is_some()
     }
@@ -784,8 +781,7 @@ where
     #[inline]
     pub fn get<Q>(&self, key: &Q) -> Option<&K>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.set.raw.get(key, &self.guard) } {
