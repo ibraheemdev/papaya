@@ -2,7 +2,6 @@ use crate::raw::{self, InsertResult};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
-use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
@@ -1427,8 +1426,7 @@ where
     #[inline]
     pub fn remove<Q>(&self, key: &Q) -> Option<&V>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.map.raw.remove(key, &self.guard) } {
@@ -1444,8 +1442,7 @@ where
     #[inline]
     pub fn remove_entry<Q>(&self, key: &Q) -> Option<(&K, &V)>
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         unsafe { self.map.raw.remove(key, &self.guard) }

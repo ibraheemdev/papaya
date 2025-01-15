@@ -3,7 +3,6 @@ use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use crate::map::ResizeMode;
-use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
@@ -810,8 +809,7 @@ where
     #[inline]
     pub fn remove<Q>(&self, key: &Q) -> bool
     where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Equivalent<K> + Hash + ?Sized,
     {
         // Safety: `self.guard` was created from our map.
         match unsafe { self.set.raw.remove(key, &self.guard) } {
