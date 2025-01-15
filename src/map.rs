@@ -1381,7 +1381,6 @@ where
     /// and returns a reference to the value that was inserted.
     ///
     /// See [`HashMap::try_insert_with`] for details.
-    /// ```
     #[inline]
     pub fn try_insert_with<F>(&self, key: K, f: F) -> Result<&V, &V>
     where
