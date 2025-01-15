@@ -1175,6 +1175,14 @@ where
     }
 
     // Restores the state if an operation fails.
+    //
+    // This allows the result of the compute closure with a given input to be memoized.
+    // This is useful at it avoids calling the closure multiple times if an update needs
+    // to be retried in a new table.
+    //
+    // Additionally, update and insert operations are memoized separately, although this
+    // is not guaranteed in the public API. This means that internal methods can rely on
+    // `compute(None)` being called at most once.
     #[inline]
     fn restore(&mut self, input: Option<*mut Entry<K, V>>, output: Operation<V, T>) {
         match input {
@@ -1238,6 +1246,42 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
+    /// Tries to insert a key and value computed from a closure into the map,
+    /// and returns a reference to the value that was inserted.
+    //
+    // # Safety
+    //
+    // The guard must be valid to use with this map.
+    #[inline]
+    pub unsafe fn try_insert_with<'g, F>(
+        &self,
+        key: K,
+        f: F,
+        guard: &'g impl Guard,
+    ) -> Result<&'g V, &'g V>
+    where
+        F: FnOnce() -> V,
+        K: 'g,
+    {
+        let mut f = Some(f);
+        let compute = |entry| match entry {
+            // There is already an existing value.
+            Some((_, current)) => Operation::Abort(current),
+
+            // Insert the initial value.
+            //
+            // Note that this case is guaranteed to be executed at most
+            // once as insert values are memoized, so this can never panic.
+            None => Operation::Insert((f.take().unwrap())()),
+        };
+
+        match self.compute(key, compute, guard) {
+            Compute::Aborted(current) => Err(current),
+            Compute::Inserted(_, value) => Ok(value),
+            _ => unreachable!(),
+        }
+    }
+
     /// Returns a reference to the value corresponding to the key, or inserts a default value
     /// computed from a closure.
     //
@@ -1254,7 +1298,11 @@ where
         let compute = |entry| match entry {
             // Return the existing value.
             Some((_, current)) => Operation::Abort(current),
+
             // Insert the initial value.
+            //
+            // Note that this case is guaranteed to be executed at most
+            // once as insert values are memoized, so this can never panic.
             None => Operation::Insert((f.take().unwrap())()),
         };
 
@@ -1282,8 +1330,10 @@ where
         K: 'g,
     {
         let compute = |entry| match entry {
-            Some((_, value)) => Operation::Insert(update(value)),
+            // There is nothing to update.
             None => Operation::Abort(()),
+            // Perform the update.
+            Some((_, value)) => Operation::Insert(update(value)),
         };
 
         match self.compute(key, compute, guard) {
@@ -1317,7 +1367,11 @@ where
         let compute = |entry| match entry {
             // Perform the update.
             Some((_, value)) => Operation::Insert::<_, ()>(update(value)),
+
             // Insert the initial value.
+            //
+            // Note that this case is guaranteed to be executed at most
+            // once as insert values are memoized, so this can never panic.
             None => Operation::Insert((f.take().unwrap())()),
         };
 
@@ -1359,7 +1413,7 @@ where
         // Deallocate the entry if it was not inserted.
         if matches!(result, Compute::Removed(..) | Compute::Aborted(_)) {
             if let LazyEntry::Init(entry) = entry {
-                // Safety: We allocated this box above and it was not inserted into the map.
+                // Safety: The entry was allocated but not inserted into the map.
                 let _ = unsafe { Box::from_raw(entry) };
             }
         }

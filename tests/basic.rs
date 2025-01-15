@@ -1,6 +1,6 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::{Compute, HashMap, Operation};
+use papaya::{Compute, HashMap, OccupiedError, Operation};
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -244,6 +244,74 @@ fn get_or_insert() {
         let result = map.get_or_insert(42, 1, &guard);
         assert_eq!(result, &0);
         assert_eq!(map.len(), 1);
+    });
+}
+
+#[test]
+fn try_insert() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        assert_eq!(map.try_insert(42, 1, &guard), Ok(&1));
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &1);
+        }
+
+        assert_eq!(
+            map.try_insert(42, 2, &guard),
+            Err(OccupiedError {
+                current: &1,
+                not_inserted: 2
+            })
+        );
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &1);
+        }
+
+        assert_eq!(map.try_insert(43, 2, &guard), Ok(&2));
+    });
+}
+
+#[test]
+fn try_insert_with() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        map.try_insert_with(42, || 1, &guard).unwrap();
+        assert_eq!(map.len(), 1);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &1);
+        }
+
+        let mut called = false;
+        let insert = || {
+            called = true;
+            2
+        };
+        assert_eq!(map.try_insert_with(42, insert, &guard), Err(&1));
+        assert_eq!(map.len(), 1);
+        assert!(!called);
+
+        {
+            let guard = map.guard();
+            let e = map.get(&42, &guard).unwrap();
+            assert_eq!(e, &1);
+        }
+
+        assert_eq!(map.try_insert_with(43, || 2, &guard), Ok(&2));
     });
 }
 

@@ -565,6 +565,42 @@ where
         }
     }
 
+    /// Tries to insert a key and value computed from a closure into the map,
+    /// and returns a reference to the value that was inserted.
+    ///
+    /// If the map already had this key present, nothing is updated, and
+    /// the existing value is returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// let map = map.pin();
+    ///
+    /// assert_eq!(map.try_insert_with(37, || "a").unwrap(), &"a");
+    ///
+    /// let current = map.try_insert_with(37, || "b").unwrap_err();
+    /// assert_eq!(current, &"a");
+    /// ```
+    #[inline]
+    pub fn try_insert_with<'g, F>(
+        &self,
+        key: K,
+        f: F,
+        guard: &'g impl Guard,
+    ) -> Result<&'g V, &'g V>
+    where
+        F: FnOnce() -> V,
+        K: 'g,
+    {
+        self.raw.check_guard(guard);
+
+        // Safety: Checked the guard above.
+        unsafe { self.raw.try_insert_with(key, f, guard) }
+    }
+
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
     ///
     /// If the given key is present, the corresponding value is returned. If it is not present,
@@ -1339,6 +1375,20 @@ where
             }),
             InsertResult::Replaced(_) => unreachable!(),
         }
+    }
+
+    /// Tries to insert a key and value computed from a closure into the map,
+    /// and returns a reference to the value that was inserted.
+    ///
+    /// See [`HashMap::try_insert_with`] for details.
+    /// ```
+    #[inline]
+    pub fn try_insert_with<F>(&self, key: K, f: F) -> Result<&V, &V>
+    where
+        F: FnOnce() -> V,
+    {
+        // Safety: `self.guard` was created from our map.
+        unsafe { self.map.raw.try_insert_with(key, f, &self.guard) }
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
