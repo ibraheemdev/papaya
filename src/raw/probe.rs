@@ -5,8 +5,6 @@ pub struct Probe {
     pub i: usize,
     // The current length of the probe sequence.
     pub len: usize,
-    // The current quadratic stride.
-    stride: usize,
 }
 
 impl Probe {
@@ -16,7 +14,6 @@ impl Probe {
         Probe {
             i: hash & mask,
             len: 0,
-            stride: 0,
         }
     }
 
@@ -24,8 +21,7 @@ impl Probe {
     #[inline]
     pub fn next(&mut self, mask: usize) {
         self.len += 1;
-        self.stride += 1;
-        self.i = (self.i + self.stride) & mask;
+        self.i = (self.i + self.len) & mask;
     }
 }
 
