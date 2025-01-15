@@ -1,3 +1,4 @@
+use crate::raw::utils::MapGuard;
 use crate::raw::{self, InsertResult};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
@@ -259,7 +260,7 @@ impl<K, S> HashSet<K, S> {
     #[inline]
     pub fn pin(&self) -> HashSetRef<'_, K, S, LocalGuard<'_>> {
         HashSetRef {
-            guard: self.guard(),
+            guard: self.raw.guard(),
             set: self,
         }
     }
@@ -275,7 +276,7 @@ impl<K, S> HashSet<K, S> {
     #[inline]
     pub fn pin_owned(&self) -> HashSetRef<'_, K, S, OwnedGuard<'_>> {
         HashSetRef {
-            guard: self.owned_guard(),
+            guard: self.raw.owned_guard(),
             set: self,
         }
     }
@@ -368,7 +369,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.get(key, guard).is_some()
+        self.get(key, self.raw.verify(guard)).is_some()
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -395,11 +396,8 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.get(key, guard) } {
-            Some((k, _)) => Some(k),
+        match self.raw.get(key, self.raw.verify(guard)) {
+            Some((key, _)) => Some(key),
             None => None,
         }
     }
@@ -429,10 +427,7 @@ where
     /// ```
     #[inline]
     pub fn insert(&self, key: K, guard: &impl Guard) -> bool {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.insert(key, (), true, guard) } {
+        match self.raw.insert(key, (), true, self.raw.verify(guard)) {
             InsertResult::Inserted(_) => true,
             InsertResult::Replaced(_) => false,
             InsertResult::Error { .. } => unreachable!(),
@@ -461,10 +456,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.remove(key, guard) } {
+        match self.raw.remove(key, self.raw.verify(guard)) {
             Some((_, _)) => true,
             None => false,
         }
@@ -492,10 +484,7 @@ where
     /// ```
     #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.reserve(additional, guard) };
+        self.raw.reserve(additional, self.raw.verify(guard))
     }
 
     /// Clears the set, removing all values.
@@ -517,10 +506,7 @@ where
     /// ```
     #[inline]
     pub fn clear(&self, guard: &impl Guard) {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.clear(guard) }
+        self.raw.clear(self.raw.verify(guard))
     }
 
     /// Retains only the elements specified by the predicate.
@@ -551,10 +537,7 @@ where
     where
         F: FnMut(&K) -> bool,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.retain(|k, _| f(k), guard) }
+        self.raw.retain(|k, _| f(k), self.raw.verify(guard))
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -582,11 +565,8 @@ where
     where
         G: Guard,
     {
-        self.raw.check_guard(guard);
-
         Iter {
-            // Safety: Checked the guard above.
-            raw: unsafe { self.raw.iter(guard) },
+            raw: self.raw.iter(self.raw.verify(guard)),
         }
     }
 }
@@ -731,7 +711,7 @@ where
 /// This type is created with [`HashSet::pin`] and can be used to easily access a [`HashSet`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
 pub struct HashSetRef<'set, K, S, G> {
-    guard: G,
+    guard: MapGuard<G>,
     set: &'set HashSet<K, S>,
 }
 
@@ -782,8 +762,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.set.raw.get(key, &self.guard) } {
+        match self.set.raw.get(key, &self.guard) {
             Some((k, _)) => Some(k),
             None => None,
         }
@@ -794,8 +773,7 @@ where
     /// See [`HashSet::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K) -> bool {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.set.raw.insert(key, (), true, &self.guard) } {
+        match self.set.raw.insert(key, (), true, &self.guard) {
             InsertResult::Inserted(_) => true,
             InsertResult::Replaced(_) => false,
             InsertResult::Error { .. } => unreachable!(),
@@ -811,8 +789,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.set.raw.remove(key, &self.guard) } {
+        match self.set.raw.remove(key, &self.guard) {
             Some((_, _)) => true,
             None => false,
         }
@@ -823,8 +800,7 @@ where
     /// See [`HashSet::clear`] for details.
     #[inline]
     pub fn clear(&self) {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.set.raw.clear(&self.guard) }
+        self.set.raw.clear(&self.guard)
     }
 
     /// Retains only the elements specified by the predicate.
@@ -835,8 +811,7 @@ where
     where
         F: FnMut(&K) -> bool,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.set.raw.retain(|k, _| f(k), &self.guard) }
+        self.set.raw.retain(|k, _| f(k), &self.guard)
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -845,8 +820,7 @@ where
     /// See [`HashSet::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.set.raw.reserve(additional, &self.guard) }
+        self.set.raw.reserve(additional, &self.guard)
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -856,8 +830,7 @@ where
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, G> {
         Iter {
-            // Safety: `self.guard` was created from our map.
-            raw: unsafe { self.set.raw.iter(&self.guard) },
+            raw: self.set.raw.iter(&self.guard),
         }
     }
 }
@@ -891,7 +864,7 @@ where
 ///
 /// This struct is created by the [`iter`](HashSet::iter) method on [`HashSet`]. See its documentation for details.
 pub struct Iter<'g, K, G> {
-    raw: raw::Iter<'g, K, (), G>,
+    raw: raw::Iter<'g, K, (), MapGuard<G>>,
 }
 
 impl<'g, K: 'g, G> Iterator for Iter<'g, K, G>

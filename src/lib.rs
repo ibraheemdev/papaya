@@ -214,7 +214,12 @@
 //!
 //! [benchmarks]: https://github.com/ibraheemdev/papaya/blob/master/BENCHMARKS.md
 
-#![deny(missing_debug_implementations, missing_docs, dead_code)]
+#![deny(
+    missing_debug_implementations,
+    missing_docs,
+    dead_code,
+    unsafe_op_in_unsafe_fn
+)]
 // Polyfills for unstable APIs related to strict-provenance.
 #![allow(unstable_name_collisions)]
 // Stylistic preferences.

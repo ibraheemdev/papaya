@@ -1,3 +1,4 @@
+use crate::raw::utils::MapGuard;
 use crate::raw::{self, InsertResult};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
@@ -310,7 +311,7 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     pub fn pin(&self) -> HashMapRef<'_, K, V, S, LocalGuard<'_>> {
         HashMapRef {
-            guard: self.guard(),
+            guard: self.raw.guard(),
             map: self,
         }
     }
@@ -326,7 +327,7 @@ impl<K, V, S> HashMap<K, V, S> {
     #[inline]
     pub fn pin_owned(&self) -> HashMapRef<'_, K, V, S, OwnedGuard<'_>> {
         HashMapRef {
-            guard: self.owned_guard(),
+            guard: self.raw.owned_guard(),
             map: self,
         }
     }
@@ -419,7 +420,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.get(key, guard).is_some()
+        self.get(key, self.raw.verify(guard)).is_some()
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -447,10 +448,7 @@ where
         K: 'g,
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.get(key, guard) } {
+        match self.raw.get(key, self.raw.verify(guard)) {
             Some((_, v)) => Some(v),
             None => None,
         }
@@ -480,10 +478,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.get(key, guard) }
+        self.raw.get(key, self.raw.verify(guard))
     }
 
     /// Inserts a key-value pair into the map.
@@ -512,10 +507,7 @@ where
     /// ```
     #[inline]
     pub fn insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> Option<&'g V> {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.insert(key, value, true, guard) } {
+        match self.raw.insert(key, value, true, self.raw.verify(guard)) {
             InsertResult::Inserted(_) => None,
             InsertResult::Replaced(value) => Some(value),
             InsertResult::Error { .. } => unreachable!(),
@@ -549,10 +541,8 @@ where
         value: V,
         guard: &'g impl Guard,
     ) -> Result<&'g V, OccupiedError<'g, V>> {
-        self.raw.check_guard(guard);
-
         // Safety: Checked the guard above.
-        match unsafe { self.raw.insert(key, value, false, guard) } {
+        match self.raw.insert(key, value, false, self.raw.verify(guard)) {
             InsertResult::Inserted(value) => Ok(value),
             InsertResult::Error {
                 current,
@@ -595,10 +585,7 @@ where
         F: FnOnce() -> V,
         K: 'g,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.try_insert_with(key, f, guard) }
+        self.raw.try_insert_with(key, f, self.raw.verify(guard))
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
@@ -617,8 +604,6 @@ where
     /// ```
     #[inline]
     pub fn get_or_insert<'g>(&self, key: K, value: V, guard: &'g impl Guard) -> &'g V {
-        self.raw.check_guard(guard);
-
         // Note that we use `try_insert` instead of `compute` or `get_or_insert_with` here, as it
         // allows us to avoid the closure indirection.
         match self.try_insert(key, value, guard) {
@@ -650,10 +635,7 @@ where
         F: FnOnce() -> V,
         K: 'g,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.get_or_insert_with(key, f, guard) }
+        self.raw.get_or_insert_with(key, f, self.raw.verify(guard))
     }
 
     /// Updates an existing entry atomically.
@@ -691,10 +673,7 @@ where
         F: Fn(&V) -> V,
         K: 'g,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.update(key, update, guard) }
+        self.raw.update(key, update, self.raw.verify(guard))
     }
 
     /// Updates an existing entry or inserts a default value.
@@ -726,8 +705,6 @@ where
         F: Fn(&V) -> V,
         K: 'g,
     {
-        self.raw.check_guard(guard);
-
         self.update_or_insert_with(key, update, || value, guard)
     }
 
@@ -762,10 +739,8 @@ where
         U: Fn(&V) -> V,
         K: 'g,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.update_or_insert_with(key, update, f, guard) }
+        self.raw
+            .update_or_insert_with(key, update, f, self.raw.verify(guard))
     }
 
     /// Updates an entry with a compare-and-swap (CAS) function.
@@ -823,10 +798,7 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.compute(key, compute, guard) }
+        self.raw.compute(key, compute, self.raw.verify(guard))
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -852,10 +824,7 @@ where
         K: 'g,
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        match unsafe { self.raw.remove(key, guard) } {
+        match self.raw.remove(key, self.raw.verify(guard)) {
             Some((_, value)) => Some(value),
             None => None,
         }
@@ -885,10 +854,7 @@ where
         K: 'g,
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.remove(key, guard) }
+        self.raw.remove(key, self.raw.verify(guard))
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -913,10 +879,7 @@ where
     /// ```
     #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.reserve(additional, guard) };
+        self.raw.reserve(additional, self.raw.verify(guard))
     }
 
     /// Clears the map, removing all key-value pairs.
@@ -938,10 +901,7 @@ where
     /// ```
     #[inline]
     pub fn clear(&self, guard: &impl Guard) {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.clear(guard) }
+        self.raw.clear(self.raw.verify(guard))
     }
 
     /// Retains only the elements specified by the predicate.
@@ -970,10 +930,7 @@ where
     where
         F: FnMut(&K, &V) -> bool,
     {
-        self.raw.check_guard(guard);
-
-        // Safety: Checked the guard above.
-        unsafe { self.raw.retain(f, guard) }
+        self.raw.retain(f, self.raw.verify(guard))
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -1002,11 +959,8 @@ where
     where
         G: Guard,
     {
-        self.raw.check_guard(guard);
-
         Iter {
-            // Safety: Checked the guard above.
-            raw: unsafe { self.raw.iter(guard) },
+            raw: self.raw.iter(self.raw.verify(guard)),
         }
     }
 
@@ -1037,8 +991,6 @@ where
     where
         G: Guard,
     {
-        self.raw.check_guard(guard);
-
         Keys {
             iter: self.iter(guard),
         }
@@ -1071,8 +1023,6 @@ where
     where
         G: Guard,
     {
-        self.raw.check_guard(guard);
-
         Values {
             iter: self.iter(guard),
         }
@@ -1274,7 +1224,7 @@ where
 /// This type is created with [`HashMap::pin`] and can be used to easily access a [`HashMap`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
 pub struct HashMapRef<'map, K, V, S, G> {
-    guard: G,
+    guard: MapGuard<G>,
     map: &'map HashMap<K, V, S>,
 }
 
@@ -1325,8 +1275,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.map.raw.get(key, &self.guard) } {
+        match self.map.raw.get(key, &self.guard) {
             Some((_, v)) => Some(v),
             None => None,
         }
@@ -1340,8 +1289,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.get(key, &self.guard) }
+        self.map.raw.get(key, &self.guard)
     }
 
     /// Inserts a key-value pair into the map.
@@ -1349,8 +1297,7 @@ where
     /// See [`HashMap::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.map.raw.insert(key, value, true, &self.guard) } {
+        match self.map.raw.insert(key, value, true, &self.guard) {
             InsertResult::Inserted(_) => None,
             InsertResult::Replaced(value) => Some(value),
             InsertResult::Error { .. } => unreachable!(),
@@ -1363,8 +1310,7 @@ where
     /// See [`HashMap::try_insert`] for details.
     #[inline]
     pub fn try_insert(&self, key: K, value: V) -> Result<&V, OccupiedError<'_, V>> {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.map.raw.insert(key, value, false, &self.guard) } {
+        match self.map.raw.insert(key, value, false, &self.guard) {
             InsertResult::Inserted(value) => Ok(value),
             InsertResult::Error {
                 current,
@@ -1386,8 +1332,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.try_insert_with(key, f, &self.guard) }
+        self.map.raw.try_insert_with(key, f, &self.guard)
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value.
@@ -1412,8 +1357,7 @@ where
     where
         F: FnOnce() -> V,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.get_or_insert_with(key, f, &self.guard) }
+        self.map.raw.get_or_insert_with(key, f, &self.guard)
     }
 
     /// Updates an existing entry atomically.
@@ -1424,8 +1368,7 @@ where
     where
         F: Fn(&V) -> V,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.update(key, update, &self.guard) }
+        self.map.raw.update(key, update, &self.guard)
     }
 
     /// Updates an existing entry or inserts a default value.
@@ -1448,12 +1391,9 @@ where
         F: FnOnce() -> V,
         U: Fn(&V) -> V,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe {
-            self.map
-                .raw
-                .update_or_insert_with(key, update, f, &self.guard)
-        }
+        self.map
+            .raw
+            .update_or_insert_with(key, update, f, &self.guard)
     }
 
     // Updates an entry with a compare-and-swap (CAS) function.
@@ -1464,8 +1404,7 @@ where
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.compute(key, compute, &self.guard) }
+        self.map.raw.compute(key, compute, &self.guard)
     }
 
     /// Removes a key from the map, returning the value at the key if the key
@@ -1477,8 +1416,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        match unsafe { self.map.raw.remove(key, &self.guard) } {
+        match self.map.raw.remove(key, &self.guard) {
             Some((_, value)) => Some(value),
             None => None,
         }
@@ -1493,8 +1431,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.remove(key, &self.guard) }
+        self.map.raw.remove(key, &self.guard)
     }
 
     /// Clears the map, removing all key-value pairs.
@@ -1502,8 +1439,7 @@ where
     /// See [`HashMap::clear`] for details.
     #[inline]
     pub fn clear(&self) {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.clear(&self.guard) }
+        self.map.raw.clear(&self.guard)
     }
 
     /// Retains only the elements specified by the predicate.
@@ -1514,8 +1450,7 @@ where
     where
         F: FnMut(&K, &V) -> bool,
     {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.retain(f, &self.guard) }
+        self.map.raw.retain(f, &self.guard)
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -1524,8 +1459,7 @@ where
     /// See [`HashMap::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
-        // Safety: `self.guard` was created from our map.
-        unsafe { self.map.raw.reserve(additional, &self.guard) }
+        self.map.raw.reserve(additional, &self.guard)
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
@@ -1535,8 +1469,7 @@ where
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, V, G> {
         Iter {
-            // Safety: `self.guard` was created from our map.
-            raw: unsafe { self.map.raw.iter(&self.guard) },
+            raw: self.map.raw.iter(&self.guard),
         }
     }
 
@@ -1589,7 +1522,7 @@ where
 ///
 /// This struct is created by the [`iter`](HashMap::iter) method on [`HashMap`]. See its documentation for details.
 pub struct Iter<'g, K, V, G> {
-    raw: raw::Iter<'g, K, V, G>,
+    raw: raw::Iter<'g, K, V, MapGuard<G>>,
 }
 
 impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>

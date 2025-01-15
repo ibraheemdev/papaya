@@ -1,10 +1,10 @@
 mod alloc;
 mod probe;
-mod utils;
+pub(crate) mod utils;
 
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
-use std::sync::atomic::{fence, AtomicPtr, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{hint, panic, ptr};
 
@@ -14,47 +14,55 @@ use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, Shared, StrictPr
 use crate::map::{Compute, Operation, ResizeMode};
 use crate::Equivalent;
 
-use seize::{AsLink, Collector, Guard, Link};
+use seize::{AsLink, Collector, Link, LocalGuard, OwnedGuard};
+use utils::{MapGuard, VerifiedGuard};
 
-// A lock-free hash-table.
+/// A lock-free hash-table.
 pub struct HashMap<K, V, S> {
-    // A pointer to the root table.
+    /// A pointer to the root table.
     table: AtomicPtr<RawTable<Entry<K, V>>>,
 
-    // Collector for memory reclamation.
-    //
-    // The collector is allocated as it's aliased by each table,
-    // in case it needs to be accessed during reclamation.
+    /// Collector for memory reclamation.
+    ///
+    /// The collector is allocated at the root and shared within each table
+    /// allocation in case it needs to be accessed during reclamation.
     collector: Shared<Collector>,
 
-    // The resize mode, either blocking or incremental.
+    /// The resize mode, either blocking or incremental.
     resize: ResizeMode,
 
-    // The number of keys in the table.
+    /// An atomic counter of the number of keys in the table.
     count: Counter,
 
-    // Hasher for keys.
+    /// Hasher for keys.
     pub hasher: S,
 }
 
-// Hash-table state.
+/// Resize state for the hash-table.
 pub struct State<T> {
-    // The next table used for resizing.
+    /// The next table used for resizing.
     pub next: AtomicPtr<RawTable<T>>,
-    // A lock acquired to allocate the next table.
+
+    /// A lock acquired to allocate the next table.
     pub allocating: Mutex<()>,
-    // The number of entries that have been copied to the next table.
+
+    /// The number of entries that have been copied to the next table.
     pub copied: AtomicUsize,
-    // The number of entries that have been claimed by copiers,
-    // but not necessarily copied.
+
+    /// The number of entries that have been claimed by copiers,
+    /// but not necessarily copied.
     pub claim: AtomicUsize,
-    // The status of the resize.
+
+    /// The status of the resize.
     pub status: AtomicU8,
-    // A thread parker for blocking on copy operations.
+
+    /// A thread parker for blocking on copy operations.
     pub parker: Parker,
-    // Entries whose retirement has been deferred by later tables.
+
+    /// Entries whose retirement has been deferred by later tables.
     pub deferred: seize::Deferred,
-    // A pointer to the root collector, valid as long as the map is alive.
+
+    /// A pointer to the root collector, valid as long as the map is alive.
     pub collector: *const Collector,
 }
 
@@ -74,35 +82,39 @@ impl<T> Default for State<T> {
 }
 
 impl State<()> {
-    // A resize is in-progress.
+    /// A resize is in-progress.
     pub const PENDING: u8 = 0;
 
-    // The resize has been aborted, continue to the next table.
+    /// The resize has been aborted, continue to the next table.
     pub const ABORTED: u8 = 1;
 
-    // The resize was complete and the table was promoted.
+    /// The resize was complete and the table was promoted.
     pub const PROMOTED: u8 = 2;
 }
 
 // The result of an insert operation.
 pub enum InsertResult<'g, V> {
-    // Inserted the given value.
+    /// Inserted the given value.
     Inserted(&'g V),
-    // Replaced the given value.
+
+    /// Replaced the given value.
     Replaced(&'g V),
-    // Error returned by `try_insert`.
+
+    /// Error returned by `try_insert`.
     Error { current: &'g V, not_inserted: V },
 }
 
 // The raw result of an insert operation.
 pub enum RawInsertResult<'g, K, V> {
-    // Inserted the given value.
+    /// Inserted the given value.
     Inserted(&'g V),
-    // Replaced the given value.
+
+    /// Replaced the given value.
     Replaced(&'g V),
-    // Error returned by `try_insert`.
+
+    /// Error returned by `try_insert`.
     Error {
-        current: Tagged<Entry<K, V>>,
+        current: &'g V,
         not_inserted: *mut Entry<K, V>,
     },
 }
@@ -110,70 +122,84 @@ pub enum RawInsertResult<'g, K, V> {
 // An entry in the hash-table.
 #[repr(C)]
 pub struct Entry<K, V> {
+    /// A link to the `seize::Collector`, enabling garbage collection
+    /// when the entry is removed or replaced.
     pub link: Link,
+
+    /// The key for this entry.
     pub key: K,
+
+    /// The value for this entry.
     pub value: V,
 }
 
-// Safety: repr(C) and seize::Link is the first field
+/// Safety: `Entry` is `repr(C)` and `seize::Link` is its first field.
 unsafe impl<K, V> AsLink for Entry<K, V> {}
 
 impl Entry<(), ()> {
-    // The entry is being copied to the new table, no updates are allowed on the old table.
-    //
-    // This bit is put down to initiate a copy, forcing all writers to complete the resize
-    // before making progress.
+    /// The entry is being copied to the new table, no updates are allowed on the old table.
+    ///
+    /// This bit is put down to initiate a copy, forcing all writers to complete the resize
+    /// before making progress.
     const COPYING: usize = 0b001;
 
-    // The entry has been copied to the new table.
-    //
-    // This bit is put down after a copy completes. Both readers and writers must go to
-    // the new table to see the new state of the entry.
-    //
-    // In blocking mode this is unused.
+    /// The entry has been copied to the new table.
+    ///
+    /// This bit is put down after a copy completes. Both readers and writers must go to
+    /// the new table to see the new state of the entry.
+    ///
+    /// In blocking mode this is unused.
     const COPIED: usize = 0b010;
 
-    // The entry was copied from a previous table.
-    //
-    // This bit indicates that an entry may still be accessible from previous tables
-    // because the resize is still in progress, and so it is unsafe to reclaim.
-    //
-    // In blocking mode this is unused.
+    /// The entry was copied from a previous table.
+    ///
+    /// This bit indicates that an entry may still be accessible from previous tables
+    /// because the resize is still in progress, and so it is unsafe to reclaim.
+    ///
+    /// In blocking mode this is unused.
     const BORROWED: usize = 0b100;
 
-    // Reclaims an entry.
+    /// Reclaims an entry.
+    ///
+    /// # Safety
+    ///
+    /// The retired pointer must have been a valid pointer of type `*mut Entry<K, V>`.
     #[inline]
     unsafe fn reclaim<K, V>(link: *mut Link) {
         let entry: *mut Entry<K, V> = link.cast();
+        // Safety: The caller guarantees that the pointer is valid.
         let _entry = unsafe { Box::from_raw(entry) };
     }
 }
 
 impl<K, V> utils::Unpack for Entry<K, V> {
-    // Mask for an entry pointer, ignoring any tag bits.
+    /// Mask for an entry pointer, ignoring any tag bits.
     const MASK: usize = !(Entry::COPYING | Entry::COPIED | Entry::BORROWED);
 }
 
 impl<K, V> Entry<K, V> {
-    // A sentinel pointer for a deleted entry.
-    //
-    // Null pointers are never copied to the new table, so this state is safe to use.
-    // Note that tombstone entries may still be marked as `COPYING`, so this state
-    // cannot be used for direct equality.
+    /// A sentinel pointer for a deleted entry.
+    ///
+    /// Null pointers are never copied to the new table, so this state is safe to use.
+    /// Note that tombstone entries may still be marked as `COPYING`, so this state
+    /// cannot be used for direct equality.
     const TOMBSTONE: *mut Entry<K, V> = Entry::COPIED as _;
 }
 
 /// The status of an entry.
 enum EntryStatus<K, V> {
-    // The entry is a tombstone or null (potentially a null copy).
+    /// The entry is a tombstone or null (potentially a null copy).
     Null,
-    // The entry is being copied.
+
+    /// The entry is being copied.
     Copied(Tagged<Entry<K, V>>),
-    // A valid entry.
+
+    /// A valid entry.
     Value(Tagged<Entry<K, V>>),
 }
 
 impl<K, V> From<Tagged<Entry<K, V>>> for EntryStatus<K, V> {
+    /// Returns the status for this entry.
     #[inline]
     fn from(entry: Tagged<Entry<K, V>>) -> Self {
         if entry.ptr.is_null() {
@@ -188,22 +214,24 @@ impl<K, V> From<Tagged<Entry<K, V>>> for EntryStatus<K, V> {
 
 /// The state of an entry we attempted to update.
 enum UpdateStatus<K, V> {
-    // Successfully replaced the given key and value.
+    /// Successfully replaced the given key and value.
     Replaced(Tagged<Entry<K, V>>),
-    // A new entry was written before we could update.
+
+    /// A new entry was written before we could update.
     Found(EntryStatus<K, V>),
 }
 
 /// The state of an entry we attempted to insert into.
 enum InsertStatus<K, V> {
-    // Successfully inserted the value.
+    /// Successfully inserted the value.
     Inserted,
-    // A new entry was written before we could update.
+
+    /// A new entry was written before we could update.
     Found(EntryStatus<K, V>),
 }
 
 impl<K, V, S> HashMap<K, V, S> {
-    // Creates new hash-table with the given options.
+    /// Creates new hash-table with the given options.
     #[inline]
     pub fn new(
         capacity: usize,
@@ -237,36 +265,56 @@ impl<K, V, S> HashMap<K, V, S> {
         }
     }
 
-    // Verify a guard is valid to use with this map.
-    #[inline]
-    pub fn check_guard(&self, guard: &impl Guard) {
-        assert!(
-            guard.belongs_to(&self.collector),
-            "accessed map with incorrect guard"
-        );
+    /// Returns a guard for this collector
+    pub fn guard(&self) -> MapGuard<LocalGuard<'_>> {
+        // Safety: Created the guard from our collector.
+        unsafe { MapGuard::new(self.collector().enter()) }
     }
 
-    // Returns a reference to the root hash-table.
+    /// Returns an owned guard for this collector
+    pub fn owned_guard(&self) -> MapGuard<OwnedGuard<'_>> {
+        // Safety: Created the guard from our collector.
+        unsafe { MapGuard::new(self.collector().enter_owned()) }
+    }
+
+    /// Verify a guard is valid to use with this map.
     #[inline]
-    fn root(&self, guard: &impl Guard) -> Table<Entry<K, V>> {
+    pub fn verify<'g, G>(&self, guard: &'g G) -> &'g MapGuard<G>
+    where
+        G: seize::Guard,
+    {
+        assert!(
+            guard.belongs_to(&self.collector),
+            "Attempted to access map with incorrect guard"
+        );
+
+        // Safety: Verified the guard above.
+        unsafe { MapGuard::from_ref(guard) }
+    }
+
+    /// Returns a reference to the root hash-table.
+    #[inline]
+    fn root(&self, guard: &impl VerifiedGuard) -> Table<Entry<K, V>> {
         // Load the root table.
         let raw = guard.protect(&self.table, Ordering::Acquire);
+
+        // Safety: The root table is either null or a valid table allocation.
         unsafe { Table::from_raw(raw) }
     }
 
-    // Returns a reference to the collector.
+    /// Returns a reference to the collector.
     #[inline]
     pub fn collector(&self) -> &Collector {
         &self.collector
     }
 
-    // Returns the number of entries in the table.
+    /// Returns the number of entries in the table.
     #[inline]
     pub fn len(&self) -> usize {
         self.count.sum()
     }
 
-    // Returns true if incremental resizing is enabled.
+    /// Returns true if incremental resizing is enabled.
     #[inline]
     fn is_incremental(&self) -> bool {
         matches!(self.resize, ResizeMode::Incremental(_))
@@ -278,18 +326,16 @@ where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    // Returns a reference to the entry corresponding to the key.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Returns a reference to the entry corresponding to the key.
     #[inline]
-    pub unsafe fn get<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
+    pub fn get<'g, Q>(&self, key: &Q, guard: &'g impl VerifiedGuard) -> Option<(&'g K, &'g V)>
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
+        // Load the root table.
         let mut table = self.root(guard);
 
+        // The table has not been initialized yet.
         if table.raw.is_null() {
             return None;
         }
@@ -303,11 +349,14 @@ where
             // Probe until we reach the limit.
             'probe: while probe.len <= table.limit {
                 // Load the entry metadata first for cheap searches.
+                //
+                // Safety: `probe.i` is always in-bounds for the table length.
                 let meta = unsafe { table.meta(probe.i) }.load(Ordering::Acquire);
 
                 if meta == h2 {
                     // Load the full entry.
                     let entry = guard
+                        // Safety: `probe.i` is always in-bounds for the table length.
                         .protect(unsafe { table.entry(probe.i) }, Ordering::Acquire)
                         .unpack();
 
@@ -317,8 +366,13 @@ where
                         continue 'probe;
                     }
 
+                    // Safety: We performed a protected load of the pointer using a verified guard with
+                    // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                    // as we hold the guard.
+                    let entry_ref = unsafe { &(*entry.ptr) };
+
                     // Check for a full match.
-                    if key.equivalent(unsafe { &(*entry.ptr).key }) {
+                    if key.equivalent(&entry_ref.key) {
                         // The entry was copied to the new table.
                         //
                         // In blocking resize mode we do not need to perform self check as all writes block
@@ -328,7 +382,7 @@ where
                         }
 
                         // Found the correct entry, return the key and value.
-                        return unsafe { Some((&(*entry.ptr).key, &(*entry.ptr).value)) };
+                        return Some((&entry_ref.key, &entry_ref.value));
                     }
                 }
 
@@ -356,32 +410,37 @@ where
         }
     }
 
-    // Inserts a key-value pair into the table.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Inserts a key-value pair into the table.
     #[inline]
-    pub unsafe fn insert<'g>(
+    pub fn insert<'g>(
         &self,
         key: K,
         value: V,
         replace: bool,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> InsertResult<'g, V> {
         // Perform the insert.
-        //
-        // Safety: We just allocated the entry above.
-        let result = self.insert_with(key, value, replace, guard);
-        let result = match result {
-            RawInsertResult::Inserted(value) => InsertResult::Inserted(value),
+        let raw_result = self.insert_inner(key, value, replace, guard);
+
+        let result = match raw_result {
+            // Updated an entry.
             RawInsertResult::Replaced(value) => InsertResult::Replaced(value),
+
+            // Inserted a new entry.
+            RawInsertResult::Inserted(value) => {
+                // Increment the table length.
+                self.count
+                    .get(guard.thread_id())
+                    .fetch_add(1, Ordering::Relaxed);
+
+                InsertResult::Inserted(value)
+            }
+
+            // Failed to insert the entry.
             RawInsertResult::Error {
                 current,
                 not_inserted,
             } => {
-                let current = unsafe { &(*current.ptr).value };
-
                 // Safety: We allocated this box above and it was not inserted into the table.
                 let not_inserted = unsafe { Box::from_raw(not_inserted) };
 
@@ -392,24 +451,17 @@ where
             }
         };
 
-        // Increment the length if we inserted a new entry.
-        if matches!(result, InsertResult::Inserted(_)) {
-            self.count
-                .get(guard.thread_id())
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
         result
     }
 
-    // Inserts an entry into the map.
+    /// Inserts an entry into the map.
     #[inline]
-    fn insert_with<'g>(
+    fn insert_inner<'g>(
         &self,
         key: K,
         value: V,
         should_replace: bool,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> RawInsertResult<'g, K, V> {
         // Allocate the entry to be inserted.
         let new_entry = untagged(Box::into_raw(Box::new(Entry {
@@ -418,9 +470,10 @@ where
             link: self.collector.link(),
         })));
 
-        // Safety: Just allocated above.
+        // Safety: We just allocated the entry above.
         let new_ref = unsafe { &(*new_entry.ptr) };
 
+        // Load the root table.
         let mut table = self.root(guard);
 
         // Allocate the table if it has not been initialized yet.
@@ -442,10 +495,16 @@ where
                 }
 
                 // Load the entry metadata first for cheap searches.
+                //
+                // Safety: `probe.i` is always in-bounds for the table length.
                 let meta = unsafe { table.meta(probe.i) }.load(Ordering::Acquire);
 
                 // The entry is empty, try to insert.
                 let entry = if meta == meta::EMPTY {
+                    // Perform the insertion.
+                    //
+                    // Safety: `probe.i` is always in-bounds for the table length. Additionally,
+                    // `new_entry` was allocated above and never shared.
                     match unsafe { self.insert_at(probe.i, h2, new_entry.raw, table, guard) } {
                         // Successfully inserted.
                         InsertStatus::Inserted => return RawInsertResult::Inserted(&new_ref.value),
@@ -466,20 +525,19 @@ where
                 // Found a potential match.
                 else if meta == h2 {
                     // Load the full entry.
-                    let found = unsafe {
-                        guard
-                            .protect(table.entry(probe.i), Ordering::Acquire)
-                            .unpack()
-                    };
+                    let entry = guard
+                        // Safety: `probe.i` is always in-bounds for the table length.
+                        .protect(unsafe { table.entry(probe.i) }, Ordering::Acquire)
+                        .unpack();
 
                     // The entry was deleted, keep probing.
-                    if found.ptr.is_null() {
+                    if entry.ptr.is_null() {
                         probe.next(table.mask);
                         continue 'probe;
                     }
 
                     // If the key matches, we might be able to update the value.
-                    found
+                    entry
                 }
                 // Otherwise, continue probing.
                 else {
@@ -487,9 +545,13 @@ where
                     continue 'probe;
                 };
 
+                // Safety: We performed a protected load of the pointer using a verified guard with
+                // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                // as we hold the guard.
+                let entry_ref = unsafe { &(*entry.ptr) };
+
                 // Check for a full match.
-                let found_key = unsafe { &(*entry.ptr).key };
-                if *found_key != new_ref.key {
+                if entry_ref.key != new_ref.key {
                     probe.next(table.mask);
                     continue 'probe;
                 }
@@ -502,15 +564,21 @@ where
                 // Return an error for calls to `try_insert`.
                 if !should_replace {
                     return RawInsertResult::Error {
-                        current: entry,
+                        current: &entry_ref.value,
                         not_inserted: new_entry.ptr,
                     };
                 }
 
                 // Try to update the value.
+                //
+                // Safety:
+                // - `probe.i` is always in-bounds for the table length
+                // - `entry` is a valid non-null entry that was inserted into the map.
                 match unsafe { self.insert_slow(probe.i, entry, new_entry.raw, table, guard) } {
-                    // Successfully updated.
+                    // Successfully performed the update.
                     UpdateStatus::Replaced(entry) => {
+                        // Safety: `entry` is a valid non-null entry that we found in the map
+                        // before replacing it.
                         let value = unsafe { &(*entry.ptr).value };
                         return RawInsertResult::Replaced(value);
                     }
@@ -534,6 +602,12 @@ where
     }
 
     /// The slow-path for `insert`, updating the value.
+    ///
+    /// The returned pointer is guaranteed to be non-null and valid for reads.
+    ///
+    /// # Safety
+    ///
+    /// The safety requirements of `HashMap::update_at` apply.
     #[cold]
     #[inline(never)]
     unsafe fn insert_slow(
@@ -542,12 +616,17 @@ where
         mut entry: Tagged<Entry<K, V>>,
         new_entry: *mut Entry<K, V>,
         table: Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> UpdateStatus<K, V> {
         loop {
             // Try to update the value.
-            match self.update_at(i, entry, new_entry, table, guard) {
+            //
+            // Safety: Guaranteed by caller.
+            match unsafe { self.update_at(i, entry, new_entry, table, guard) } {
                 // Someone else beat us to the update, retry.
+                //
+                // Note that the pointer we find here is a non-null entry that was inserted
+                // into the map.
                 UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
 
                 status => return status,
@@ -563,7 +642,7 @@ where
         copying: Option<usize>,
         help_copy: &mut bool,
         table: Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Table<Entry<K, V>> {
         // If went over the probe limit or found a copied entry, trigger a resize.
         let mut next_table = self.get_or_alloc_next(None, table);
@@ -600,18 +679,16 @@ where
         next_table
     }
 
-    // Removes a key from the map, returning the entry for the key if the key was previously in the map.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Removes a key from the map, returning the entry for the key if the key was previously in the map.
     #[inline]
-    pub unsafe fn remove<'g, Q>(&self, key: &Q, guard: &'g impl Guard) -> Option<(&'g K, &'g V)>
+    pub fn remove<'g, Q>(&self, key: &Q, guard: &'g impl VerifiedGuard) -> Option<(&'g K, &'g V)>
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
+        // Load the root table.
         let mut table = self.root(guard);
 
+        // The table has not been initialized yet.
         if table.raw.is_null() {
             return None;
         }
@@ -630,6 +707,8 @@ where
                 }
 
                 // Load the entry metadata first for cheap searches.
+                //
+                // Safety: `probe.i` is always in-bounds for the table length.
                 let meta = unsafe { table.meta(probe.i).load(Ordering::Acquire) };
 
                 // The key is not in the table.
@@ -645,8 +724,10 @@ where
                 }
 
                 // Load the full entry.
-                let mut entry =
-                    unsafe { guard.protect(table.entry(probe.i), Ordering::Acquire) }.unpack();
+                let mut entry = guard
+                    // Safety: `probe.i` is always in-bounds for the table length.
+                    .protect(unsafe { table.entry(probe.i) }, Ordering::Acquire)
+                    .unpack();
 
                 // The entry was deleted, keep probing.
                 if entry.ptr.is_null() {
@@ -655,6 +736,10 @@ where
                 }
 
                 // Check for a full match.
+                //
+                // Safety: We performed a protected load of the pointer using a verified guard with
+                // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                // as we hold the guard.
                 if !key.equivalent(unsafe { &(*entry.ptr).key }) {
                     probe.next(table.mask);
                     continue 'probe;
@@ -667,8 +752,13 @@ where
                 }
 
                 loop {
-                    match unsafe { self.update_at(probe.i, entry, Entry::TOMBSTONE, table, guard) }
-                    {
+                    // Safety:
+                    // - `probe.i` is always in-bounds for the table length
+                    // - `entry` is a valid non-null entry that we found in the map.
+                    let status =
+                        unsafe { self.update_at(probe.i, entry, Entry::TOMBSTONE, table, guard) };
+
+                    match status {
                         // Successfully removed the entry.
                         UpdateStatus::Replaced(entry) => {
                             // Mark the entry as a tombstone.
@@ -676,6 +766,8 @@ where
                             // Note that this might end up being overwritten by the metadata hash
                             // if the initial insertion is lagging behind, but we avoid the RMW
                             // and sacrifice reads in the extremely rare case.
+                            //
+                            // Safety: `probe.i` is always in-bounds for the table length.
                             unsafe {
                                 table
                                     .meta(probe.i)
@@ -686,8 +778,10 @@ where
                             let count = self.count.get(guard.thread_id());
                             count.fetch_sub(1, Ordering::Relaxed);
 
-                            let entry = unsafe { &(*entry.ptr) };
-                            return Some((&entry.key, &entry.value));
+                            // Safety: `entry` is a valid non-null entry that we found in the map
+                            // before replacing it.
+                            let entry_ref = unsafe { &(*entry.ptr) };
+                            return Some((&entry_ref.key, &entry_ref.value));
                         }
 
                         // The entry is being copied to the new table, we have to complete the copy
@@ -719,7 +813,7 @@ where
         copying: Option<usize>,
         help_copy: &mut bool,
         table: Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Option<Table<Entry<K, V>>> {
         let next_table = match self.resize {
             ResizeMode::Blocking => match copying {
@@ -761,7 +855,15 @@ where
         Some(next_table)
     }
 
-    // Attempts to insert an entry at the given index.
+    /// Attempts to insert an entry at the given index.
+    ///
+    /// In the case of an error, the returned pointer is guaranteed to be
+    /// protected and valid for reads as long as the guard is held.
+    ///
+    /// # Safety
+    ///
+    /// The index must be in-bounds for the table. Additionally, `new_entry` must be a
+    /// valid owned pointer to insert into the map.
     #[inline]
     unsafe fn insert_at(
         &self,
@@ -769,9 +871,11 @@ where
         meta: u8,
         new_entry: *mut Entry<K, V>,
         table: Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> InsertStatus<K, V> {
+        // Safety: The caller guarantees that `i` is in-bounds.
         let entry = unsafe { table.entry(i) };
+        let meta_entry = unsafe { table.meta(i) };
 
         // Try to claim the empty entry.
         let found = match entry.compare_exchange(
@@ -783,7 +887,7 @@ where
             // Successfully claimed the entry.
             Ok(_) => {
                 // Update the metadata table.
-                unsafe { table.meta(i).store(meta, Ordering::Release) };
+                meta_entry.store(meta, Ordering::Release);
 
                 // Return the value we inserted.
                 return InsertStatus::Inserted;
@@ -801,11 +905,16 @@ where
                 // Re-check the entry status.
                 match EntryStatus::from(found) {
                     EntryStatus::Value(found) | EntryStatus::Copied(found) => {
+                        // Safety: We performed a protected load of the pointer using a verified guard
+                        // with `Acquire` and ensured that it is non-null, meaning it is valid for reads
+                        // as long as we hold the guard.
+                        let key = unsafe { &(*found.ptr).key };
+
                         // An entry was inserted, we have to hash it to get the metadata.
                         //
                         // The logic is the same for copied entries here as we have to
                         // check if the key matches and continue the update in the new table.
-                        let hash = self.hasher.hash_one(&(*found.ptr).key);
+                        let hash = self.hasher.hash_one(key);
                         (meta::h2(hash), EntryStatus::Value(found))
                     }
 
@@ -819,14 +928,23 @@ where
         };
 
         // Ensure the meta table is updated to keep the probe chain alive for readers.
-        if table.meta(i).load(Ordering::Relaxed) == meta::EMPTY {
-            table.meta(i).store(meta, Ordering::Release);
+        if meta_entry.load(Ordering::Relaxed) == meta::EMPTY {
+            meta_entry.store(meta, Ordering::Release);
         }
 
         InsertStatus::Found(status)
     }
 
-    // Attempts to replace the value of an existing entry at the given index.
+    /// Attempts to replace the value of an existing entry at the given index.
+    ///
+    /// In the case of an error, the returned pointer is guaranteed to be
+    /// protected and valid for reads.
+    ///
+    /// # Safety
+    ///
+    /// - The index must be in-bounds for the table.
+    /// - `current` must be a valid non-null entry that was inserted into the map.
+    /// - `new_entry` must be a valid sentinel or owned pointer to insert into the map.
     #[inline]
     unsafe fn update_at(
         &self,
@@ -834,8 +952,9 @@ where
         current: Tagged<Entry<K, V>>,
         new_entry: *mut Entry<K, V>,
         table: Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> UpdateStatus<K, V> {
+        // Safety: The caller guarantees that `i` is in-bounds.
         let entry = unsafe { table.entry(i) };
 
         // Try to perform the update.
@@ -847,8 +966,11 @@ where
         ) {
             // Successfully updated.
             Ok(_) => unsafe {
-                // Safety: The old value is now unreachable from this table.
+                // Safety: The caller guarantees that `current` is a valid non-null entry that was
+                // inserted into the map. Additionally, it is now unreachable from this table due
+                // to the CAS above.
                 self.defer_retire(current, &table, guard);
+
                 return UpdateStatus::Replaced(current);
             },
 
@@ -878,13 +1000,9 @@ where
         UpdateStatus::Found(status)
     }
 
-    // Reserve capacity for `additional` more elements.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Reserve capacity for `additional` more elements.
     #[inline]
-    pub unsafe fn reserve(&self, additional: usize, guard: &impl Guard) {
+    pub fn reserve(&self, additional: usize, guard: &impl VerifiedGuard) {
         let mut table = self.root(guard);
 
         // The table has not yet been allocated, initialize it.
@@ -910,15 +1028,13 @@ where
         }
     }
 
-    // Remove all entries from this table.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Remove all entries from this table.
     #[inline]
-    pub unsafe fn clear(&self, guard: &impl Guard) {
+    pub fn clear(&self, guard: &impl VerifiedGuard) {
+        // Load the root table.
         let mut table = self.root(guard);
 
+        // The table has not been initialized yet.
         if table.raw.is_null() {
             return;
         }
@@ -930,10 +1046,13 @@ where
             // Note that this method is not implemented in terms of `retain(|_, _| true)` to avoid
             // loading entry metadata, as there is no need to provide consistency with `get`.
             let mut copying = false;
+
             'probe: for i in 0..table.len() {
                 // Load the entry to delete.
-                let mut entry =
-                    unsafe { guard.protect(table.entry(i), Ordering::Acquire) }.unpack();
+                let mut entry = guard
+                    // Safety: `i` is in bounds for the table length.
+                    .protect(unsafe { table.entry(i) }, Ordering::Acquire)
+                    .unpack();
 
                 loop {
                     // The entry is empty or already deleted.
@@ -949,6 +1068,8 @@ where
                     }
 
                     // Try to delete the entry.
+                    //
+                    // Safety: `i` is in bounds for the table length.
                     let result = unsafe {
                         table.entry(i).compare_exchange(
                             entry.raw,
@@ -960,19 +1081,22 @@ where
 
                     match result {
                         // Successfully deleted the entry.
-                        Ok(_) => unsafe {
+                        Ok(_) => {
                             // Update the metadata table.
-                            table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+                            //
+                            // Safety: `i` is in bounds for the table length.
+                            unsafe { table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
 
                             // Decrement the table length.
                             let count = self.count.get(guard.thread_id());
                             count.fetch_sub(1, Ordering::Relaxed);
 
-                            // Safety: We just removed the old value from this table.
-                            self.defer_retire(entry, &table, guard);
-
+                            // Safety: The caller guarantees that `current` is a valid non-null entry that was
+                            // inserted into the map. Additionally, it is now unreachable from this table due
+                            // to the CAS above.
+                            unsafe { self.defer_retire(entry, &table, guard) };
                             continue 'probe;
-                        },
+                        }
 
                         // Lost to a concurrent update, retry.
                         Err(found) => entry = found.unpack(),
@@ -992,18 +1116,16 @@ where
         }
     }
 
-    // Retains only the elements specified by the predicate.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Retains only the elements specified by the predicate.
     #[inline]
-    pub unsafe fn retain<F>(&self, mut f: F, guard: &impl Guard)
+    pub fn retain<F>(&self, mut f: F, guard: &impl VerifiedGuard)
     where
         F: FnMut(&K, &V) -> bool,
     {
+        // Load the root table.
         let mut table = self.root(guard);
 
+        // The table has not been initialized yet.
         if table.raw.is_null() {
             return;
         }
@@ -1016,6 +1138,8 @@ where
             'probe: for i in 0..table.len() {
                 // Load the entry metadata first to ensure consistency with calls to `get`
                 // for entries that are retained.
+                //
+                // Safety: `i` is in bounds for the table length.
                 let meta = unsafe { table.meta(i) }.load(Ordering::Acquire);
 
                 // The entry is empty or deleted.
@@ -1024,8 +1148,10 @@ where
                 }
 
                 // Load the entry to delete.
-                let mut entry =
-                    unsafe { guard.protect(table.entry(i), Ordering::Acquire) }.unpack();
+                let mut entry = guard
+                    // Safety: `i` is in bounds for the table length.
+                    .protect(unsafe { table.entry(i) }, Ordering::Acquire)
+                    .unpack();
 
                 loop {
                     // The entry is empty or already deleted.
@@ -1040,6 +1166,9 @@ where
                         continue 'probe;
                     }
 
+                    // Safety: We performed a protected load of the pointer using a verified guard with
+                    // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                    // as we hold the guard.
                     let entry_ref = unsafe { &*entry.raw };
 
                     // Should we retain this entry?
@@ -1048,6 +1177,8 @@ where
                     }
 
                     // Try to delete the entry.
+                    //
+                    // Safety: `i` is in bounds for the table length.
                     let result = unsafe {
                         table.entry(i).compare_exchange(
                             entry.raw,
@@ -1059,19 +1190,22 @@ where
 
                     match result {
                         // Successfully deleted the entry.
-                        Ok(_) => unsafe {
+                        Ok(_) => {
                             // Update the metadata table.
-                            table.meta(i).store(meta::TOMBSTONE, Ordering::Release);
+                            //
+                            // Safety: `i` is in bounds for the table length.
+                            unsafe { table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
 
                             // Decrement the table length.
                             let count = self.count.get(guard.thread_id());
                             count.fetch_sub(1, Ordering::Relaxed);
 
-                            // Safety: We just removed the old value from this table.
-                            self.defer_retire(entry, &table, guard);
-
+                            // Safety: The caller guarantees that `current` is a valid non-null entry that was
+                            // inserted into the map. Additionally, it is now unreachable from this table due
+                            // to the CAS above.
+                            unsafe { self.defer_retire(entry, &table, guard) };
                             continue 'probe;
-                        },
+                        }
 
                         // Lost to a concurrent update, retry.
                         Err(found) => entry = found.unpack(),
@@ -1091,18 +1225,16 @@ where
         }
     }
 
-    // Returns an iterator over the keys and values of this table.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Returns an iterator over the keys and values of this table.
     #[inline]
-    pub unsafe fn iter<'g, G>(&self, guard: &'g G) -> Iter<'g, K, V, G>
+    pub fn iter<'g, G>(&self, guard: &'g G) -> Iter<'g, K, V, G>
     where
-        G: Guard,
+        G: VerifiedGuard,
     {
+        // Load the root table.
         let root = self.root(guard);
 
+        // The table has not been initialized yet, return a dummy iterator.
         if root.raw.is_null() {
             return Iter {
                 i: 0,
@@ -1117,7 +1249,7 @@ where
         Iter { i: 0, guard, table }
     }
 
-    // Returns the h1 and h2 hash for the given key.
+    /// Returns the h1 and h2 hash for the given key.
     #[inline]
     fn hash<Q>(&self, key: &Q) -> (usize, u8)
     where
@@ -1128,15 +1260,24 @@ where
     }
 }
 
-// A wrapper around a CAS function that manages the computed state.
+/// A wrapper around a CAS function that manages the computed state.
 struct ComputeState<F, K, V, T> {
+    /// The CAS function.
     compute: F,
+
+    /// A cached insert transition.
     insert: Option<V>,
+
+    /// A cached update transition.
     update: Option<CachedUpdate<K, V, T>>,
 }
 
+/// A cached update transition.
 struct CachedUpdate<K, V, T> {
+    /// The entry that the CAS function was called with.
     input: *mut Entry<K, V>,
+
+    /// The cached result.
     output: Operation<V, T>,
 }
 
@@ -1146,7 +1287,7 @@ where
     K: 'g,
     V: 'g,
 {
-    // Create a new `ComputeState` for the given function.
+    /// Create a new `ComputeState` for the given function.
     #[inline]
     fn new(compute: F) -> ComputeState<F, K, V, T> {
         ComputeState {
@@ -1156,33 +1297,47 @@ where
         }
     }
 
-    // Performs a state transition.
+    /// Performs a state transition.
+    ///
+    /// # Safety
+    ///
+    /// The entry pointer must be valid for reads if provided.
     #[inline]
-    fn next(&mut self, entry: Option<*mut Entry<K, V>>) -> Operation<V, T> {
-        match entry {
-            Some(entry) => match self.update.take() {
-                Some(CachedUpdate { input, output }) if input == entry => output,
-                _ => {
-                    let entry = unsafe { &*entry };
-                    (self.compute)(Some((&entry.key, &entry.value)))
-                }
-            },
-            None => match self.insert.take() {
+    unsafe fn next(&mut self, entry: Option<*mut Entry<K, V>>) -> Operation<V, T> {
+        let Some(entry) = entry else {
+            // If there is no current entry, perform a transition for the insert.
+            return match self.insert.take() {
+                // Use the cached insert.
                 Some(value) => Operation::Insert(value),
+
+                // Otherwise, compute the value to insert.
                 None => (self.compute)(None),
-            },
+            };
+        };
+
+        // Otherwise, perform an update transition.
+        match self.update.take() {
+            // Used the cached update if the entry has not changed.
+            Some(CachedUpdate { input, output }) if input == entry => output,
+
+            // Otherwise, compute the value to update.
+            _ => {
+                // Safety: The caller guarantees that `entry` is valid for reads.
+                let entry_ref = unsafe { &*entry };
+                (self.compute)(Some((&entry_ref.key, &entry_ref.value)))
+            }
         }
     }
 
-    // Restores the state if an operation fails.
-    //
-    // This allows the result of the compute closure with a given input to be memoized.
-    // This is useful at it avoids calling the closure multiple times if an update needs
-    // to be retried in a new table.
-    //
-    // Additionally, update and insert operations are memoized separately, although this
-    // is not guaranteed in the public API. This means that internal methods can rely on
-    // `compute(None)` being called at most once.
+    /// Restores the state if an operation fails.
+    ///
+    /// This allows the result of the compute closure with a given input to be cached.
+    /// This is useful at it avoids calling the closure multiple times if an update needs
+    /// to be retried in a new table.
+    ///
+    /// Additionally, update and insert operations are cached separately, although this
+    /// is not guaranteed in the public API. This means that internal methods can rely on
+    /// `compute(None)` being called at most once.
     #[inline]
     fn restore(&mut self, input: Option<*mut Entry<K, V>>, output: Operation<V, T>) {
         match input {
@@ -1195,16 +1350,17 @@ where
     }
 }
 
-// A lazy initialized `Entry` allocation.
+/// A lazy initialized `Entry` allocation.
 enum LazyEntry<K, V> {
-    // An uninitialized entry, containing just the owned key.
+    /// An uninitialized entry, containing just the owned key.
     Uninit(K),
-    // An allocated entry.
+
+    /// An allocated entry.
     Init(*mut Entry<K, MaybeUninit<V>>),
 }
 
 impl<K, V> LazyEntry<K, V> {
-    // Returns a reference to the entry's key.
+    /// Returns a reference to the entry's key.
     #[inline]
     fn key(&self) -> &K {
         match self {
@@ -1213,7 +1369,8 @@ impl<K, V> LazyEntry<K, V> {
         }
     }
 
-    // Initializes the entry if it has not already been initialized, returning the pointer.
+    /// Initializes the entry if it has not already been initialized, returning the pointer
+    /// to the entry allocation.
     #[inline]
     fn init(&mut self, collector: &Collector) -> *mut Entry<K, MaybeUninit<V>> {
         match self {
@@ -1240,7 +1397,7 @@ impl<K, V> LazyEntry<K, V> {
     }
 }
 
-// Update operations.
+/// RMW operations.
 impl<K, V, S> HashMap<K, V, S>
 where
     K: Hash + Eq,
@@ -1248,16 +1405,12 @@ where
 {
     /// Tries to insert a key and value computed from a closure into the map,
     /// and returns a reference to the value that was inserted.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
     #[inline]
-    pub unsafe fn try_insert_with<'g, F>(
+    pub fn try_insert_with<'g, F>(
         &self,
         key: K,
         f: F,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> Result<&'g V, &'g V>
     where
         F: FnOnce() -> V,
@@ -1271,59 +1424,42 @@ where
             // Insert the initial value.
             //
             // Note that this case is guaranteed to be executed at most
-            // once as insert values are memoized, so this can never panic.
+            // once as insert values are cached, so this can never panic.
             None => Operation::Insert((f.take().unwrap())()),
         };
 
         match self.compute(key, compute, guard) {
+            // Failed to insert, return the existing value.
             Compute::Aborted(current) => Err(current),
+
+            // Successfully inserted.
             Compute::Inserted(_, value) => Ok(value),
+
             _ => unreachable!(),
         }
     }
 
     /// Returns a reference to the value corresponding to the key, or inserts a default value
     /// computed from a closure.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
     #[inline]
-    pub unsafe fn get_or_insert_with<'g, F>(&self, key: K, f: F, guard: &'g impl Guard) -> &'g V
+    pub fn get_or_insert_with<'g, F>(&self, key: K, f: F, guard: &'g impl VerifiedGuard) -> &'g V
     where
         F: FnOnce() -> V,
         K: 'g,
     {
-        let mut f = Some(f);
-        let compute = |entry| match entry {
-            // Return the existing value.
-            Some((_, current)) => Operation::Abort(current),
-
-            // Insert the initial value.
-            //
-            // Note that this case is guaranteed to be executed at most
-            // once as insert values are memoized, so this can never panic.
-            None => Operation::Insert((f.take().unwrap())()),
-        };
-
-        match self.compute(key, compute, guard) {
-            Compute::Aborted(value) => value,
-            Compute::Inserted(_, value) => value,
-            _ => unreachable!(),
+        match self.try_insert_with(key, f, guard) {
+            Ok(value) => value,
+            Err(value) => value,
         }
     }
 
-    // Updates an existing entry atomically, returning the value that was inserted.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Updates an existing entry atomically, returning the value that was inserted.
     #[inline]
-    pub unsafe fn update<'g, F>(
+    pub fn update<'g, F>(
         &self,
         key: K,
         mut update: F,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> Option<&'g V>
     where
         F: FnMut(&V) -> V,
@@ -1337,26 +1473,26 @@ where
         };
 
         match self.compute(key, compute, guard) {
+            // Return the updated value.
             Compute::Updated {
                 new: (_, value), ..
             } => Some(value),
+
+            // There was nothing to update.
             Compute::Aborted(_) => None,
+
             _ => unreachable!(),
         }
     }
 
     /// Updates an existing entry or inserts a default value computed from a closure.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
     #[inline]
-    pub unsafe fn update_or_insert_with<'g, U, F>(
+    pub fn update_or_insert_with<'g, U, F>(
         &self,
         key: K,
         update: U,
         f: F,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> &'g V
     where
         F: FnOnce() -> V,
@@ -1371,33 +1507,33 @@ where
             // Insert the initial value.
             //
             // Note that this case is guaranteed to be executed at most
-            // once as insert values are memoized, so this can never panic.
+            // once as insert values are cached, so this can never panic.
             None => Operation::Insert((f.take().unwrap())()),
         };
 
         match self.compute(key, compute, guard) {
+            // Return the updated value.
             Compute::Updated {
                 new: (_, value), ..
             } => value,
+
+            // Return the value we inserted.
             Compute::Inserted(_, value) => value,
+
             _ => unreachable!(),
         }
     }
 
-    // Update an entry with a CAS function.
-    //
-    // Note that `compute` closure is guaranteed to be called for a `None` input only once, allowing the insertion
-    // of values that cannot be cloned or reconstructed.
-    //
-    // # Safety
-    //
-    // The guard must be valid to use with this map.
+    /// Update an entry with a CAS function.
+    ///
+    /// Note that `compute` closure is guaranteed to be called for a `None` input only once, allowing the
+    /// insertion of values that cannot be cloned or reconstructed.
     #[inline]
-    pub unsafe fn compute<'g, F, T>(
+    pub fn compute<'g, F, T>(
         &self,
         key: K,
         compute: F,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> Compute<'g, K, V, T>
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
@@ -1421,27 +1557,30 @@ where
         result
     }
 
-    // Update an entry with a CAS function.
-    //
-    // # Safety
-    //
-    // The new entry must be a valid pointer.
+    /// Update an entry with a CAS function.
+    ///
+    /// # Safety
+    ///
+    /// The new entry must be a valid owned pointer to insert into the map.
     #[inline]
     unsafe fn compute_with<'g, F, T>(
         &self,
         new_entry: &mut LazyEntry<K, V>,
         mut state: ComputeState<F, K, V, T>,
-        guard: &'g impl Guard,
+        guard: &'g impl VerifiedGuard,
     ) -> Compute<'g, K, V, T>
     where
         F: FnMut(Option<(&'g K, &'g V)>) -> Operation<V, T>,
     {
+        // Load the root table.
         let mut table = self.root(guard);
 
         // The table has not yet been allocated.
         if table.raw.is_null() {
             // Compute the value to insert.
-            match state.next(None) {
+            //
+            // Safety: Insert transitions are always sound.
+            match unsafe { state.next(None) } {
                 op @ Operation::Insert(_) => state.restore(None, op),
                 Operation::Remove => panic!("Cannot remove `None` entry."),
                 Operation::Abort(value) => return Compute::Aborted(value),
@@ -1465,30 +1604,40 @@ where
                 }
 
                 // Load the entry metadata first for cheap searches.
+                //
+                // Safety: `probe.i` is always in-bounds for the table length.
                 let meta = unsafe { table.meta(probe.i) }.load(Ordering::Acquire);
 
                 // The entry is empty.
                 let mut entry = if meta == meta::EMPTY {
                     // Compute the value to insert.
-                    let value = match state.next(None) {
+                    //
+                    // Safety: Insert transitions are always sound.
+                    let value = match unsafe { state.next(None) } {
                         Operation::Insert(value) => value,
                         Operation::Remove => panic!("Cannot remove `None` entry."),
                         Operation::Abort(value) => return Compute::Aborted(value),
                     };
 
                     let new_entry = new_entry.init(&self.collector);
+
+                    // Safety: `new_entry` was just allocated above and is valid for writes.
                     unsafe { (*new_entry).value = MaybeUninit::new(value) }
 
                     // Attempt to insert.
-                    match self.insert_at(probe.i, h2, new_entry.cast(), table, guard) {
+                    //
+                    // Safety: `probe.i` is always in-bounds for the table length.Additionally,
+                    // `new_entry` was allocated above and never shared.
+                    match unsafe { self.insert_at(probe.i, h2, new_entry.cast(), table, guard) } {
                         // Successfully inserted.
                         InsertStatus::Inserted => {
                             // Increment the table length.
                             let count = self.count.get(guard.thread_id());
                             count.fetch_add(1, Ordering::Relaxed);
 
-                            let new = unsafe { &*new_entry.cast::<Entry<K, V>>() };
-                            return Compute::Inserted(&new.key, &new.value);
+                            // Safety: `new_entry` was initialized above.
+                            let new_ref = unsafe { &*new_entry.cast::<Entry<K, V>>() };
+                            return Compute::Inserted(&new_ref.key, &new_ref.value);
                         }
 
                         // Lost to a concurrent insert.
@@ -1496,7 +1645,10 @@ where
                         // If the key matches, we might be able to update the value.
                         InsertStatus::Found(EntryStatus::Value(found))
                         | InsertStatus::Found(EntryStatus::Copied(found)) => {
-                            // Save the previous value in case the update fails.
+                            // Cache the previous value
+                            //
+                            // Safety: `new_entry` was initialized above and was not inserted
+                            // into the map.
                             let value = unsafe { (*new_entry).value.assume_init_read() };
                             state.restore(None, Operation::Insert(value));
 
@@ -1505,7 +1657,10 @@ where
 
                         // The entry was removed or invalidated.
                         InsertStatus::Found(EntryStatus::Null) => {
-                            // Save the previous value.
+                            // Cache the previous value.
+                            //
+                            // Safety: `new_entry` was initialized above and was not inserted
+                            // into the map.
                             let value = unsafe { (*new_entry).value.assume_init_read() };
                             state.restore(None, Operation::Insert(value));
 
@@ -1519,7 +1674,8 @@ where
                 else if meta == h2 {
                     // Load the full entry.
                     let found = guard
-                        .protect(table.entry(probe.i), Ordering::Acquire)
+                        // Safety: `probe.i` is always in-bounds for the table length.
+                        .protect(unsafe { table.entry(probe.i) }, Ordering::Acquire)
                         .unpack();
 
                     // The entry was deleted, keep probing.
@@ -1538,6 +1694,10 @@ where
                 };
 
                 // Check for a full match.
+                //
+                // Safety: We performed a protected load of the pointer using a verified guard with
+                // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                // as we hold the guard.
                 if unsafe { (*entry.ptr).key != *new_entry.key() } {
                     probe.next(table.mask);
                     continue 'probe;
@@ -1550,31 +1710,51 @@ where
 
                 loop {
                     // Compute the value to insert.
-                    let failure = match state.next(Some(entry.ptr)) {
+                    //
+                    // Safety: `entry` is valid for reads.
+                    let failure = match unsafe { state.next(Some(entry.ptr)) } {
                         // The operation was aborted.
                         Operation::Abort(value) => return Compute::Aborted(value),
 
                         // Update the value.
                         Operation::Insert(value) => {
                             let new_entry = new_entry.init(&self.collector);
+
+                            // Safety: `new_entry` was just allocated above and is valid for writes.
                             unsafe { (*new_entry).value = MaybeUninit::new(value) }
 
                             // Try to perform the update.
-                            match self.update_at(probe.i, entry, new_entry.cast(), table, guard) {
+                            //
+                            // Safety:
+                            // - `probe.i` is always in-bounds for the table length
+                            // - `entry` is a valid non-null entry that we found in the map.
+                            // - `new_entry` was initialized above and never shared.
+                            let status = unsafe {
+                                self.update_at(probe.i, entry, new_entry.cast(), table, guard)
+                            };
+
+                            match status {
                                 // Successfully updated.
                                 UpdateStatus::Replaced(entry) => {
-                                    let old = unsafe { &(*entry.ptr) };
-                                    let new = unsafe { &*new_entry.cast::<Entry<K, V>>() };
+                                    // Safety: `entry` is a valid non-null entry that we found in the map
+                                    // before replacing it.
+                                    let entry_ref = unsafe { &(*entry.ptr) };
+
+                                    // Safety: `new_entry` was initialized above.
+                                    let new_ref = unsafe { &*new_entry.cast::<Entry<K, V>>() };
 
                                     return Compute::Updated {
-                                        old: (&old.key, &old.value),
-                                        new: (&new.key, &new.value),
+                                        old: (&entry_ref.key, &entry_ref.value),
+                                        new: (&new_ref.key, &new_ref.value),
                                     };
                                 }
 
                                 // The update failed.
                                 failure => {
                                     // Save the previous value.
+                                    //
+                                    // Safety: `new_entry` was initialized above and was not inserted
+                                    // into the map.
                                     let value = unsafe { (*new_entry).value.assume_init_read() };
                                     state.restore(Some(entry.ptr), Operation::Insert(value));
 
@@ -1586,11 +1766,15 @@ where
                         // Remove the key from the map.
                         Operation::Remove => {
                             // Try to perform the removal.
-                            let result = unsafe {
+                            //
+                            // Safety:
+                            // - `probe.i` is always in-bounds for the table length
+                            // - `entry` is a valid non-null entry that we found in the map.
+                            let status = unsafe {
                                 self.update_at(probe.i, entry, Entry::TOMBSTONE, table, guard)
                             };
 
-                            match result {
+                            match status {
                                 // Successfully removed the entry.
                                 UpdateStatus::Replaced(entry) => {
                                     // Mark the entry as a tombstone.
@@ -1608,8 +1792,10 @@ where
                                     let count = self.count.get(guard.thread_id());
                                     count.fetch_sub(1, Ordering::Relaxed);
 
-                                    let entry = unsafe { &(*entry.ptr) };
-                                    return Compute::Removed(&entry.key, &entry.value);
+                                    // Safety: `entry` is a valid non-null entry that we found in the map
+                                    // before replacing it.
+                                    let entry_ref = unsafe { &(*entry.ptr) };
+                                    return Compute::Removed(&entry_ref.key, &entry_ref.value);
                                 }
 
                                 // The remove failed.
@@ -1632,7 +1818,9 @@ where
                         // We know that at some point during our execution the key was not in the map.
                         UpdateStatus::Found(EntryStatus::Null) => {
                             // Compute the next operation.
-                            match state.next(None) {
+                            //
+                            // Safety: Insert transitions are always sound.
+                            match unsafe { state.next(None) } {
                                 Operation::Insert(value) => {
                                     // Save the computed value.
                                     state.restore(None, Operation::Insert(value));
@@ -1661,7 +1849,9 @@ where
             }
 
             // Otherwise, the key is not in the map.
-            match state.next(None) {
+            //
+            // Safety: Insert transitions are always sound.
+            match unsafe { state.next(None) } {
                 // Need to insert into the new table.
                 op @ Operation::Insert(_) => {
                     table = self.prepare_retry_insert(None, &mut help_copy, table, guard);
@@ -1675,13 +1865,13 @@ where
     }
 }
 
-// Resize operations.
+/// Resize operations.
 impl<K, V, S> HashMap<K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
 {
-    // Allocate the initial table.
+    /// Allocate the initial table.
     #[cold]
     #[inline(never)]
     fn init(&self, capacity: Option<usize>) -> Table<Entry<K, V>> {
@@ -1703,16 +1893,16 @@ where
 
             // Someone beat us, deallocate our table and use the table that was written.
             Err(found) => {
-                unsafe {
-                    Table::dealloc(new);
-                }
+                // Safety: We allocated the table above and never shared it.
+                unsafe { Table::dealloc(new) }
 
+                // Safety: The table was just initialized.
                 unsafe { Table::from_raw(found) }
             }
         }
     }
 
-    // Returns the next table, allocating it has not already been created.
+    /// Returns the next table, allocating it has not already been created.
     #[cold]
     #[inline(never)]
     fn get_or_alloc_next(
@@ -1727,13 +1917,12 @@ where
             7
         };
 
-        let state = table.state();
-        let next = state.next.load(Ordering::Acquire);
-
         // The next table is already allocated.
-        if !next.is_null() {
-            return unsafe { Table::from_raw(next) };
+        if let Some(next) = table.next_table() {
+            return next;
         }
+
+        let state = table.state();
 
         // Otherwise, try to acquire the allocation lock.
         //
@@ -1750,10 +1939,9 @@ where
                         hint::spin_loop();
                     }
 
-                    let next = state.next.load(Ordering::Acquire);
-                    if !next.is_null() {
-                        // The table was initialized.
-                        return unsafe { Table::from_raw(next) };
+                    // The table was initialized.
+                    if let Some(next) = table.next_table() {
+                        return next;
                     }
 
                     spun += 1;
@@ -1764,20 +1952,21 @@ where
             }
         };
 
-        let next = state.next.load(Ordering::Acquire);
-        if !next.is_null() {
-            // The table was allocated while we were waiting for the lock.
-            return unsafe { Table::from_raw(next) };
+        // The table was allocated while we were waiting for the lock.
+        if let Some(next) = table.next_table() {
+            return next;
         }
 
         let next_capacity = match cfg!(papaya_stress) {
             // Never grow the table to stress the incremental resizing algorithm.
             true => table.len(),
+
             // Double the table capacity if we are at least 50% full.
             //
             // Loading the length here is quite expensive, we may want to consider
             // a probabilistic counter to detect high-deletion workloads.
             false if self.len() >= (table.len() >> 1) => table.len() << 1,
+
             // Otherwise keep the capacity the same.
             //
             // This can occur due to poor hash distribution or frequent cycling of
@@ -1800,17 +1989,17 @@ where
         next
     }
 
-    // Help along with an existing resize operation, returning the new root table.
-    //
-    // If `copy_all` is `false` in incremental resize mode, this returns the current reference's next table,
-    // not necessarily the new root.
+    /// Help along with an existing resize operation, returning the new root table.
+    ///
+    /// If `copy_all` is `false` in incremental resize mode, this returns the current reference's next
+    /// table, not necessarily the new root.
     #[cold]
     #[inline(never)]
     fn help_copy(
         &self,
         copy_all: bool,
         table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Table<Entry<K, V>> {
         match self.resize {
             ResizeMode::Blocking => self.help_copy_blocking(table, guard),
@@ -1828,18 +2017,16 @@ where
         }
     }
 
-    // Help along the resize operation until it completes and the next table is promoted.
-    //
-    // Should only be called on the root table.
+    /// Help along the resize operation until it completes and the next table is promoted.
+    ///
+    /// Should only be called on the root table.
     fn help_copy_blocking(
         &self,
         table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Table<Entry<K, V>> {
         // Load the next table.
-        let next = table.state().next.load(Ordering::Acquire);
-        debug_assert!(!next.is_null());
-        let mut next = unsafe { Table::from_raw(next) };
+        let mut next = table.next_table().unwrap();
 
         'copy: loop {
             // Make sure we are copying to the correct table.
@@ -1873,7 +2060,9 @@ where
                     }
 
                     // Copy the entry.
-                    if !self.copy_at_blocking(i, table, &next, guard) {
+                    //
+                    // Safety: We verified that `i` is in-bounds above.
+                    if unsafe { !self.copy_at_blocking(i, table, &next, guard) } {
                         // This table doesn't have space for the next entry.
                         //
                         // Abort the current resize.
@@ -1945,23 +2134,26 @@ where
         }
     }
 
-    // Copy the entry at the given index to the new table.
-    //
-    // Returns `true` if the entry was copied into the table or `false` if the table was full.
-    fn copy_at_blocking(
+    /// Copy the entry at the given index to the new table.
+    ///
+    /// Returns `true` if the entry was copied into the table or `false` if the table was full.
+    ///
+    /// # Safety
+    ///
+    /// The index must be in-bounds for the table.
+    unsafe fn copy_at_blocking(
         &self,
         i: usize,
         table: &Table<Entry<K, V>>,
         next_table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> bool {
         // Mark the entry as copying.
-        let entry = unsafe {
-            table
-                .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::AcqRel)
-                .unpack()
-        };
+        //
+        // Safety: The caller guarantees that the index is in-bounds.
+        let entry = unsafe { table.entry(i) }
+            .fetch_or(Entry::COPYING, Ordering::AcqRel)
+            .unpack();
 
         // The entry is a tombstone.
         if entry.raw == Entry::TOMBSTONE {
@@ -1971,38 +2163,41 @@ where
         // There is nothing to copy, we're done.
         if entry.ptr.is_null() {
             // Mark as a tombstone so readers avoid having to load the entry.
-            unsafe { table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
+            //
+            // Safety: The caller guarantees that the index is in-bounds.
+            unsafe { table.meta(i) }.store(meta::TOMBSTONE, Ordering::Release);
             return true;
         }
 
         // Copy the value to the new table.
+        //
+        // Safety: We marked the entry as `COPYING`, ensuring that any updates
+        // or removals wait until we complete the copy, and allowing us to get
+        // away without a protected load. Additionally, we verified that the
+        // entry is non-null, meaning that it is valid for reads.
         unsafe {
             self.insert_copy(entry.ptr.unpack(), false, next_table, guard)
                 .is_some()
         }
     }
 
-    // Help along an in-progress resize incrementally by copying a chunk of entries.
-    //
-    // Returns the table that was copied to.
+    /// Help along an in-progress resize incrementally by copying a chunk of entries.
+    ///
+    /// Returns the table that was copied to.
     fn help_copy_incremental(
         &self,
         chunk: usize,
         block: bool,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Table<Entry<K, V>> {
         // Always help the highest priority root resize.
         let table = self.root(guard);
 
         // Load the next table.
-        let next = table.state().next.load(Ordering::Acquire);
-
-        // The copy we tried to help was already promoted.
-        if next.is_null() {
+        let Some(next) = table.next_table() else {
+            // The copy we tried to help was already promoted.
             return table;
-        }
-
-        let next = unsafe { Table::from_raw(next) };
+        };
 
         loop {
             // The copy already completed.
@@ -2029,7 +2224,9 @@ where
                     }
 
                     // Copy the entry.
-                    self.copy_at_incremental(i, &table, &next, guard);
+                    //
+                    // Safety: We verified that `i` is in-bounds above.
+                    unsafe { self.copy_at_incremental(i, &table, &next, guard) };
                     copied += 1;
                 }
 
@@ -2080,68 +2277,81 @@ where
         }
     }
 
-    // Copy the entry at the given index to the new table.
-    fn copy_at_incremental(
+    /// Copy the entry at the given index to the new table.
+    ///
+    /// # Safety
+    ///
+    /// The index must be in-bounds for the table.
+    unsafe fn copy_at_incremental(
         &self,
         i: usize,
         table: &Table<Entry<K, V>>,
         next_table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) {
+        // Safety: The caller guarantees that the index is in-bounds.
+        let entry = unsafe { table.entry(i) };
+
         // Mark the entry as copying.
-        let entry = unsafe {
-            table
-                .entry(i)
-                .fetch_or(Entry::COPYING, Ordering::AcqRel)
-                .unpack()
-        };
+        let found = entry.fetch_or(Entry::COPYING, Ordering::AcqRel).unpack();
 
         // The entry is a tombstone.
-        if entry.raw == Entry::TOMBSTONE {
+        if found.raw == Entry::TOMBSTONE {
             return;
         }
 
         // There is nothing to copy, we're done.
-        if entry.ptr.is_null() {
+        if found.ptr.is_null() {
             // Mark as a tombstone so readers avoid having to load the entry.
-            unsafe { table.meta(i).store(meta::TOMBSTONE, Ordering::Release) };
+            //
+            // Safety: The caller guarantees that the index is in-bounds.
+            unsafe { table.meta(i) }.store(meta::TOMBSTONE, Ordering::Release);
             return;
         }
 
         // Mark the entry as borrowed so writers in the new table know it was copied.
-        let new_entry = entry.map_tag(|addr| addr | Entry::BORROWED);
+        let new_entry = found.map_tag(|addr| addr | Entry::BORROWED);
 
         // Copy the value to the new table.
+        //
+        // Safety: We marked the entry as `COPYING`, ensuring that any updates
+        // or removals wait until we complete the copy, and allowing us to get
+        // away without a protected load. Additionally, we verified that the
+        // entry is non-null, meaning that it is valid for reads.
         unsafe {
             self.insert_copy(new_entry, true, next_table, guard)
                 .unwrap();
         }
 
         // Mark the entry as copied.
-        let copied = entry
+        let copied = found
             .raw
             .map_addr(|addr| addr | Entry::COPYING | Entry::COPIED);
 
         // Note that we already wrote the COPYING bit, so no one is writing to the old
         // entry except us.
-        unsafe { table.entry(i).store(copied, Ordering::SeqCst) };
+        entry.store(copied, Ordering::SeqCst);
 
         // Notify any writers that the copy has completed.
-        unsafe { table.state().parker.unpark(table.entry(i)) };
+        table.state().parker.unpark(entry);
     }
 
     // Copy an entry into the table, returning the index it was inserted into.
     //
     // This is an optimized version of `insert_entry` where the caller is the only writer
     // inserting the given key into the new table, as it has already been marked as copying.
+    //
+    // # Safety
+    //
+    // The new entry must be valid for reads.
     unsafe fn insert_copy(
         &self,
         new_entry: Tagged<Entry<K, V>>,
         resize: bool,
         table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> Option<(Table<Entry<K, V>>, usize)> {
-        // Safety: The new entry is guaranteed to be valid by the caller.
+        // Safety: The new entry is guaranteed to be valid for reads.
         let key = unsafe { &(*new_entry.ptr).key };
 
         let mut table = *table;
@@ -2153,11 +2363,15 @@ where
 
             // Probe until we reach the limit.
             while probe.len <= table.limit {
+                // Safety: `probe.i` is always in-bounds for the table length.
+                let meta_entry = unsafe { table.meta(probe.i) };
+
                 // Load the entry metadata first for cheap searches.
-                let meta = unsafe { table.meta(probe.i) }.load(Ordering::Acquire);
+                let meta = meta_entry.load(Ordering::Acquire);
 
                 // The entry is empty, try to insert.
                 if meta == meta::EMPTY {
+                    // Safety: `probe.i` is always in-bounds for the table length.
                     let entry = unsafe { table.entry(probe.i) };
 
                     // Try to claim the entry.
@@ -2170,7 +2384,7 @@ where
                         // Successfully inserted.
                         Ok(_) => {
                             // Update the metadata table.
-                            unsafe { table.meta(probe.i).store(h2, Ordering::Release) };
+                            meta_entry.store(h2, Ordering::Release);
                             return Some((table, probe.i));
                         }
                         Err(found) => {
@@ -2185,14 +2399,19 @@ where
                                 if found.ptr.is_null() {
                                     meta::TOMBSTONE
                                 } else {
+                                    // Safety: We performed a protected load of the pointer using a verified guard with
+                                    // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                                    // as we hold the guard.
+                                    let found_ref = unsafe { &(*found.ptr) };
+
                                     // Ensure the meta table is updated to avoid breaking the probe chain.
-                                    let hash = self.hasher.hash_one(&(*found.ptr).key);
+                                    let hash = self.hasher.hash_one(&found_ref.key);
                                     meta::h2(hash)
                                 }
                             };
 
-                            if table.meta(probe.i).load(Ordering::Relaxed) == meta::EMPTY {
-                                table.meta(probe.i).store(meta, Ordering::Release);
+                            if meta_entry.load(Ordering::Relaxed) == meta::EMPTY {
+                                meta_entry.store(meta, Ordering::Release);
                             }
                         }
                     }
@@ -2219,7 +2438,7 @@ where
         table: &Table<Entry<K, V>>,
         next: &Table<Entry<K, V>>,
         copied: usize,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) -> bool {
         let state = next.state();
 
@@ -2248,13 +2467,17 @@ where
                     // Successfully promoted the table.
                     state.status.store(State::PROMOTED, Ordering::SeqCst);
 
+                    // Retire the old table.
+                    //
+                    // Safety: `table.raw` is a valid pointer to the table we just
+                    // copied from. Additionally, the CAS above made the previous table
+                    // unreachable from the root pointer, allowing it to be safely retired.
                     unsafe {
-                        // Retire the old table.
-                        //
-                        // Note that we do not drop entries because they have been copied to the
-                        // new root.
                         guard.defer_retire(table.raw, |link| {
                             let raw: *mut RawTable<Entry<K, V>> = link.cast();
+
+                            // Note that we do not drop entries because they have been copied to
+                            // the new root.
                             drop_table(Table::from_raw(raw));
                         });
                     }
@@ -2275,7 +2498,11 @@ where
     // This is necessary for operations like `iter` or `clear`, where entries in multiple tables
     // can cause lead to incomplete results.
     #[inline]
-    fn linearize(&self, mut table: Table<Entry<K, V>>, guard: &impl Guard) -> Table<Entry<K, V>> {
+    fn linearize(
+        &self,
+        mut table: Table<Entry<K, V>>,
+        guard: &impl VerifiedGuard,
+    ) -> Table<Entry<K, V>> {
         if self.is_incremental() {
             // If we're in incremental resize mode, we need to complete any in-progress resizes to
             // ensure we don't miss any entries in the next table. We can't iterate over both because
@@ -2324,13 +2551,14 @@ where
     ///
     /// # Safety
     ///
-    /// The entry must be unreachable from the current table.
+    /// The entry must be a valid pointer that is unreachable from the current table. Additionally,
+    /// it is *undefined behavior* to call this method multiple times for the same entry.
     #[inline]
     unsafe fn defer_retire(
         &self,
         entry: Tagged<Entry<K, V>>,
         table: &Table<Entry<K, V>>,
-        guard: &impl Guard,
+        guard: &impl VerifiedGuard,
     ) {
         match self.resize {
             // Safety: In blocking resize mode, we only ever write to the root table, so the entry
@@ -2342,19 +2570,19 @@ where
             ResizeMode::Incremental(_) => {
                 if entry.tag() & Entry::BORROWED == 0 {
                     // Safety: If the entry is not borrowed, meaning it is not in any previous tables,
-                    // it is inaccessible even if we are not the root. Thus we can safely retire.
+                    // it is inaccessible even if the current table is not root. Thus we can safely retire.
                     unsafe { guard.defer_retire(entry.ptr, Entry::reclaim::<K, V>) };
                     return;
                 }
 
-                let root = self.table.load(Ordering::Relaxed);
+                let root = self.root(guard);
 
                 // Check if our table, or any subsequent table, is the root.
                 let mut next = Some(*table);
                 while let Some(table) = next {
-                    if table.raw == root {
+                    if table.raw == root.raw {
                         // Safety: The root table is our table or a table that succeeds ours.
-                        // Thus any previous tables are unreachable and we can safely retire.
+                        // Thus any previous tables are unreachable from the root, so we can safely retire.
                         unsafe { guard.defer_retire(entry.ptr, Entry::reclaim::<K, V>) };
                         return;
                     }
@@ -2365,15 +2593,16 @@ where
                 // Otherwise, we have to wait for the table we are copying from to be reclaimed.
                 //
                 // Find the table we are copying from, searching from the root.
-                fence(Ordering::Acquire);
-                let mut prev = unsafe { Table::from_raw(root) };
+                let mut prev = root;
 
                 loop {
                     let next = prev.next_table().unwrap();
 
                     // Defer the entry to be retired by the table we are copying from.
                     if next.raw == table.raw {
-                        prev.state().deferred.defer(entry.ptr);
+                        // Safety: The caller guarantees that this method will not be
+                        // called multiple times with the same entry.
+                        unsafe { prev.state().deferred.defer(entry.ptr) };
                         return;
                     }
 
@@ -2393,7 +2622,7 @@ pub struct Iter<'g, K, V, G> {
 
 impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
 where
-    G: Guard,
+    G: VerifiedGuard,
 {
     type Item = (&'g K, &'g V);
 
@@ -2411,6 +2640,8 @@ where
             }
 
             // Load the entry metadata first to ensure consistency with calls to `get`.
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
             let meta = unsafe { self.table.meta(self.i) }.load(Ordering::Acquire);
 
             // The entry is empty or deleted.
@@ -2420,11 +2651,11 @@ where
             }
 
             // Load the entry.
-            let entry = unsafe {
-                self.guard
-                    .protect(self.table.entry(self.i), Ordering::Acquire)
-                    .unpack()
-            };
+            let entry = self
+                .guard
+                // Safety: We verified that `self.i` is in-bounds above.
+                .protect(unsafe { self.table.entry(self.i) }, Ordering::Acquire)
+                .unpack();
 
             // The entry was deleted.
             if entry.ptr.is_null() {
@@ -2432,18 +2663,24 @@ where
                 continue;
             }
 
-            // Read the key and value.
-            let entry = unsafe { (&(*entry.ptr).key, &(*entry.ptr).value) };
+            // Safety: We performed a protected load of the pointer using a verified guard with
+            // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+            // as we hold the guard.
+            let entry_ref = unsafe { &(*entry.ptr) };
 
             self.i += 1;
-            return Some(entry);
+            return Some((&entry_ref.key, &entry_ref.value));
         }
     }
 }
 
 // Safety: An iterator holds a shared reference to the HashMap
 // and Guard, and outputs shared references to keys and values.
-// Thus everything must be Sync for the iterator to be Send/Sync.
+// Thus everything must be `Sync` for the iterator to be `Send`
+// or `Sync`.
+//
+// It is not possible to obtain an owned key, value, or guard
+// from an iterator, so `Send` is not a required bound.
 unsafe impl<K, V, G> Send for Iter<'_, K, V, G>
 where
     K: Sync,
@@ -2479,22 +2716,41 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
         //
         // Dropping a table depends on accessing the collector for deferred retirement,
         // using the shared collector pointer that is invalidated by drop.
+        //
+        // Safety: We have a unique reference to the collector.
         unsafe { self.collector.reclaim_all() };
 
         // Drop all nested tables and entries.
         while !raw.is_null() {
+            // Safety: The root and next tables are always valid pointers to a
+            // table allocation, or null.
             let mut table = unsafe { Table::from_raw(raw) };
+
+            // Read the next table pointer before dropping the current one.
             let next = *table.state_mut().next.get_mut();
+
+            // Safety: We have unique access to the table and do
+            // not access the entries after this call.
             unsafe { drop_entries(table) };
+
+            // Safety: We have unique access to the table and do
+            // not access it after this call.
             unsafe { drop_table(table) };
+
+            // Continue for all nested tables.
             raw = next;
         }
     }
 }
 
 // Drop all entries in this table.
+//
+// # Safety
+//
+// The table entries must not be accessed after this call.
 unsafe fn drop_entries<K, V>(table: Table<Entry<K, V>>) {
     for i in 0..table.len() {
+        // Safety: `i` is in-bounds and we have unique access to the table.
         let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
         // The entry was copied, or there is nothing to deallocate.
@@ -2503,24 +2759,35 @@ unsafe fn drop_entries<K, V>(table: Table<Entry<K, V>>) {
         }
 
         // Drop the entry.
+        //
+        // Safety: We verified that the table is non-null and will
+        // not be accessed after this call. Additionally, we ensured
+        // that the entry is not copied to avoid double freeing entries
+        // that may exist in multiple tables.
         unsafe { Entry::reclaim::<K, V>(entry.ptr.cast()) }
     }
 }
 
 // Drop the table allocation.
+//
+// # Safety
+//
+// The table must not be accessed after this call.
 unsafe fn drop_table<K, V>(mut table: Table<Entry<K, V>>) {
-    // Safety: `drop_table` is being called from `reclaim_all` in `Drop` or
-    // a table is being reclaimed by our thread. In both cases, the collector
+    // Safety: `drop_table` is either being called from `reclaim_all` in `Drop`
+    // or the table is being reclaimed by our thread. In both cases, the collector
     // is still alive and safe to access through the state pointer.
     let collector = unsafe { &*table.state().collector };
 
     // Drop any entries that were deferred during an incremental resize.
     //
-    // Safety: A deferred entry was retired after it was made unreachable
-    // from the next table during a resize. Because our table was still accessible
-    // for this entry to be deferred, our table must have been retired *after* the
-    // entry was made accessible in the next table. Now that our table is being reclaimed,
-    // the entry has thus been totally removed from the map, and can be safely retired.
+    // Safety: Entries are deferred after they are made unreachable from the
+    // next table during a resize from this table. This table must have been accessible
+    // from the root for any entry to have been deferred. Thus it is being retired now,
+    // *after* the entry was made inaccessible from the next table. Additionally, for
+    // this table to have been retired, it also must no longer be accessible from the root,
+    // meaning that the entry has been totally removed from the map, and can be safely
+    // retired.
     unsafe {
         table
             .state_mut()
@@ -2529,6 +2796,8 @@ unsafe fn drop_table<K, V>(mut table: Table<Entry<K, V>>) {
     }
 
     // Deallocate the table.
+    //
+    // Safety: The caller guarantees that the table will not be accessed after this call.
     unsafe { Table::dealloc(table) };
 }
 
