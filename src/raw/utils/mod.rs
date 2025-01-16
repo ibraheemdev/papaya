@@ -47,8 +47,9 @@ unsafe impl<T> StrictProvenance<T> for *mut T {
 
 // An unpacked tagged pointer.
 pub struct Tagged<T> {
-    // The raw, tagged pointer.
+    // The raw tagged pointer.
     pub raw: *mut T,
+
     // The untagged pointer.
     pub ptr: *mut T,
 }
@@ -102,6 +103,9 @@ impl<T> AtomicPtrFetchOps<T> for AtomicPtr<T> {
         {
             use std::sync::atomic::AtomicUsize;
 
+            // Safety: `AtomicPtr` and `AtomicUsize` are identical in terms
+            // of memory layout. This operation is technically invalid in that
+            // it loses provenance, but there is no stable alternative.
             unsafe { &*(self as *const AtomicPtr<T> as *const AtomicUsize) }
                 .fetch_or(value, ordering) as *mut T
         }
@@ -218,6 +222,7 @@ impl<T> Deref for Shared<T> {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
+        // Safety: `self.0` was allocated with `Box` and is never shared.
         unsafe { &*self.0.as_ptr() }
     }
 }
@@ -225,6 +230,81 @@ impl<T> Deref for Shared<T> {
 impl<T> Drop for Shared<T> {
     #[inline]
     fn drop(&mut self) {
+        // Safety: `self.0` was allocated with `Box` and is never shared,
+        // and we have unique access to `self`.
         let _ = unsafe { Box::from_raw(self.0.as_ptr()) };
+    }
+}
+
+/// A `seize::Guard` that has been verified to belong to a given map.
+pub trait VerifiedGuard: seize::Guard {}
+
+#[repr(transparent)]
+pub struct MapGuard<G>(G);
+
+impl<G> MapGuard<G> {
+    /// Create a new `MapGuard`.
+    ///
+    /// # Safety
+    ///
+    /// The guard must be valid to use with the given map.
+    pub unsafe fn new(guard: G) -> MapGuard<G> {
+        MapGuard(guard)
+    }
+
+    /// Create a new `MapGuard` from a reference.
+    ///
+    /// # Safety
+    ///
+    /// The guard must be valid to use with the given map.
+    pub unsafe fn from_ref(guard: &G) -> &MapGuard<G> {
+        // Safety: `VerifiedGuard` is `repr(transparent)` over `G`.
+        unsafe { &*(guard as *const G as *const MapGuard<G>) }
+    }
+}
+
+impl<G> VerifiedGuard for MapGuard<G> where G: seize::Guard {}
+
+impl<G> seize::Guard for MapGuard<G>
+where
+    G: seize::Guard,
+{
+    #[inline]
+    fn refresh(&mut self) {
+        self.0.refresh();
+    }
+
+    #[inline]
+    fn flush(&self) {
+        self.0.flush();
+    }
+
+    #[inline]
+    fn protect<T: seize::AsLink>(&self, ptr: &AtomicPtr<T>, ordering: Ordering) -> *mut T {
+        self.0.protect(ptr, ordering)
+    }
+
+    #[inline]
+    unsafe fn defer_retire<T: seize::AsLink>(
+        &self,
+        ptr: *mut T,
+        reclaim: unsafe fn(*mut seize::Link),
+    ) {
+        unsafe { self.0.defer_retire(ptr, reclaim) };
+    }
+
+    #[inline]
+    fn thread_id(&self) -> usize {
+        self.0.thread_id()
+    }
+
+    #[inline]
+    fn belongs_to(&self, collector: &seize::Collector) -> bool {
+        self.0.belongs_to(collector)
+    }
+
+    #[inline]
+    fn link(&self, collector: &seize::Collector) -> seize::Link {
+        self.0.link(collector)
     }
 }
