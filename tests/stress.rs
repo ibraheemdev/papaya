@@ -512,6 +512,86 @@ fn conditional_remove_update_or_insert_stress() {
     });
 }
 
+// Similar to `conditional_remove_update_or_insert_stress` except uses `HashMap::remove_if`.
+#[test]
+#[ignore]
+fn remove_if_update_or_insert_stress() {
+    const ENTRIES: usize = if cfg!(miri) { 64 } else { 256 };
+    const OPERATIONS: usize = match () {
+        _ if cfg!(miri) => 1,
+        _ if cfg!(papaya_stress) || cfg!(papaya_asan) => 1 << 5,
+        _ => 1 << 9,
+    };
+    const ITERATIONS: usize = if cfg!(miri) { 1 } else { 32 };
+
+    let threads = threads();
+
+    let entries = || {
+        let mut entries = (0..(OPERATIONS))
+            .flat_map(|_| (0..ENTRIES))
+            .collect::<Vec<_>>();
+        let mut rng = rand::thread_rng();
+        entries.shuffle(&mut rng);
+        entries
+    };
+
+    with_map(|map| {
+        for _ in (0..ITERATIONS).inspect(|e| debug!("{e}/{ITERATIONS}")) {
+            let map = map();
+
+            let group = threads.checked_div(2).unwrap();
+            let barrier = Barrier::new(threads + 1);
+            thread::scope(|s| {
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+                        for i in entries {
+                            map.update_or_insert(i, |v| v + 1, 1, &guard);
+                        }
+                    });
+                }
+
+                for _ in 0..group {
+                    s.spawn(|| {
+                        let entries = entries();
+                        barrier.wait();
+                        let guard = map.guard();
+
+                        for i in entries {
+                            if let Ok(Some((_k, &value))) =
+                                map.remove_if(&i, |_k, v| v % 2 == 0, &guard)
+                            {
+                                map.update_or_insert(i, |v| v + value, value, &guard);
+                            }
+                        }
+                    });
+                }
+
+                s.spawn(|| {
+                    barrier.wait();
+                    let guard = map.guard();
+                    for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                        map.insert(i, usize::MAX, &guard);
+                    }
+                });
+            });
+
+            let guard = map.guard();
+            assert_eq!(map.len(), ENTRIES * OPERATIONS);
+
+            for i in 0..ENTRIES {
+                assert_eq!(*map.get(&i, &guard).unwrap(), group * OPERATIONS);
+            }
+
+            for i in ENTRIES..(ENTRIES * OPERATIONS) {
+                assert_eq!(*map.get(&i, &guard).unwrap(), usize::MAX);
+            }
+        }
+    });
+}
+
 // Call `remove` and `insert` in parallel for a shared set of keys.
 #[test]
 #[ignore]

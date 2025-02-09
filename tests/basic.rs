@@ -71,6 +71,26 @@ fn remove_empty() {
 }
 
 #[test]
+fn remove_if() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+
+        assert_eq!(map.pin().remove_if(&1, |_k, _v| true), Ok(None));
+
+        map.pin().insert(1, 0);
+
+        assert_eq!(map.pin().remove_if(&0, |_k, _v| true), Ok(None));
+        assert_eq!(map.pin().remove_if(&1, |_k, _v| false), Err((&1, &0)));
+        assert_eq!(map.pin().remove_if(&1, |_k, v| *v == 1), Err((&1, &0)));
+
+        assert_eq!(map.pin().get(&1), Some(&0));
+
+        assert_eq!(map.pin().remove_if(&1, |_k, v| *v == 0), Ok(Some((&1, &0))));
+        assert_eq!(map.pin().remove_if(&1, |_, _| true), Ok(None));
+    });
+}
+
+#[test]
 fn insert_and_remove() {
     with_map::<usize, usize>(|map| {
         let map = map();
