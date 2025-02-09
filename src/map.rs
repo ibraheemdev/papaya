@@ -208,6 +208,9 @@ impl<K, V> HashMap<K, V> {
     /// However, the capacity is an estimate, and the table may prematurely resize due
     /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
     ///
+    /// Note that the `HashMap` may grow and shrink as elements are inserted or removed,
+    /// but it is guaranteed to never shrink below the initial capacity.
+    ///
     /// # Examples
     ///
     /// ```

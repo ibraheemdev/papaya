@@ -34,6 +34,11 @@ pub struct HashMap<K, V, S> {
     /// An atomic counter of the number of keys in the table.
     count: Counter,
 
+    /// The initial capacity provided to `HashMap::new`.
+    ///
+    /// The table is guaranteed to never shrink below this capacity.
+    initial_capacity: usize,
+
     /// Hasher for keys.
     pub hasher: S,
 }
@@ -247,6 +252,7 @@ impl<K, V, S> HashMap<K, V, S> {
                 collector,
                 resize,
                 hasher,
+                initial_capacity: 1,
                 table: AtomicPtr::new(ptr::null_mut()),
                 count: Counter::default(),
             };
@@ -260,6 +266,7 @@ impl<K, V, S> HashMap<K, V, S> {
             hasher,
             resize,
             collector,
+            initial_capacity: capacity,
             table: AtomicPtr::new(table.raw),
             count: Counter::default(),
         }
@@ -1957,22 +1964,35 @@ where
             return next;
         }
 
+        let current_capacity = table.len();
+
+        // Loading the length here is quite expensive, we may want to consider
+        // a probabilistic counter to detect high-deletion workloads.
+        let active_entries = self.len();
+
         let next_capacity = match cfg!(papaya_stress) {
             // Never grow the table to stress the incremental resizing algorithm.
-            true => table.len(),
+            true => current_capacity,
 
             // Double the table capacity if we are at least 50% full.
+            false if active_entries >= (current_capacity >> 1) => current_capacity << 1,
+
+            // Halve the table if we are at most 12.5% full.
             //
-            // Loading the length here is quite expensive, we may want to consider
-            // a probabilistic counter to detect high-deletion workloads.
-            false if self.len() >= (table.len() >> 1) => table.len() << 1,
+            // This heuristic is intentionally pessimistic as unnecessarily shrinking
+            // is an expensive operation, but it may change in the future. We also respect
+            // the initial capacity to give the user a way to retain a strict minimum table
+            // size.
+            false if active_entries <= (current_capacity >> 3) => {
+                self.initial_capacity.max(current_capacity >> 1)
+            }
 
             // Otherwise keep the capacity the same.
             //
             // This can occur due to poor hash distribution or frequent cycling of
             // insertions and deletions, in which case we want to avoid continuously
             // growing the table.
-            false => table.len(),
+            false => current_capacity,
         };
 
         let next_capacity = capacity.unwrap_or(next_capacity);
