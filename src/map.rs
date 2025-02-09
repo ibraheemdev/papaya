@@ -857,6 +857,45 @@ where
         self.raw.remove(key, self.raw.verify(guard))
     }
 
+    /// Conditionally removes a key from the map based on the provided closure.
+    ///
+    /// If the key is found in the map and the closure returns `true` given the key and its value,
+    /// the key and value are returned successfully. Note that the returned entry is guaranteed to
+    /// be the same entry that the closure returned `true` for. However, the closure returning `true`
+    /// does not guarantee that the entry is removed in the presence of concurrent modifications.
+    ///
+    /// If the key is not found in the map, `Ok(None)` is returned.
+    ///
+    /// If the closure returns `false`, an error is returned containing the entry provided to the closure.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// map.pin().insert(1, "a");
+    ///
+    /// assert_eq!(map.pin().remove_if(&1, |k, v| *v == "b"), Err((&1, &"a")));
+    /// assert_eq!(map.pin().get(&1), Some(&"a"));
+    /// assert_eq!(map.pin().remove_if(&1, |k, v| *v == "a"), Ok(Some((&1, &"a"))));
+    /// assert_eq!(map.pin().remove_if(&1, |_, _| true), Ok(None));
+    /// ```
+    #[inline]
+    pub fn remove_if<'g, Q, F>(
+        &self,
+        key: &Q,
+        should_remove: F,
+        guard: &'g impl Guard,
+    ) -> Result<Option<(&'g K, &'g V)>, (&'g K, &'g V)>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.raw
+            .remove_if(key, should_remove, self.raw.verify(guard))
+    }
+
     /// Tries to reserve capacity for `additional` more elements to be inserted
     /// in the `HashMap`.
     ///
@@ -1432,6 +1471,18 @@ where
         Q: Equivalent<K> + Hash + ?Sized,
     {
         self.map.raw.remove(key, &self.guard)
+    }
+
+    /// Conditionally removes a key from the map based on the provided closure.
+    ///
+    /// See [`HashMap::remove_if`] for details.
+    #[inline]
+    pub fn remove_if<Q, F>(&self, key: &Q, should_remove: F) -> Result<Option<(&K, &V)>, (&K, &V)>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnMut(&K, &V) -> bool,
+    {
+        self.map.raw.remove_if(key, should_remove, &self.guard)
     }
 
     /// Clears the map, removing all key-value pairs.

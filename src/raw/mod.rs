@@ -685,12 +685,34 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
+        #[inline(always)]
+        fn should_remove<K, V>(_key: &K, _value: &V) -> bool {
+            true
+        }
+
+        // Safety: `should_remove` unconditionally returns `true`.
+        unsafe { self.remove_if(key, should_remove, guard).unwrap_unchecked() }
+    }
+
+    /// Removes a key from the map, returning the entry for the key if the key was previously in the map
+    /// and the provided closure returns `true`
+    #[inline]
+    pub fn remove_if<'g, Q, F>(
+        &self,
+        key: &Q,
+        mut should_remove: F,
+        guard: &'g impl VerifiedGuard,
+    ) -> Result<Option<(&'g K, &'g V)>, (&'g K, &'g V)>
+    where
+        Q: Equivalent<K> + Hash + ?Sized,
+        F: FnMut(&K, &V) -> bool,
+    {
         // Load the root table.
         let mut table = self.root(guard);
 
         // The table has not been initialized yet.
         if table.raw.is_null() {
-            return None;
+            return Ok(None);
         }
 
         let (h1, h2) = self.hash(key);
@@ -714,7 +736,7 @@ where
                 // The key is not in the table.
                 // It also cannot be in the next table because we have not went over the probe limit.
                 if meta == meta::EMPTY {
-                    return None;
+                    return Ok(None);
                 }
 
                 // Check for a potential match.
@@ -752,6 +774,14 @@ where
                 }
 
                 loop {
+                    // Safety: `entry` is a valid, non-null, protected entry that we found in the map.
+                    let entry_ref = unsafe { &(*entry.ptr) };
+
+                    // Ensure that the entry should be removed.
+                    if !should_remove(&entry_ref.key, &entry_ref.value) {
+                        return Err((&entry_ref.key, &entry_ref.value));
+                    }
+
                     // Safety:
                     // - `probe.i` is always in-bounds for the table length
                     // - `entry` is a valid non-null entry that we found in the map.
@@ -760,7 +790,7 @@ where
 
                     match status {
                         // Successfully removed the entry.
-                        UpdateStatus::Replaced(entry) => {
+                        UpdateStatus::Replaced(_entry) => {
                             // Mark the entry as a tombstone.
                             //
                             // Note that this might end up being overwritten by the metadata hash
@@ -778,10 +808,8 @@ where
                             let count = self.count.get(guard.thread_id());
                             count.fetch_sub(1, Ordering::Relaxed);
 
-                            // Safety: `entry` is a valid non-null entry that we found in the map
-                            // before replacing it.
-                            let entry_ref = unsafe { &(*entry.ptr) };
-                            return Some((&entry_ref.key, &entry_ref.value));
+                            // Note that `entry_ref` here is the entry that we just replaced.
+                            return Ok(Some((&entry_ref.key, &entry_ref.value)));
                         }
 
                         // The entry is being copied to the new table, we have to complete the copy
@@ -791,7 +819,7 @@ where
                         // The entry was deleted.
                         //
                         // We know that at some point during our execution the key was not in the map.
-                        UpdateStatus::Found(EntryStatus::Null) => return None,
+                        UpdateStatus::Found(EntryStatus::Null) => return Ok(None),
 
                         // Lost to a concurrent update, retry.
                         UpdateStatus::Found(EntryStatus::Value(found)) => entry = found,
@@ -800,7 +828,12 @@ where
             };
 
             // Prepare to retry in the next table.
-            table = self.prepare_retry(copying, &mut help_copy, table, guard)?;
+            table = match self.prepare_retry(copying, &mut help_copy, table, guard) {
+                Some(table) => table,
+
+                // The search was exhausted.
+                None => return Ok(None),
+            }
         }
     }
 
