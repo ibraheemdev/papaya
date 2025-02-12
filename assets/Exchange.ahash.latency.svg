@@ -271,10 +271,10 @@ Latency
 850 ns
 </text>
 <polyline fill="none" opacity="1" stroke="#000000" stroke-width="1" points="560,56 565,56 "/>
-<polyline fill="none" opacity="1" stroke="#0000FF" stroke-width="1" points="80,401 126,387 188,378 249,369 311,359 373,346 435,334 497,327 559,311 "/>
-<polyline fill="none" opacity="1" stroke="#FF0000" stroke-width="1" points="80,380 126,317 188,279 249,225 311,155 373,114 435,73 497,58 559,36 "/>
-<polyline fill="none" opacity="1" stroke="#00FF00" stroke-width="1" points="80,400 126,384 188,374 249,368 311,358 373,340 435,327 497,322 559,301 "/>
-<polyline fill="none" opacity="1" stroke="#FF00FF" stroke-width="1" points="80,388 126,382 188,377 249,371 311,362 373,348 435,344 497,337 559,331 "/>
+<polyline fill="none" opacity="1" stroke="#0000FF" stroke-width="1" points="80,400 126,385 188,378 249,366 311,356 373,345 435,333 497,324 559,315 "/>
+<polyline fill="none" opacity="1" stroke="#FF0000" stroke-width="1" points="80,382 126,320 188,273 249,216 311,160 373,120 435,86 497,61 559,36 "/>
+<polyline fill="none" opacity="1" stroke="#00FF00" stroke-width="1" points="80,401 126,386 188,377 249,368 311,359 373,344 435,337 497,324 559,318 "/>
+<polyline fill="none" opacity="1" stroke="#FF00FF" stroke-width="1" points="80,391 126,383 188,376 249,371 311,358 373,352 435,344 497,339 559,335 "/>
 <rect x="85" y="41" width="95" height="79" opacity="0.8" fill="#FFFFFF" stroke="none"/>
 <rect x="85" y="41" width="95" height="79" opacity="1" fill="none" stroke="#000000"/>
 <text x="125" y="51" dy="0.76em" text-anchor="start" font-family="Fira Code" font-size="10.483870967741936" opacity="1" fill="#000000">
@@ -287,7 +287,7 @@ Flurry
 Papaya
 </text>
 <text x="125" y="100" dy="0.76em" text-anchor="start" font-family="Fira Code" font-size="10.483870967741936" opacity="1" fill="#000000">
-SccMap
+Scc
 </text>
 <polyline fill="none" opacity="1" stroke="#0000FF" stroke-width="1" points="95,56 115,56 "/>
 <polyline fill="none" opacity="1" stroke="#FF0000" stroke-width="1" points="95,72 115,72 "/>

@@ -692,7 +692,7 @@ where
         let other = HashSet::builder()
             .capacity(self.len())
             .hasher(self.raw.hasher.clone())
-            .collector(self.raw.collector().clone())
+            .collector(seize::Collector::new())
             .build();
 
         {

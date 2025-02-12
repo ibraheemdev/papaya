@@ -1093,7 +1093,7 @@ where
         let (guard1, guard2) = (&self.guard(), &other.guard());
 
         let mut iter = self.iter(guard1);
-        iter.all(|(key, value)| other.get(key, guard2).map_or(false, |v| *value == *v))
+        iter.all(|(key, value)| other.get(key, guard2).is_some_and(|v| *value == *v))
     }
 }
 
@@ -1205,7 +1205,7 @@ where
         let other = HashMap::builder()
             .capacity(self.len())
             .hasher(self.raw.hasher.clone())
-            .collector(self.raw.collector().clone())
+            .collector(seize::Collector::new())
             .build();
 
         {
