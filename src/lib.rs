@@ -224,6 +224,8 @@
 #![allow(unstable_name_collisions)]
 // Stylistic preferences.
 #![allow(clippy::multiple_bound_locations, clippy::single_match)]
+// Clippy trips up with pollyfills.
+#![allow(clippy::incompatible_msrv)]
 
 mod map;
 mod raw;

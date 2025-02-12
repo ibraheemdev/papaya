@@ -3,11 +3,12 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, Thread};
 
-// A simpler thread parker.
+// A simple thread parker.
 //
-// This parker is rarely used and relatively naive. Ideally this would just use `futex`
-// but the hashmap needs to park on tagged pointer state, and mixed-sized atomic accesses
-// are questionable.
+// This parker is rarely used and relatively naive. Ideally this would just use a futex
+// but the hashmap needs to park on tagged pointer state so we would either need mixed-sized
+// atomic accesses (https://github.com/rust-lang/unsafe-code-guidelines/issues/345) which are
+// questionable, or 64 bit futexes, which are not available on most platforms.
 //
 // The parker implementation may be sharded and use intrusive lists if it is found to be
 // a bottleneck.

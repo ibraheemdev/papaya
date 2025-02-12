@@ -3,8 +3,6 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::{alloc, mem, ptr};
 
-use seize::Collector;
-
 use super::{probe, State};
 
 // A hash-table laid out in a single allocation.
@@ -14,16 +12,9 @@ use super::{probe, State};
 #[repr(transparent)]
 pub struct RawTable<T>(u8, PhantomData<T>);
 
-// Safety: `seize::Link` is the first field (see `TableLayout`).
-unsafe impl<T> seize::AsLink for RawTable<T> {}
-
 // The layout of the table allocation.
 #[repr(C)]
 struct TableLayout<T> {
-    /// A link to the `seize::Collector`, enabling garbage collection
-    /// when the table resizes.
-    link: seize::Link,
-
     /// A mask to get an index into the table from a hash.
     mask: usize,
 
@@ -65,7 +56,7 @@ impl<T> Clone for Table<T> {
 
 impl<T> Table<T> {
     // Allocate a table with the provided length and collector.
-    pub fn alloc(len: usize, collector: &Collector) -> Table<T> {
+    pub fn alloc(len: usize) -> Table<T> {
         assert!(len.is_power_of_two());
 
         // Pad the meta table to fulfill the alignment requirement of an entry.
@@ -87,15 +78,11 @@ impl<T> Table<T> {
         unsafe {
             // Write the table state.
             ptr.cast::<TableLayout<T>>().write(TableLayout {
-                link: collector.link(),
                 mask,
                 limit,
-                state: State {
-                    collector,
-                    ..State::default()
-                },
                 meta: [],
                 entries: [],
+                state: State::default(),
             });
 
             // Initialize the meta table.
@@ -235,8 +222,7 @@ impl<T> Table<T> {
 #[test]
 fn layout() {
     unsafe {
-        let collector = seize::Collector::new();
-        let table: Table<u8> = Table::alloc(4, &collector);
+        let table: Table<u8> = Table::alloc(4);
         let table: Table<u8> = Table::from_raw(table.raw);
 
         // The capacity is padded for pointer alignment.
