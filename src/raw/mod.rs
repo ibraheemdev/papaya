@@ -2058,6 +2058,9 @@ where
                         // This table doesn't have space for the next entry.
                         //
                         // Abort the current resize.
+                        //
+                        // Note that the `SeqCst` is necessary to make the store visible
+                        // to threads that are unparked.
                         next.state().status.store(State::ABORTED, Ordering::SeqCst);
 
                         // Allocate the next table.
@@ -2096,7 +2099,13 @@ where
                     7
                 };
 
-                let status = state.status.load(Ordering::SeqCst);
+                // Note that `Acquire` is necessary here to ensure we see the
+                // relevant modifications to the root table if see the updated
+                // state before parking.
+                //
+                // Otherwise, `Parker::park` will ensure the necessary synchronization
+                // when we are unparked.
+                let status = state.status.load(Ordering::Acquire);
 
                 // If this copy was aborted, we have to retry in the new table.
                 if status == State::ABORTED {
@@ -2250,7 +2259,14 @@ where
                 };
 
                 // The copy has completed.
-                let status = state.status.load(Ordering::SeqCst);
+                //
+                // Note that `Acquire` is necessary here to ensure we see the
+                // relevant modifications to the root table if see the updated
+                // state before parking.
+                //
+                // Otherwise, `Parker::park` will ensure the necessary synchronization
+                // when we are unparked.
+                let status = state.status.load(Ordering::Acquire);
                 if status == State::PROMOTED {
                     return next;
                 }
@@ -2326,6 +2342,9 @@ where
 
         // Note that we already wrote the COPYING bit, so no one is writing to the old
         // entry except us.
+        //
+        // Note that the `SeqCst` is necessary to make the store visible to threads
+        // that are unparked.
         entry.store(copied, Ordering::SeqCst);
 
         // Notify any writers that the copy has completed.
@@ -2456,6 +2475,9 @@ where
                     .is_ok()
                 {
                     // Successfully promoted the table.
+                    //
+                    // Note that the `SeqCst` is necessary to make the store visible to threads
+                    // that are unparked.
                     state.status.store(State::PROMOTED, Ordering::SeqCst);
 
                     // Retire the old table.

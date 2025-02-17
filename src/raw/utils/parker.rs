@@ -26,6 +26,9 @@ struct State {
 
 impl Parker {
     // Block the current thread until the park condition is false.
+    //
+    // This method is guaranteed to establish happens-before with the unpark condition
+    // before it returns.
     pub fn park<T>(&self, atomic: &impl Atomic<T>, should_park: impl Fn(T) -> bool) {
         let key = atomic as *const _ as usize;
 
@@ -35,6 +38,9 @@ impl Parker {
             // This must be done before inserting our thread to prevent
             // incorrect decrements if we are unparked in-between inserting
             // the thread and incrementing the counter.
+            //
+            // Note that the `SeqCst` store here establishes a total order
+            // with the `SeqCst` store that establishes the unpark condition.
             self.pending.fetch_add(1, Ordering::SeqCst);
 
             // Insert our thread into the parker.
@@ -49,6 +55,9 @@ impl Parker {
             };
 
             // Check the park condition.
+            //
+            // Note that `SeqCst` is necessary here to participate in the
+            // total order established above.
             if !should_park(atomic.load(Ordering::SeqCst)) {
                 // Don't need to park, remove our thread if it wasn't already unparked.
                 let thread = {
@@ -81,6 +90,8 @@ impl Parker {
             }
 
             // Ensure we were unparked for the correct reason.
+            //
+            // Establish happens-before with the unpark condition.
             if !should_park(atomic.load(Ordering::Acquire)) {
                 return;
             }
@@ -94,6 +105,11 @@ impl Parker {
         let key = atomic as *const _ as usize;
 
         // Fast-path, no one waiting to be unparked.
+        //
+        // Note that `SeqCst` is necessary here to participate in the
+        // total order established between the increment of `self.pending`
+        // in `park` and the `SeqCst` store of the unpark condition by
+        // the caller.
         if self.pending.load(Ordering::SeqCst) == 0 {
             return;
         }
