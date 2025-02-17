@@ -13,6 +13,7 @@ pub struct Stack<T> {
     head: AtomicPtr<Node<T>>,
 }
 
+/// A node in the stack.
 struct Node<T> {
     value: T,
     next: *mut Node<T>,
