@@ -1,6 +1,6 @@
 [package]
 name = "papaya"
-version = "0.1.8"
+version = "0.1.9"
 authors = ["Ibraheem Ahmed <ibraheem@ibraheem.ca>"]
 description = "A fast and ergonomic concurrent hash-table for read-heavy workloads."
 edition = "2021"
