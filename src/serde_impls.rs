@@ -154,7 +154,7 @@ where
     type Value = HashSet<K, S>;
 
     fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "a map")
+        write!(f, "a set")
     }
 
     fn visit_seq<M>(self, mut access: M) -> Result<Self::Value, M::Error>
