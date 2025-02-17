@@ -968,7 +968,7 @@ where
     /// assert_eq!(map.len(), 4);
     /// ```
     #[inline]
-    pub fn retain<F>(&mut self, f: F, guard: &impl Guard)
+    pub fn retain<F>(&self, f: F, guard: &impl Guard)
     where
         F: FnMut(&K, &V) -> bool,
     {
