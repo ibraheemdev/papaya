@@ -815,7 +815,7 @@ fn retain_empty() {
 fn retain_all_false() {
     with_map::<usize, usize>(|map| {
         let map = map();
-        for i in 0..10 {
+        for i in 0..100 {
             map.pin().insert(i, i);
         }
         map.pin().retain(|_, _| false);
@@ -827,11 +827,11 @@ fn retain_all_false() {
 fn retain_all_true() {
     with_map::<usize, usize>(|map| {
         let map = map();
-        for i in 0..10 {
+        for i in 0..100 {
             map.pin().insert(i, i);
         }
         map.pin().retain(|_, _| true);
-        assert_eq!(map.len(), 10);
+        assert_eq!(map.len(), 100);
     });
 }
 
@@ -839,14 +839,14 @@ fn retain_all_true() {
 fn retain_some() {
     with_map::<usize, usize>(|map| {
         let map = map();
-        for i in 0..10 {
+        for i in 0..100 {
             map.pin().insert(i, i);
         }
-        map.pin().retain(|_, v| *v >= 5);
+        map.pin().retain(|_, v| *v < 5);
         assert_eq!(map.len(), 5);
         let mut got: Vec<_> = map.pin().values().copied().collect();
         got.sort();
-        assert_eq!(got, [5, 6, 7, 8, 9]);
+        assert_eq!(got, [0, 1, 2, 3, 4]);
     });
 }
 

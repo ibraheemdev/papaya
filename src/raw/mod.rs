@@ -1152,7 +1152,7 @@ where
                     // Safety: We performed a protected load of the pointer using a verified guard with
                     // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
                     // as we hold the guard.
-                    let entry_ref = unsafe { &*entry.raw };
+                    let entry_ref = unsafe { &*entry.ptr };
 
                     // Should we retain this entry?
                     if f(&entry_ref.key, &entry_ref.value) {
