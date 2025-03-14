@@ -1051,7 +1051,10 @@ fn retain_stress() {
                 s.spawn(|| {
                     barrier.wait();
                     for _ in 0..(threads * 20) {
-                        map.pin().retain(|_, _| true);
+                        map.pin().retain(|k, v| {
+                            assert_eq!(k, v);
+                            true
+                        });
                     }
                 });
             });
