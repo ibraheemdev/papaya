@@ -1,5 +1,5 @@
 use crate::raw::utils::MapGuard;
-use crate::raw::{self, InsertResult};
+use crate::raw::{map, map::InsertResult};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
@@ -7,7 +7,6 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 
 /// A concurrent hash table.
 ///
@@ -15,14 +14,7 @@ use std::mem::ManuallyDrop;
 /// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
 pub struct HashMap<K, V, S = RandomState> {
-    raw: ManuallyDrop<raw::HashMap<K, V, S>>,
-}
-
-impl<K, V, S> Drop for HashMap<K, V, S> {
-    fn drop(&mut self) {
-        // Safety: We don't access `self` after taking the inner map.
-        raw::drop_map(unsafe { ManuallyDrop::take(&mut self.raw) });
-    }
+    raw: map::HashMap<K, V, S>,
 }
 
 // Safety: `HashMap` acts as a single-threaded collection on a single thread.
@@ -139,12 +131,7 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
     /// Construct a [`HashMap`] from the builder, using the configured options.
     pub fn build(self) -> HashMap<K, V, S> {
         HashMap {
-            raw: ManuallyDrop::new(raw::HashMap::new(
-                self.capacity,
-                self.hasher,
-                self.collector,
-                self.resize_mode,
-            )),
+            raw: map::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
         }
     }
 }
@@ -264,7 +251,7 @@ impl<K, V, S> HashMap<K, V, S> {
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
     /// to allow HashMaps to be resistant to attacks that cause many collisions
-    /// and very actuallypoor performance. Setting it manually using this function can
+    /// and very poor performance. Setting it manually using this function can
     /// expose a DoS attack vector.
     ///
     /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
@@ -311,12 +298,12 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
         HashMap {
-            raw: ManuallyDrop::new(raw::HashMap::new(
+            raw: map::HashMap::new(
                 capacity,
                 hash_builder,
                 Collector::default(),
                 ResizeMode::default(),
-            )),
+            ),
         }
     }
 
@@ -1133,13 +1120,8 @@ impl<K, V, S> IntoIterator for HashMap<K, V, S> {
     /// let v: Vec<(&str, i32)> = map.into_iter().collect();
     /// ```
     fn into_iter(self) -> Self::IntoIter {
-        let mut map = ManuallyDrop::new(self);
-
-        // Safety: We don't access `self` after taking the inner map.
-        let raw = unsafe { ManuallyDrop::take(&mut map.raw) };
-
         IntoIter {
-            raw: raw.into_iter(),
+            raw: self.raw.into_iter(),
         }
     }
 }
@@ -1650,7 +1632,7 @@ where
 ///
 /// This struct is created by the [`iter`](HashMap::iter) method on [`HashMap`]. See its documentation for details.
 pub struct Iter<'g, K, V, G> {
-    raw: raw::Iter<'g, K, V, MapGuard<G>>,
+    raw: map::Iter<'g, K, V, MapGuard<G>>,
 }
 
 impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
@@ -1688,7 +1670,7 @@ where
 ///
 /// This struct is created by the [`iter_mut`](HashMap::iter_mut) method on [`HashMap`]. See its documentation for details.
 pub struct IterMut<'map, K, V> {
-    raw: raw::IterMut<'map, K, V>,
+    raw: map::IterMut<'map, K, V>,
 }
 
 impl<'map, K, V> Iterator for IterMut<'map, K, V> {
@@ -1779,7 +1761,7 @@ where
 ///
 /// [`into_iter`]: IntoIterator::into_iter
 pub struct IntoIter<K, V> {
-    pub(crate) raw: raw::IntoIter<K, V>,
+    pub(crate) raw: map::IntoIter<K, V>,
 }
 
 impl<K, V> Iterator for IntoIter<K, V> {

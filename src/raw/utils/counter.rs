@@ -1,7 +1,6 @@
-use std::sync::{
-    atomic::{AtomicIsize, Ordering},
-    OnceLock,
-};
+use std::fmt;
+use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::OnceLock;
 
 use super::CachePadded;
 
@@ -57,5 +56,11 @@ impl Counter {
             // Depending on the order of deletion/insertions this might be negative,
             // in which case we assume the map is empty.
             .unwrap_or(0)
+    }
+}
+
+impl fmt::Debug for Counter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Counter").field(&self.sum()).finish()
     }
 }

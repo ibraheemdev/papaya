@@ -3,7 +3,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::{alloc, mem, ptr};
 
-use super::{probe, State};
+use super::probe;
+use super::table::{meta, State};
 
 // A hash-table laid out in a single allocation.
 //
@@ -88,7 +89,7 @@ impl<T> Table<T> {
             // Initialize the meta table.
             ptr.add(mem::size_of::<TableLayout<T>>())
                 .cast::<u8>()
-                .write_bytes(super::meta::EMPTY, len);
+                .write_bytes(meta::EMPTY, len);
         }
 
         Table {

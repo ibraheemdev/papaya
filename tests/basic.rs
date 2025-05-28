@@ -776,7 +776,7 @@ fn len() {
         let map = map();
         let len = if cfg!(miri) { 100 } else { 10_000 };
         for i in 0..len {
-            map.pin().insert(i, i + 1);
+            assert_eq!(map.pin().insert(i, i + 1), None);
         }
         assert_eq!(map.len(), len);
     });

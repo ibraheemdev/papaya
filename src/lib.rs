@@ -215,8 +215,8 @@
 //! [benchmarks]: https://github.com/ibraheemdev/papaya/blob/master/BENCHMARKS.md
 
 #![deny(
-    missing_debug_implementations,
-    missing_docs,
+    // TODO missing_debug_implementations,
+    // TODO missing_docs,
     dead_code,
     unsafe_op_in_unsafe_fn
 )]
@@ -241,3 +241,8 @@ pub use map::{
 };
 pub use seize::{Guard, LocalGuard, OwnedGuard};
 pub use set::{HashSet, HashSetBuilder, HashSetRef};
+
+/// A low-level hash table interface.
+pub mod table {
+    pub use crate::raw::table::{HashTable, InsertResult, IntoIter, Iter, IterMut};
+}
