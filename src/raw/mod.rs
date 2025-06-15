@@ -3,6 +3,8 @@ mod probe;
 
 pub(crate) mod utils;
 
+#[cfg(feature = "rayon")]
+use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
@@ -1229,6 +1231,35 @@ where
         let table = self.linearize(root, guard);
 
         Iter { i: 0, guard, table }
+    }
+
+    /// Returns a parallel iterator over all key/value pairs in the table.
+    #[cfg(feature = "rayon")]
+    #[inline]
+    pub fn par_iter<'g, G>(&self, guard: &'g G) -> ParIter<'g, K, V, G>
+    where
+        G: VerifiedGuard,
+    {
+        let root = self.root(guard);
+
+        if root.raw.is_null() {
+            return ParIter {
+                start: 0,
+                end: 0,
+                guard,
+                table: root,
+            };
+        }
+
+        let table = self.linearize(root, guard);
+        let len = table.len();
+
+        ParIter {
+            start: 0,
+            end: len,
+            guard,
+            table,
+        }
     }
 
     /// Returns the h1 and h2 hash for the given key.
@@ -2715,6 +2746,120 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
             table: self.table,
             guard: self.guard,
         }
+    }
+}
+
+#[cfg(feature = "rayon")]
+/// A parallel iterator over the entries of a hash table.
+pub struct ParIter<'g, K, V, G> {
+    start: usize,
+    end: usize,
+    table: Table<Entry<K, V>>,
+    guard: &'g G,
+}
+
+#[cfg(feature = "rayon")]
+impl<'g, K, V, G> fmt::Debug for ParIter<'g, K, V, G> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ParIter")
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .finish()
+    }
+}
+
+#[cfg(feature = "rayon")]
+unsafe impl<K, V, G> Send for ParIter<'_, K, V, G>
+where
+    K: Sync,
+    V: Sync,
+    G: Sync,
+{
+}
+
+#[cfg(feature = "rayon")]
+unsafe impl<K, V, G> Sync for ParIter<'_, K, V, G>
+where
+    K: Sync,
+    V: Sync,
+    G: Sync,
+{
+}
+
+#[cfg(feature = "rayon")]
+impl<'g, K, V, G> rayon::iter::ParallelIterator for ParIter<'g, K, V, G>
+where
+    K: Sync + 'g,
+    V: Sync + 'g,
+    G: VerifiedGuard + Sync,
+{
+    type Item = (&'g K, &'g V);
+
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>,
+    {
+        rayon::iter::plumbing::bridge_unindexed(self, consumer)
+    }
+}
+
+#[cfg(feature = "rayon")]
+impl<'g, K, V, G> rayon::iter::plumbing::UnindexedProducer for ParIter<'g, K, V, G>
+where
+    K: Sync + 'g,
+    V: Sync + 'g,
+    G: VerifiedGuard + Sync,
+{
+    type Item = (&'g K, &'g V);
+
+    fn split(mut self) -> (Self, Option<Self>) {
+        let len = self.end - self.start;
+        if len <= 1 {
+            (self, None)
+        } else {
+            let mid = self.start + len / 2;
+            let right = ParIter {
+                start: mid,
+                end: self.end,
+                table: self.table,
+                guard: self.guard,
+            };
+            self.end = mid;
+            (self, Some(right))
+        }
+    }
+
+    fn fold_with<F>(self, mut folder: F) -> F
+    where
+        F: rayon::iter::plumbing::Folder<Self::Item>,
+    {
+        if self.table.raw.is_null() {
+            return folder;
+        }
+        let mut i = self.start;
+        while i < self.end {
+            // Safety: i is in-bounds for the table length.
+            let meta = unsafe { self.table.meta(i) }.load(Ordering::Acquire);
+            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
+                i += 1;
+                continue;
+            }
+
+            let entry = self
+                .guard
+                .protect(unsafe { self.table.entry(i) }, Ordering::Acquire)
+                .unpack();
+
+            if entry.ptr.is_null() {
+                i += 1;
+                continue;
+            }
+
+            let entry_ref = unsafe { &(*entry.ptr) };
+            folder = folder.consume((&entry_ref.key, &entry_ref.value));
+            i += 1;
+        }
+        folder
     }
 }
 
