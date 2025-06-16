@@ -234,6 +234,9 @@ mod set;
 #[cfg(feature = "serde")]
 mod serde_impls;
 
+#[cfg(feature = "rayon")]
+mod rayon_impls;
+
 pub use equivalent::Equivalent;
 pub use map::{
     Compute, HashMap, HashMapBuilder, HashMapRef, Iter, Keys, OccupiedError, Operation, ResizeMode,

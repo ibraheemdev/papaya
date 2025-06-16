@@ -1298,6 +1298,13 @@ where
         self.len() == 0
     }
 
+    /// Provides access to raw table for parallel iteration (rayon feature only).
+    #[cfg(feature = "rayon")]
+    #[doc(hidden)]
+    pub(crate) fn raw_par_iter(&self) -> raw::ParIter<'_, K, V, MapGuard<G>> {
+        raw::ParIter::new(&self.map.raw, &self.guard)
+    }
+
     /// Returns `true` if the map contains a value for the specified key.
     ///
     /// See [`HashMap::contains_key`] for details.

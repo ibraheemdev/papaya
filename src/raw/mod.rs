@@ -2838,3 +2838,10 @@ mod meta {
         (top7 & 0x7f) as u8
     }
 }
+
+// Parallel iteration support for rayon
+#[cfg(feature = "rayon")]
+pub use self::par_iter::ParIter;
+
+#[cfg(feature = "rayon")]
+mod par_iter;
