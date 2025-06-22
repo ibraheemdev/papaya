@@ -33,6 +33,9 @@ unsafe impl<T> StrictProvenance<T> for *mut T {
     where
         T: Unpack,
     {
+        // This assert will fail at compile time if T doesn't have an alignment that
+        // guarantees all valid pointers have zero in the bits excluded by T::MASK.
+        const { assert!(align_of::<T>() > !T::MASK) };
         Tagged {
             raw: self,
             ptr: self.map_addr(|addr| addr & T::MASK),
