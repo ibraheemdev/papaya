@@ -32,7 +32,7 @@ unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
 // Additionally, `HashMap` owns its `seize::Collector` and never exposes it,
 // so multiple threads cannot be involved in reclamation without sharing the
 // `HashMap` itself. If this was not true, we would require stricter bounds
-// on `HashMap` operations themselves.
+// on the `HashMap` operations themselves.
 unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {}
 
 /// A builder for a [`HashMap`].
@@ -1006,6 +1006,35 @@ where
         }
     }
 
+    /// An iterator visiting all key-value pairs in arbitrary order, with mutable references
+    /// to the values. The iterator element type is `(&K, &mut V)`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let mut map = HashMap::from([
+    ///     ("a", 1),
+    ///     ("b", 2),
+    ///     ("c", 3),
+    /// ]);
+    ///
+    /// // Update all values.
+    /// for (_, val) in map.iter_mut() {
+    ///     *val *= 2;
+    /// }
+    ///
+    /// for (key, val) in map.pin().iter() {
+    ///     println!("key: {key} val: {val}");
+    /// }
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        IterMut {
+            raw: self.raw.iter_mut(),
+        }
+    }
+
     /// An iterator visiting all keys in arbitrary order.
     /// The iterator element type is `&K`.
     ///
@@ -1572,7 +1601,7 @@ where
     }
 }
 
-/// An iterator over a map's entries.
+/// An iterator over the entries of a `HashMap`.
 ///
 /// This struct is created by the [`iter`](HashMap::iter) method on [`HashMap`]. See its documentation for details.
 pub struct Iter<'g, K, V, G> {
@@ -1601,6 +1630,37 @@ where
         f.debug_list()
             .entries(Iter {
                 raw: self.raw.clone(),
+            })
+            .finish()
+    }
+}
+
+/// A mutable iterator over the entries of a `HashMap`.
+///
+/// This struct is created by the [`iter_mut`](HashMap::iter_mut) method on [`HashMap`]. See its documentation for details.
+pub struct IterMut<'map, K, V> {
+    raw: raw::IterMut<'map, K, V>,
+}
+
+impl<'map, K, V> Iterator for IterMut<'map, K, V> {
+    type Item = (&'map K, &'map mut V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next()
+    }
+}
+
+impl<K, V> fmt::Debug for IterMut<'_, K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(IterMut {
+                // Safety: We only create a single clone.
+                raw: unsafe { self.raw.clone() },
             })
             .finish()
     }
