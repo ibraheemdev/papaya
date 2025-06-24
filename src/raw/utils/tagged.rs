@@ -1,3 +1,4 @@
+use std::mem::align_of;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 // Polyfill for the unstable strict-provenance APIs.
@@ -12,9 +13,13 @@ pub unsafe trait StrictProvenance<T>: Sized {
 }
 
 // Unpack a tagged pointer.
-pub trait Unpack {
+pub trait Unpack: Sized {
     // A mask for the pointer tag bits.
     const MASK: usize;
+
+    // This constant, if used, will fail to compile if T doesn't have an alignment
+    // that guarantees all valid pointers have zero in the bits excluded by T::MASK.
+    const ASSERT_ALIGNMENT: () = assert!(align_of::<Self>() > !Self::MASK);
 }
 
 unsafe impl<T> StrictProvenance<T> for *mut T {
@@ -33,6 +38,7 @@ unsafe impl<T> StrictProvenance<T> for *mut T {
     where
         T: Unpack,
     {
+        let () = T::ASSERT_ALIGNMENT;
         Tagged {
             raw: self,
             ptr: self.map_addr(|addr| addr & T::MASK),

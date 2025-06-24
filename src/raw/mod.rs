@@ -118,8 +118,9 @@ pub enum RawInsertResult<'g, K, V> {
     },
 }
 
-// An entry in the hash-table.
-#[repr(C)]
+// An entry in the hash-table. We force a minimum of 8-byte alignment because
+// we store entry flags in the low 3 bits of pointers to this type.
+#[repr(C, align(8))]
 pub struct Entry<K, V> {
     /// The key for this entry.
     pub key: K,
