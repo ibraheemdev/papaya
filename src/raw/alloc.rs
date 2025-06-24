@@ -157,6 +157,25 @@ impl<T> Table<T> {
         }
     }
 
+    // Returns the entry at the given index.
+    //
+    // # Safety
+    //
+    // The index must be in-bounds for the length of the table.
+    #[inline]
+    pub unsafe fn entry_mut(&mut self, i: usize) -> *mut T {
+        debug_assert!(i < self.len());
+
+        // Safety: The caller guarantees the index is in-bounds.
+        let entry = unsafe {
+            let meta = self.raw.add(mem::size_of::<TableLayout<T>>());
+            let entries = meta.add(self.len()).cast::<AtomicPtr<T>>();
+            &mut *entries.add(i)
+        };
+
+        *entry.get_mut()
+    }
+
     /// Returns the length of the table.
     #[inline]
     pub fn len(&self) -> usize {

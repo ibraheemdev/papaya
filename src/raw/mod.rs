@@ -4,6 +4,7 @@ mod probe;
 pub(crate) mod utils;
 
 use std::hash::{BuildHasher, Hash};
+use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -1222,13 +1223,41 @@ where
                 i: 0,
                 guard,
                 table: root,
+                _entries: PhantomData,
             };
         }
 
         // Get a clean copy of the table to iterate over.
         let table = self.linearize(root, guard);
 
-        Iter { i: 0, guard, table }
+        Iter {
+            i: 0,
+            guard,
+            table,
+            _entries: PhantomData,
+        }
+    }
+
+    /// Returns an iterator over the keys and values of this table.
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        // Safety: The root table is either null or a valid table allocation.
+        let table = unsafe { Table::from_raw(*self.table.get_mut()) };
+
+        // The table has not been initialized yet, return a dummy iterator.
+        if table.raw.is_null() {
+            return IterMut {
+                i: 0,
+                table,
+                _entries: PhantomData,
+            };
+        }
+
+        IterMut {
+            i: 0,
+            table,
+            _entries: PhantomData,
+        }
     }
 
     /// Returns the h1 and h2 hash for the given key.
@@ -2627,6 +2656,7 @@ pub struct Iter<'g, K, V, G> {
     i: usize,
     table: Table<Entry<K, V>>,
     guard: &'g G,
+    _entries: PhantomData<(&'g K, &'g V)>,
 }
 
 impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
@@ -2684,8 +2714,8 @@ where
     }
 }
 
-// Safety: An iterator holds a shared reference to the HashMap
-// and Guard, and outputs shared references to keys and values.
+// Safety: An iterator holds a shared reference to the `HashMap`
+// and `Guard`, and outputs shared references to keys and values.
 // Thus everything must be `Sync` for the iterator to be `Send`
 // or `Sync`.
 //
@@ -2714,8 +2744,98 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
             i: self.i,
             table: self.table,
             guard: self.guard,
+            _entries: PhantomData,
         }
     }
+}
+
+// A mutable iterator over the keys and values of this table.
+pub struct IterMut<'map, K, V> {
+    i: usize,
+    table: Table<Entry<K, V>>,
+    // Ensure invariance with respect to `V`.
+    _entries: PhantomData<(&'map K, &'map mut V)>,
+}
+
+impl<'map, K, V> IterMut<'map, K, V> {
+    #[inline]
+    pub fn next(&mut self) -> Option<(&'map K, &'map mut V)> {
+        // The table has not yet been allocated.
+        if self.table.raw.is_null() {
+            return None;
+        }
+
+        loop {
+            // Iterated over every entry in the table, proceed to a nested resize if there is one.
+            //
+            // We have a mutable reference to the table, so there are no concurrent removals that
+            // can lead to us yielding duplicate entries.
+            if self.i >= self.table.len() {
+                if let Some(next_table) = self.table.next_table() {
+                    self.i = 0;
+                    self.table = next_table;
+                    continue;
+                }
+
+                // Otherwise, we're done.
+                return None;
+            }
+
+            // Load the entry.
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
+            let entry = unsafe { self.table.entry_mut(self.i) }.unpack();
+
+            // The entry was deleted.
+            if entry.ptr.is_null() {
+                self.i += 1;
+                continue;
+            }
+
+            // The entry was copied, we'll yield it when iterating over the table
+            // it was copied to.
+            if entry.tag() & Entry::COPIED != 0 {
+                self.i += 1;
+                continue;
+            }
+
+            // Safety: We have `&mut self` and ensured the entry is non-null.
+            let entry_ref = unsafe { &mut (*entry.ptr) };
+
+            self.i += 1;
+            return Some((&entry_ref.key, &mut entry_ref.value));
+        }
+    }
+
+    // Returns a clone of the iterator over the remaining entries.
+    //
+    // # Safety
+    //
+    // Creating multiple clones can lead to unsound mutable aliasing.
+    pub(crate) unsafe fn clone(&self) -> IterMut<'_, K, V> {
+        IterMut {
+            i: self.i,
+            table: self.table,
+            _entries: PhantomData,
+        }
+    }
+}
+
+// Safety: An iterator holds a mutable reference to the `HashMap`
+// and does not perform any concurrent access, so the normal `Send`
+// and `Sync` rules apply.
+unsafe impl<K, V> Send for IterMut<'_, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+unsafe impl<K, V> Sync for IterMut<'_, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
 }
 
 impl<K, V, S> Drop for HashMap<K, V, S> {
