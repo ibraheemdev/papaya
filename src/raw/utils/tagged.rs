@@ -13,19 +13,13 @@ pub unsafe trait StrictProvenance<T>: Sized {
 }
 
 // Unpack a tagged pointer.
-pub trait Unpack {
+pub trait Unpack: Sized {
     // A mask for the pointer tag bits.
     const MASK: usize;
-}
 
-// This function does nothing, but will fail to compile if T doesn't have an alignment
-// that guarantees all valid pointers have zero in the bits excluded by T::MASK.
-const fn static_assert_align_of<T: Unpack>() {
-    struct Dummy<T>(T);
-    impl<T: Unpack> Dummy<T> {
-        const ASSERT: () = assert!(align_of::<T>() > !T::MASK);
-    }
-    Dummy::<T>::ASSERT
+    // This constant, if used, will fail to compile if T doesn't have an alignment
+    // that guarantees all valid pointers have zero in the bits excluded by T::MASK.
+    const ASSERT_ALIGNMENT: () = assert!(align_of::<Self>() > !Self::MASK);
 }
 
 unsafe impl<T> StrictProvenance<T> for *mut T {
@@ -44,7 +38,7 @@ unsafe impl<T> StrictProvenance<T> for *mut T {
     where
         T: Unpack,
     {
-        static_assert_align_of::<T>();
+        let () = T::ASSERT_ALIGNMENT;
         Tagged {
             raw: self,
             ptr: self.map_addr(|addr| addr & T::MASK),
