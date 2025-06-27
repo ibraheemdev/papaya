@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread::{self, Thread};
 
@@ -8,13 +8,13 @@ use std::thread::{self, Thread};
 // This parker is rarely used and relatively naive. Ideally this would just use a futex
 // but the hashmap needs to park on tagged pointer state so we would either need mixed-sized
 // atomic accesses (https://github.com/rust-lang/unsafe-code-guidelines/issues/345) which are
-// questionable, or 64 bit futexes, which are not available on most platforms.
+// questionable, or 64-bit futexes, which are not available on most platforms.
 //
 // The parker implementation may be sharded and use intrusive lists if it is found to be
 // a bottleneck.
 #[derive(Default)]
 pub struct Parker {
-    pending: AtomicU64,
+    pending: AtomicUsize,
     state: Mutex<State>,
 }
 
@@ -121,8 +121,7 @@ impl Parker {
         };
 
         if let Some(threads) = threads {
-            let unparked = threads.len() as u64;
-            self.pending.fetch_sub(unparked, Ordering::Relaxed);
+            self.pending.fetch_sub(threads.len(), Ordering::Relaxed);
 
             for (_, thread) in threads {
                 thread.unpark();
