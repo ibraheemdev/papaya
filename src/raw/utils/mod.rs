@@ -5,7 +5,9 @@ mod tagged;
 
 pub use counter::Counter;
 pub use parker::Parker;
+use seize::Guard as _;
 pub use stack::Stack;
+use std::fmt;
 pub use tagged::{untagged, AtomicPtrFetchOps, StrictProvenance, Tagged, Unpack};
 
 /// A `seize::Guard` that has been verified to belong to a given map.
@@ -13,6 +15,17 @@ pub trait VerifiedGuard: seize::Guard {}
 
 #[repr(transparent)]
 pub struct MapGuard<G>(G);
+
+impl<G> fmt::Debug for MapGuard<G>
+where
+    G: seize::Guard,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MapGuard")
+            .field("thread_id", &self.thread_id())
+            .finish()
+    }
+}
 
 impl<G> MapGuard<G> {
     /// Create a new `MapGuard`.
