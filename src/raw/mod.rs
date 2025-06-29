@@ -1098,6 +1098,35 @@ where
         }
     }
 
+    /// Drains the map, removing all key-value pairs and returning an iterator
+    /// over the removed values.
+    #[inline]
+    pub fn drain<'g, G: VerifiedGuard>(&'g self, guard: &'g G) -> Drain<'g, K, V, S, G> {
+        let root = self.root(guard);
+
+        // The table has not been initialized yet, return a dummy iterator.
+        if root.raw.is_null() {
+            return Drain {
+                map: self,
+                guard,
+                current_table: root,
+                i: 0,
+                finished: true,
+            };
+        }
+
+        // Get a clean copy of the table to iterate over.
+        let table = self.linearize(root, guard);
+
+        Drain {
+            map: self,
+            guard,
+            current_table: table,
+            i: 0,
+            finished: false,
+        }
+    }
+
     /// Retains only the elements specified by the predicate.
     #[inline]
     pub fn retain<F>(&self, mut f: F, guard: &impl VerifiedGuard)
@@ -2836,5 +2865,157 @@ mod meta {
         // top 32 bits are 0 on 32-bit platforms.
         let top7 = hash >> (MIN_HASH_LEN * 8 - 7);
         (top7 & 0x7f) as u8
+    }
+}
+
+/// An iterator that drains entries from a table.
+pub struct Drain<'a, K, V, S, G> {
+    map: &'a HashMap<K, V, S>,
+    guard: &'a G,
+    current_table: Table<Entry<K, V>>,
+    i: usize,
+    finished: bool,
+}
+
+// Safety: An iterator holds a shared reference to the HashMap
+// and Guard, and outputs shared references to keys and values.
+// Thus everything must be `Sync` for the iterator to be `Send`
+// or `Sync`.
+//
+// It is not possible to obtain an owned key, value, or guard
+// from an iterator, so `Send` is not a required bound.
+unsafe impl<K, V, S, G> Send for Drain<'_, K, V, S, G>
+where
+    K: Sync,
+    V: Sync,
+    S: Sync,
+    G: Sync,
+{
+}
+
+unsafe impl<K, V, S, G> Sync for Drain<'_, K, V, S, G>
+where
+    K: Sync,
+    V: Sync,
+    S: Sync,
+    G: Sync,
+{
+}
+
+impl<'a, K, V, S, G> Iterator for Drain<'a, K, V, S, G>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+    G: VerifiedGuard,
+{
+    type Item = V;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        let mut needs_resize_completion = false;
+
+        loop {
+            let table = self.current_table;
+
+            // Check if we've gone through all entries
+            if self.i >= table.len() {
+                // Check if there are any entries being copied that we need to handle
+                if needs_resize_completion {
+                    // Complete the resize and switch to the new table
+                    let new_table = self.map.help_copy(true, &table, self.guard);
+                    self.current_table = new_table;
+                    needs_resize_completion = false;
+                    self.i = 0;
+                    continue;
+                } else {
+                    self.finished = true;
+                    return None;
+                }
+            }
+
+            // Load the entry metadata first to ensure consistency
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
+            let meta = unsafe { table.meta(self.i) }.load(Ordering::Acquire);
+
+            // The entry is empty or deleted.
+            if matches!(meta, meta::EMPTY | meta::TOMBSTONE) {
+                self.i += 1;
+                continue;
+            }
+
+            // Load the entry.
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
+            let entry = self
+                .guard
+                .protect(unsafe { table.entry(self.i) }, Ordering::Acquire)
+                .unpack();
+
+            // The entry was deleted.
+            if entry.ptr.is_null() {
+                self.i += 1;
+                continue;
+            }
+
+            // Found a non-empty entry being copied.
+            if entry.tag() & Entry::<(), ()>::COPYING != 0 {
+                // Skip this entry for now, we'll handle it after the resize
+                self.i += 1;
+                needs_resize_completion = true;
+                continue;
+            }
+
+            // Try to delete the entry atomically.
+            //
+            // Safety: `self.i` is in bounds for the table length.
+            let result = unsafe {
+                table.entry(self.i).compare_exchange(
+                    entry.raw,
+                    Entry::TOMBSTONE,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                )
+            };
+
+            match result {
+                // Successfully deleted the entry.
+                Ok(_) => {
+                    // Update the metadata table.
+                    //
+                    // Safety: `self.i` is in bounds for the table length.
+                    unsafe { table.meta(self.i).store(meta::TOMBSTONE, Ordering::Release) };
+
+                    // Decrement the table length.
+                    self.map
+                        .count
+                        .get(self.guard)
+                        .fetch_sub(1, Ordering::Relaxed);
+
+                    // Safety: We performed a protected load of the pointer using a verified guard with
+                    // `Acquire` and ensured that it is non-null, meaning it is valid for reads as long
+                    // as we hold the guard.
+                    let entry_ref = unsafe { &(*entry.ptr) };
+
+                    // Extract the value before retiring the entry.
+                    let value = unsafe { ptr::read(&entry_ref.value) };
+
+                    // Safety: The entry is now unreachable from this table due to the CAS above.
+                    unsafe { self.map.defer_retire(entry, &table, self.guard) };
+
+                    self.i += 1;
+                    return Some(value);
+                }
+
+                // Lost to a concurrent update, retry without advancing i.
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
     }
 }
