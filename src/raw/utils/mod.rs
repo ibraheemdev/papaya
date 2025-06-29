@@ -67,6 +67,12 @@ where
     }
 }
 
+impl<G> core::fmt::Debug for MapGuard<G> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MapGuard").finish()
+    }
+}
+
 /// Pads and aligns a value to the length of a cache line.
 ///
 // Source: https://github.com/crossbeam-rs/crossbeam/blob/0f81a6957588ddca9973e32e92e7e94abdad801e/crossbeam-utils/src/cache_padded.rs#L63.

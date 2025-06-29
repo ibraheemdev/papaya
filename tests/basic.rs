@@ -31,6 +31,78 @@ fn clear() {
 }
 
 #[test]
+fn drain() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+        let guard = map.guard();
+
+        // Insert some values
+        map.insert(0, 10, &guard);
+        map.insert(1, 11, &guard);
+        map.insert(2, 12, &guard);
+        map.insert(3, 13, &guard);
+        map.insert(4, 14, &guard);
+
+        assert_eq!(map.len(), 5);
+
+        // Drain all values
+        let drained: Vec<_> = map.drain(&guard).collect();
+
+        // Map should be empty after drain
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        // Check that all values were drained
+        assert_eq!(drained.len(), 5);
+        assert!(drained.contains(&10));
+        assert!(drained.contains(&11));
+        assert!(drained.contains(&12));
+        assert!(drained.contains(&13));
+        assert!(drained.contains(&14));
+    });
+}
+
+#[test]
+fn drain_empty() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+
+        // Drain empty map
+        let drained: Vec<_> = map.drain(&map.guard()).collect();
+
+        assert!(map.is_empty());
+        assert_eq!(drained.len(), 0);
+    });
+}
+
+#[test]
+fn drain_pinned() {
+    with_map::<usize, usize>(|map| {
+        let map = map();
+
+        // Insert some values using pinned API
+        map.pin().insert(0, 100);
+        map.pin().insert(1, 200);
+        map.pin().insert(2, 300);
+
+        assert_eq!(map.len(), 3);
+
+        // Drain all values using pinned API
+        let drained: Vec<_> = map.pin().drain().collect();
+
+        // Map should be empty after drain
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        // Check that all values were drained
+        assert_eq!(drained.len(), 3);
+        assert!(drained.contains(&100));
+        assert!(drained.contains(&200));
+        assert!(drained.contains(&300));
+    });
+}
+
+#[test]
 fn insert() {
     with_map::<usize, usize>(|map| {
         let map = map();
