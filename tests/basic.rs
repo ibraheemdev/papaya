@@ -823,6 +823,37 @@ fn iter_mut() {
 }
 
 #[test]
+fn into_iter() {
+    if cfg!(papaya_stress) {
+        return;
+    }
+
+    with_map::<usize, String>(|map| {
+        let map = map();
+        let len = if cfg!(miri) { 100 } else { 10_000 };
+        for i in 0..len {
+            assert_eq!(map.pin().insert(i, (i + 1).to_string()), None);
+        }
+
+        let v: Vec<_> = (0..len).map(|i| (i, (i + 1).to_string())).collect();
+        let mut got: Vec<_> = map.into_iter().collect();
+        got.sort();
+        assert_eq!(v, got);
+    });
+
+    with_map::<usize, String>(|map| {
+        let map = map();
+        let len = if cfg!(miri) { 100 } else { 10_000 };
+        for i in 0..len {
+            assert_eq!(map.pin().insert(i, (i + 1).to_string()), None);
+        }
+
+        let got: Vec<_> = map.into_iter().take(len / 2).collect();
+        assert_eq!(got.len(), len / 2);
+    });
+}
+
+#[test]
 fn retain_empty() {
     with_map::<usize, usize>(|map| {
         let map = map();

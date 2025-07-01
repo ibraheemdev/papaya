@@ -107,7 +107,7 @@ fn insert_overwrite_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
@@ -188,7 +188,7 @@ fn update_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
@@ -307,7 +307,7 @@ fn update_or_insert_stress() {
     let threads = threads();
 
     let entries = (0..(threads * OPERATIONS))
-        .flat_map(|_| (0..ENTRIES))
+        .flat_map(|_| 0..ENTRIES)
         .collect::<Vec<_>>();
 
     let chunk = ENTRIES * OPERATIONS;
@@ -364,7 +364,7 @@ fn remove_update_or_insert_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
@@ -445,7 +445,7 @@ fn conditional_remove_update_or_insert_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
@@ -528,7 +528,7 @@ fn remove_if_update_or_insert_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
@@ -606,7 +606,7 @@ fn insert_remove_stress() {
 
     let entries = || {
         let mut entries = (0..(OPERATIONS))
-            .flat_map(|_| (0..ENTRIES))
+            .flat_map(|_| 0..ENTRIES)
             .collect::<Vec<_>>();
         let mut rng = rand::thread_rng();
         entries.shuffle(&mut rng);
