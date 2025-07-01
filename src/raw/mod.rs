@@ -4,7 +4,8 @@ mod probe;
 pub(crate) mod utils;
 
 use std::hash::{BuildHasher, Hash};
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::{hint, panic, ptr};
@@ -1222,13 +1223,41 @@ where
                 i: 0,
                 guard,
                 table: root,
+                _entries: PhantomData,
             };
         }
 
         // Get a clean copy of the table to iterate over.
         let table = self.linearize(root, guard);
 
-        Iter { i: 0, guard, table }
+        Iter {
+            i: 0,
+            guard,
+            table,
+            _entries: PhantomData,
+        }
+    }
+
+    /// Returns a mutable iterator over the keys and values of this table.
+    #[inline]
+    pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
+        // Safety: The root table is either null or a valid table allocation.
+        let table = unsafe { Table::from_raw(*self.table.get_mut()) };
+
+        // The table has not been initialized yet, return a dummy iterator.
+        if table.raw.is_null() {
+            return IterMut {
+                i: 0,
+                table,
+                _entries: PhantomData,
+            };
+        }
+
+        IterMut {
+            i: 0,
+            table,
+            _entries: PhantomData,
+        }
     }
 
     /// Returns the h1 and h2 hash for the given key.
@@ -1239,6 +1268,42 @@ where
     {
         let hash = self.hasher.hash_one(key);
         (meta::h1(hash), meta::h2(hash))
+    }
+}
+
+impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut map = ManuallyDrop::new(HashMap {
+            table: self.table,
+            collector: self.collector,
+            resize: self.resize,
+            count: self.count,
+            initial_capacity: self.initial_capacity,
+            hasher: (),
+        });
+
+        // Safety: The root table is either null or a valid table allocation.
+        let table = unsafe { Table::from_raw(*map.table.get_mut()) };
+
+        // The table has not been initialized yet, return a dummy iterator.
+        if table.raw.is_null() {
+            return IntoIter {
+                i: 0,
+                map,
+                table,
+                _entries: PhantomData,
+            };
+        }
+
+        IntoIter {
+            i: 0,
+            map,
+            table,
+            _entries: PhantomData,
+        }
     }
 }
 
@@ -2627,6 +2692,7 @@ pub struct Iter<'g, K, V, G> {
     i: usize,
     table: Table<Entry<K, V>>,
     guard: &'g G,
+    _entries: PhantomData<(&'g K, &'g V)>,
 }
 
 impl<'g, K: 'g, V: 'g, G> Iterator for Iter<'g, K, V, G>
@@ -2684,8 +2750,8 @@ where
     }
 }
 
-// Safety: An iterator holds a shared reference to the HashMap
-// and Guard, and outputs shared references to keys and values.
+// Safety: An iterator holds a shared reference to the `HashMap`
+// and `Guard`, and outputs shared references to keys and values.
 // Thus everything must be `Sync` for the iterator to be `Send`
 // or `Sync`.
 //
@@ -2714,42 +2780,268 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
             i: self.i,
             table: self.table,
             guard: self.guard,
+            _entries: PhantomData,
         }
     }
 }
 
-impl<K, V, S> Drop for HashMap<K, V, S> {
-    fn drop(&mut self) {
-        let mut raw = *self.table.get_mut();
+// A mutable iterator over the keys and values of this table.
+pub struct IterMut<'map, K, V> {
+    i: usize,
+    table: Table<Entry<K, V>>,
+    // Ensure invariance with respect to `V`.
+    _entries: PhantomData<(&'map K, &'map mut V)>,
+}
 
-        // Make sure all objects are reclaimed before the collector is dropped.
-        //
-        // Dropping a table depends on accessing the collector for deferred retirement,
-        // using the shared collector pointer that is invalidated by drop.
-        //
-        // Safety: We have a unique reference to the collector.
-        unsafe { self.collector.reclaim_all() };
+impl<'map, K, V> Iterator for IterMut<'map, K, V> {
+    type Item = (&'map K, &'map mut V);
 
-        // Drop all nested tables and entries.
-        while !raw.is_null() {
-            // Safety: The root and next tables are always valid pointers to a
-            // table allocation, or null.
-            let mut table = unsafe { Table::from_raw(raw) };
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_raw().map(|entry| {
+            // Safety: We have `&mut self`, and `IterMut::next_raw` is guaranteed to only yield non-null entries.
+            let entry_ref = unsafe { &mut *entry };
+            (&entry_ref.key, &mut entry_ref.value)
+        })
+    }
+}
 
-            // Read the next table pointer before dropping the current one.
-            let next = *table.state_mut().next.get_mut();
-
-            // Safety: We have unique access to the table and do
-            // not access the entries after this call.
-            unsafe { drop_entries(table) };
-
-            // Safety: We have unique access to the table and do
-            // not access it after this call.
-            unsafe { drop_table(table, &self.collector) };
-
-            // Continue for all nested tables.
-            raw = next;
+impl<'map, K, V> IterMut<'map, K, V> {
+    // Note that this method is guaranteed to only yield entry pointers that are valid for reads
+    // and writes.
+    #[inline]
+    fn next_raw(&mut self) -> Option<*mut Entry<K, V>> {
+        // The table has not yet been allocated.
+        if self.table.raw.is_null() {
+            return None;
         }
+
+        loop {
+            // Iterated over every entry in the table, proceed to a nested resize if there is one.
+            if self.i >= self.table.len() {
+                if let Some(next_table) = self.table.next_table() {
+                    self.i = 0;
+                    self.table = next_table;
+                    continue;
+                }
+
+                // Otherwise, we're done.
+                return None;
+            }
+
+            // Load the entry.
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
+            let entry = unsafe { self.table.entry_mut(self.i) }.unpack();
+
+            // The entry was deleted.
+            if entry.ptr.is_null() {
+                self.i += 1;
+                continue;
+            }
+
+            // The entry was copied, we'll yield it when iterating over the table it was copied to.
+            //
+            // We have a mutable reference to the table, so there are no concurrent removals that
+            // can lead to us yielding duplicate entries.
+            if entry.tag() & Entry::COPIED != 0 {
+                self.i += 1;
+                continue;
+            }
+
+            self.i += 1;
+
+            // Safety: We ensured the entry is non-null.
+            return Some(entry.ptr);
+        }
+    }
+
+    // Returns an immutable iterator over the remaining entries.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        let mut iter = IterMut {
+            i: self.i,
+            table: self.table,
+            _entries: PhantomData,
+        };
+
+        std::iter::from_fn(move || {
+            iter.next_raw().map(|entry| {
+                // Safety: `IterMut::next_raw` is guaranteed to only yield non-null entries.
+                let entry_ref = unsafe { &*entry };
+                (&entry_ref.key, &entry_ref.value)
+            })
+        })
+    }
+}
+
+// Safety: A mutable iterator does not perform any concurrent access,
+// so the normal `Send` and `Sync` rules apply.
+unsafe impl<K, V> Send for IterMut<'_, K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+unsafe impl<K, V> Sync for IterMut<'_, K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// An owned iterator over the keys and values of this table.
+pub struct IntoIter<K, V> {
+    i: usize,
+    table: Table<Entry<K, V>>,
+    map: ManuallyDrop<HashMap<K, V, ()>>,
+    _entries: PhantomData<(K, V)>,
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        // The table has not yet been allocated.
+        if self.table.raw.is_null() {
+            return None;
+        }
+
+        loop {
+            // Iterated over every entry in the table, proceed to a nested resize if there is one.
+            if self.i >= self.table.len() {
+                if let Some(next_table) = self.table.next_table() {
+                    // Drop the previous table.
+                    //
+                    // Safety: We have unique access to the table and do
+                    // not access it after this call.
+                    unsafe { drop_table(self.table, &self.map.collector) };
+
+                    // Reset the iterator for the next table.
+                    self.i = 0;
+                    self.table = next_table;
+                    continue;
+                }
+
+                // Otherwise, we're done.
+                return None;
+            }
+
+            // Load the entry.
+            //
+            // Safety: We verified that `self.i` is in-bounds above.
+            let entry = unsafe { self.table.entry_mut(self.i) }.unpack();
+
+            // The entry was deleted.
+            if entry.ptr.is_null() {
+                self.i += 1;
+                continue;
+            }
+
+            // The entry was copied, we'll yield it when iterating over the table it was copied to.
+            //
+            // We own the table, so there are no concurrent removals that can lead to us yielding
+            // duplicate entries.
+            if entry.tag() & Entry::COPIED != 0 {
+                self.i += 1;
+                continue;
+            }
+
+            // Safety: We ensured the entry is non-null. Additionally, we own the map
+            // and ensure not to drop already yielded entries.
+            let entry = unsafe { ptr::read(entry.ptr) };
+
+            self.i += 1;
+            return Some((entry.key, entry.value));
+        }
+    }
+}
+
+impl<K, V> IntoIter<K, V> {
+    // Returns an immutable iterator over the remaining entries.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> + '_ {
+        let mut iter = IterMut {
+            i: self.i,
+            table: self.table,
+            _entries: PhantomData,
+        };
+
+        std::iter::from_fn(move || {
+            iter.next_raw().map(|entry| {
+                // Safety: `IterMut::next_raw` is guaranteed to only yield non-null entries.
+                let entry_ref = unsafe { &*entry };
+                (&entry_ref.key, &entry_ref.value)
+            })
+        })
+    }
+}
+
+impl<K, V> Drop for IntoIter<K, V> {
+    fn drop(&mut self) {
+        // Drop the remaining elements that have not been yielded.
+        drop_parts(self.i, self.table.raw, &mut self.map.collector);
+    }
+}
+
+// Safety: An owned iterator does not perform any concurrent access,
+// so the normal `Send` and `Sync` rules apply.
+unsafe impl<K, V> Send for IntoIter<K, V>
+where
+    K: Send,
+    V: Send,
+{
+}
+
+unsafe impl<K, V> Sync for IntoIter<K, V>
+where
+    K: Sync,
+    V: Sync,
+{
+}
+
+// Drop the `HashMap`.
+//
+// `HashMap` doesn't implement `Drop` due to the need for destructuring into
+// an `IntoIter`, so this method is used instead.
+pub fn drop_map<K, V, S>(mut map: HashMap<K, V, S>) {
+    drop_parts(0, *map.table.get_mut(), &mut map.collector);
+}
+
+// Drop the elements of a `HashMap`.
+fn drop_parts<K, V>(
+    mut start: usize,
+    mut raw: *mut RawTable<Entry<K, V>>,
+    collector: &mut Collector,
+) {
+    // Make sure all objects are reclaimed before the collector is dropped.
+    //
+    // Dropping a table depends on accessing the collector for deferred retirement,
+    // using the shared collector pointer that is invalidated by drop.
+    //
+    // Safety: We have a unique reference to the collector.
+    unsafe { collector.reclaim_all() };
+
+    // Drop all nested tables and entries.
+    while !raw.is_null() {
+        // Safety: The root and next tables are always valid pointers to a
+        // table allocation, or null.
+        let mut table = unsafe { Table::from_raw(raw) };
+
+        // Read the next table pointer before dropping the current one.
+        let next = *table.state_mut().next.get_mut();
+
+        // Safety: We have unique access to the table and do
+        // not access the entries after this call.
+        unsafe { drop_entries(start, table) };
+
+        // Safety: We have unique access to the table and do
+        // not access it after this call.
+        unsafe { drop_table(table, collector) };
+
+        // Continue for all nested tables.
+        raw = next;
+        start = 0;
     }
 }
 
@@ -2758,8 +3050,8 @@ impl<K, V, S> Drop for HashMap<K, V, S> {
 // # Safety
 //
 // The table entries must not be accessed after this call.
-unsafe fn drop_entries<K, V>(table: Table<Entry<K, V>>) {
-    for i in 0..table.len() {
+unsafe fn drop_entries<K, V>(start: usize, table: Table<Entry<K, V>>) {
+    for i in start..table.len() {
         // Safety: `i` is in-bounds and we have unique access to the table.
         let entry = unsafe { (*table.entry(i).as_ptr()).unpack() };
 
