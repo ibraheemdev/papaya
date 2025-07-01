@@ -7,6 +7,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::mem::ManuallyDrop;
 
 /// A concurrent hash table.
 ///
@@ -14,7 +15,14 @@ use std::marker::PhantomData;
 /// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
 pub struct HashMap<K, V, S = RandomState> {
-    raw: raw::HashMap<K, V, S>,
+    raw: ManuallyDrop<raw::HashMap<K, V, S>>,
+}
+
+impl<K, V, S> Drop for HashMap<K, V, S> {
+    fn drop(&mut self) {
+        // Safety: We don't access `self` after taking the inner map.
+        raw::drop_map(unsafe { ManuallyDrop::take(&mut self.raw) });
+    }
 }
 
 // Safety: `HashMap` acts as a single-threaded collection on a single thread.
@@ -131,7 +139,12 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
     /// Construct a [`HashMap`] from the builder, using the configured options.
     pub fn build(self) -> HashMap<K, V, S> {
         HashMap {
-            raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
+            raw: ManuallyDrop::new(raw::HashMap::new(
+                self.capacity,
+                self.hasher,
+                self.collector,
+                self.resize_mode,
+            )),
         }
     }
 }
@@ -251,7 +264,7 @@ impl<K, V, S> HashMap<K, V, S> {
     ///
     /// Warning: `hash_builder` is normally randomly generated, and is designed
     /// to allow HashMaps to be resistant to attacks that cause many collisions
-    /// and very poor performance. Setting it manually using this function can
+    /// and very actuallypoor performance. Setting it manually using this function can
     /// expose a DoS attack vector.
     ///
     /// The `hash_builder` passed should implement the [`BuildHasher`] trait for
@@ -298,12 +311,12 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashMap<K, V, S> {
         HashMap {
-            raw: raw::HashMap::new(
+            raw: ManuallyDrop::new(raw::HashMap::new(
                 capacity,
                 hash_builder,
                 Collector::default(),
                 ResizeMode::default(),
-            ),
+            )),
         }
     }
 
@@ -1100,6 +1113,37 @@ where
     }
 }
 
+impl<K, V, S> IntoIterator for HashMap<K, V, S> {
+    type Item = (K, V);
+    type IntoIter = IntoIter<K, V>;
+
+    /// Creates a consuming iterator, that is, one that moves each key-value
+    /// pair out of the map in arbitrary order. The map cannot be used after
+    /// calling this.
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::from([
+    ///     ("a", 1),
+    ///     ("b", 2),
+    ///     ("c", 3),
+    /// ]);
+    ///
+    /// let v: Vec<(&str, i32)> = map.into_iter().collect();
+    /// ```
+    fn into_iter(self) -> Self::IntoIter {
+        let mut map = ManuallyDrop::new(self);
+
+        // Safety: We don't access `self` after taking the inner map.
+        let raw = unsafe { ManuallyDrop::take(&mut map.raw) };
+
+        IntoIter {
+            raw: raw.into_iter(),
+        }
+    }
+}
+
 /// An operation to perform on given entry in a [`HashMap`].
 ///
 /// See [`HashMap::compute`] for details.
@@ -1194,7 +1238,8 @@ where
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
-        // from `hashbrown::HashMap::extend`:
+        // From `hashbrown::HashMap::extend`:
+        //
         // Keys may be already present or show multiple times in the iterator.
         // Reserve the entire hint lower bound if the map is empty.
         // Otherwise reserve half the hint (rounded up), so the map
@@ -1620,6 +1665,14 @@ where
     }
 }
 
+impl<K, V, G> Clone for Iter<'_, K, V, G> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+        }
+    }
+}
+
 impl<K, V, G> fmt::Debug for Iter<'_, K, V, G>
 where
     K: fmt::Debug,
@@ -1627,11 +1680,7 @@ where
     G: Guard,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(Iter {
-                raw: self.raw.clone(),
-            })
-            .finish()
+        f.debug_list().entries(self.raw.clone()).finish()
     }
 }
 
@@ -1657,12 +1706,7 @@ where
     V: fmt::Debug,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(IterMut {
-                // Safety: We only create a single clone.
-                raw: unsafe { self.raw.clone() },
-            })
-            .finish()
+        f.debug_list().entries(self.raw.iter()).finish()
     }
 }
 
@@ -1725,5 +1769,34 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Values").field(&self.iter).finish()
+    }
+}
+
+/// An owned iterator over the entries of a `HashMap`.
+///
+/// This `struct` is created by the [`into_iter`] method on [`HashMap`]
+/// (provided by the [`IntoIterator`] trait). See its documentation for more.
+///
+/// [`into_iter`]: IntoIterator::into_iter
+pub struct IntoIter<K, V> {
+    pub(crate) raw: raw::IntoIter<K, V>,
+}
+
+impl<K, V> Iterator for IntoIter<K, V> {
+    type Item = (K, V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next()
+    }
+}
+
+impl<K, V> fmt::Debug for IntoIter<K, V>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.raw.iter()).finish()
     }
 }
