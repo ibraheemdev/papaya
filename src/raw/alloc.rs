@@ -3,7 +3,8 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicPtr, AtomicU8, Ordering};
 use std::{alloc, mem, ptr};
 
-use super::{probe, State};
+use super::probe;
+use super::table::{meta, State};
 
 // A hash-table laid out in a single allocation.
 //
@@ -88,7 +89,7 @@ impl<T> Table<T> {
             // Initialize the meta table.
             ptr.add(mem::size_of::<TableLayout<T>>())
                 .cast::<u8>()
-                .write_bytes(super::meta::EMPTY, len);
+                .write_bytes(meta::EMPTY, len);
         }
 
         Table {
@@ -155,6 +156,25 @@ impl<T> Table<T> {
             let entries = meta.add(self.len()).cast::<AtomicPtr<T>>();
             &*entries.add(i)
         }
+    }
+
+    // Returns the entry at the given index.
+    //
+    // # Safety
+    //
+    // The index must be in-bounds for the length of the table.
+    #[inline]
+    pub unsafe fn entry_mut(&mut self, i: usize) -> *mut T {
+        debug_assert!(i < self.len());
+
+        // Safety: The caller guarantees the index is in-bounds.
+        let entry = unsafe {
+            let meta = self.raw.add(mem::size_of::<TableLayout<T>>());
+            let entries = meta.add(self.len()).cast::<AtomicPtr<T>>();
+            &mut *entries.add(i)
+        };
+
+        *entry.get_mut()
     }
 
     /// Returns the length of the table.
