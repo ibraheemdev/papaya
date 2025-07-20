@@ -526,7 +526,7 @@ where
     /// ```
     /// use papaya::HashSet;
     ///
-    /// let mut set: HashSet<i32> = (0..8).collect();
+    /// let set: HashSet<i32> = (0..8).collect();
     /// set.pin().retain(|&v| v % 2 == 0);
     /// assert_eq!(set.len(), 4);
     /// assert_eq!(set.pin().contains(&1), false);

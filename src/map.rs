@@ -1500,7 +1500,7 @@ where
     ///
     /// See [`HashMap::retain`] for details.
     #[inline]
-    pub fn retain<F>(&mut self, f: F)
+    pub fn retain<F>(&self, f: F)
     where
         F: FnMut(&K, &V) -> bool,
     {
