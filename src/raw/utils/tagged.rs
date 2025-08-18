@@ -1,5 +1,9 @@
-use std::mem::align_of;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::{
+    marker::PhantomData,
+    sync::atomic::{AtomicPtr, Ordering},
+};
+
+use crate::raw::table::Entry;
 
 // Polyfill for the unstable strict-provenance APIs.
 #[allow(clippy::missing_safety_doc)]
@@ -7,19 +11,21 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 pub unsafe trait StrictProvenance<T>: Sized {
     fn addr(self) -> usize;
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
-    fn unpack(self) -> Tagged<T>
+    fn unpack<U>(self) -> Tagged<T, U>
     where
-        T: Unpack;
+        U: Unpack;
+
+    // This constant, if used, will fail to compile if `T` doesn't have an alignment
+    // that guarantees all valid pointers have zero in the bits excluded by `T::MASK`.
+    //
+    // TODO: Make this generic over `T`.
+    const ASSERT_ALIGNMENT: () = assert!(align_of::<Self>() > !Entry::MASK);
 }
 
 // Unpack a tagged pointer.
 pub trait Unpack: Sized {
     // A mask for the pointer tag bits.
     const MASK: usize;
-
-    // This constant, if used, will fail to compile if T doesn't have an alignment
-    // that guarantees all valid pointers have zero in the bits excluded by T::MASK.
-    const ASSERT_ALIGNMENT: () = assert!(align_of::<Self>() > !Self::MASK);
 }
 
 unsafe impl<T> StrictProvenance<T> for *mut T {
@@ -34,44 +40,49 @@ unsafe impl<T> StrictProvenance<T> for *mut T {
     }
 
     #[inline(always)]
-    fn unpack(self) -> Tagged<T>
+    fn unpack<U>(self) -> Tagged<T, U>
     where
-        T: Unpack,
+        U: Unpack,
     {
-        let () = T::ASSERT_ALIGNMENT;
+        let () = Self::ASSERT_ALIGNMENT;
+
         Tagged {
             raw: self,
-            ptr: self.map_addr(|addr| addr & T::MASK),
+            ptr: self.map_addr(|addr| addr & Entry::MASK),
+            _unpack: PhantomData,
         }
     }
 }
 
 // An unpacked tagged pointer.
-pub struct Tagged<T> {
+pub struct Tagged<T, U> {
     // The raw tagged pointer.
     pub raw: *mut T,
 
     // The untagged pointer.
     pub ptr: *mut T,
+
+    _unpack: PhantomData<U>,
 }
 
 // Creates a `Tagged` from an untagged pointer.
 #[inline]
-pub fn untagged<T>(value: *mut T) -> Tagged<T> {
+pub fn untagged<T, U>(value: *mut T) -> Tagged<T, U> {
     Tagged {
         raw: value,
         ptr: value,
+        _unpack: PhantomData,
     }
 }
 
-impl<T> Tagged<T>
+impl<T, U> Tagged<T, U>
 where
-    T: Unpack,
+    U: Unpack,
 {
     // Returns the tag portion of this pointer.
     #[inline]
     pub fn tag(self) -> usize {
-        self.raw.addr() & !T::MASK
+        self.raw.addr() & !U::MASK
     }
 
     // Maps the tag of this pointer.
@@ -80,13 +91,14 @@ where
         Tagged {
             raw: self.raw.map_addr(f),
             ptr: self.ptr,
+            _unpack: PhantomData,
         }
     }
 }
 
-impl<T> Copy for Tagged<T> {}
+impl<T, U> Copy for Tagged<T, U> {}
 
-impl<T> Clone for Tagged<T> {
+impl<T, U> Clone for Tagged<T, U> {
     fn clone(&self) -> Self {
         *self
     }
