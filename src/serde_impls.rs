@@ -1,21 +1,28 @@
+use seize::Collector;
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use std::borrow::Borrow;
 use std::fmt::{self, Formatter};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::{Guard, HashMap, HashMapRef, HashSet, HashSetRef};
 
-struct MapVisitor<K, V, S> {
-    _marker: PhantomData<HashMap<K, V, S>>,
+struct MapVisitor<K, V, S, C = Collector>
+where
+    C: Borrow<Collector>,
+{
+    _marker: PhantomData<HashMap<K, V, S, C>>,
 }
 
-impl<K, V, S, G> Serialize for HashMapRef<'_, K, V, S, G>
+impl<K, V, S, C, G> Serialize for HashMapRef<'_, K, V, S, C, G>
 where
     K: Serialize + Hash + Eq,
     V: Serialize,
     G: Guard,
+    C: Borrow<Collector>,
     S: BuildHasher,
 {
     fn serialize<Sr>(&self, serializer: Sr) -> Result<Sr::Ok, Sr::Error>
@@ -26,11 +33,12 @@ where
     }
 }
 
-impl<K, V, S> Serialize for HashMap<K, V, S>
+impl<K, V, S, C> Serialize for HashMap<K, V, S, C>
 where
     K: Serialize + Hash + Eq,
     V: Serialize,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn serialize<Sr>(&self, serializer: Sr) -> Result<Sr::Ok, Sr::Error>
     where
@@ -94,13 +102,17 @@ where
     }
 }
 
-struct SetVisitor<K, S> {
-    _marker: PhantomData<HashSet<K, S>>,
+struct SetVisitor<K, S, C>
+where
+    C: Borrow<Collector>,
+{
+    _marker: PhantomData<HashSet<K, S, C>>,
 }
 
-impl<K, S, G> Serialize for HashSetRef<'_, K, S, G>
+impl<K, S, C, G> Serialize for HashSetRef<'_, K, S, C, G>
 where
     K: Serialize + Hash + Eq,
+    C: Borrow<Collector>,
     G: Guard,
     S: BuildHasher,
 {
@@ -112,10 +124,11 @@ where
     }
 }
 
-impl<K, S> Serialize for HashSet<K, S>
+impl<K, S, C> Serialize for HashSet<K, S, C>
 where
     K: Serialize + Hash + Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn serialize<Sr>(&self, serializer: Sr) -> Result<Sr::Ok, Sr::Error>
     where
@@ -134,19 +147,39 @@ where
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_seq(SetVisitor::new())
+        deserializer.deserialize_seq(SetVisitor::<K, S, Collector>::new())
     }
 }
 
-impl<K, S> SetVisitor<K, S> {
+impl<'de, K, S> Deserialize<'de> for HashSet<K, S, Arc<Collector>>
+where
+    K: Deserialize<'de> + Hash + Eq + Send + 'static,
+    S: Default + BuildHasher,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(SetVisitor::<K, S, Arc<Collector>>::new())
+    }
+}
+
+impl<K, S> SetVisitor<K, S, Collector> {
     pub(crate) fn new() -> Self {
         Self {
             _marker: PhantomData,
         }
     }
 }
+impl<K, S> SetVisitor<K, S, Arc<Collector>> {
+    pub(crate) fn new() -> SetVisitor<K, S, Arc<Collector>> {
+        Self {
+            _marker: PhantomData,
+        }
+    }
+}
 
-impl<'de, K, S> Visitor<'de> for SetVisitor<K, S>
+impl<'de, K, S> Visitor<'de> for SetVisitor<K, S, Collector>
 where
     K: Deserialize<'de> + Hash + Eq,
     S: Default + BuildHasher,
@@ -164,6 +197,45 @@ where
         let values = match access.size_hint() {
             Some(size) => HashSet::with_capacity_and_hasher(size, S::default()),
             None => HashSet::default(),
+        };
+
+        {
+            let values = values.pin();
+            while let Some(key) = access.next_element()? {
+                values.insert(key);
+            }
+        }
+
+        Ok(values)
+    }
+}
+
+impl<'de, K, S> Visitor<'de> for SetVisitor<K, S, Arc<Collector>>
+where
+    K: Deserialize<'de> + Hash + Eq + Send + 'static,
+    S: Default + BuildHasher,
+{
+    type Value = HashSet<K, S, Arc<Collector>>;
+
+    fn expecting(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "a set")
+    }
+
+    fn visit_seq<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+    where
+        M: SeqAccess<'de>,
+    {
+        let values = match access.size_hint() {
+            Some(size) => HashSet::builder()
+                .hasher(S::default())
+                .shared_collector(Arc::new(Collector::new()))
+                .capacity(size)
+                .build(),
+            None => HashSet::builder()
+                .hasher(S::default())
+                .shared_collector(Arc::new(Collector::new()))
+                .capacity(0)
+                .build(),
         };
 
         {
