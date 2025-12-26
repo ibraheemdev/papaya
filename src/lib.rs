@@ -240,4 +240,4 @@ pub use map::{
     Values,
 };
 pub use seize::{Guard, LocalGuard, OwnedGuard};
-pub use set::{HashSet, HashSetBuilder, HashSetRef};
+pub use set::{HashSet, HashSetBuilder, HashSetRef, Iter as IterSet};
