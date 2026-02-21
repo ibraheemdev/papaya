@@ -807,7 +807,7 @@ where
     ///
     /// See [`HashSet::retain`] for details.
     #[inline]
-    pub fn retain<F>(&mut self, mut f: F)
+    pub fn retain<F>(&self, mut f: F)
     where
         F: FnMut(&K) -> bool,
     {
