@@ -1,6 +1,6 @@
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::thread::{self, Thread};
 
 // A simple thread parker.
@@ -45,11 +45,12 @@ impl Parker {
 
             // Insert our thread into the parker.
             let id = {
-                let state = &mut *self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 state.count += 1;
 
+                let current_count = state.count;
                 let threads = state.threads.entry(key).or_default();
-                threads.insert(state.count, thread::current());
+                threads.insert(current_count, thread::current());
 
                 state.count
             };
@@ -61,7 +62,7 @@ impl Parker {
             if !should_park(atomic.load(Ordering::SeqCst)) {
                 // Don't need to park, remove our thread if it wasn't already unparked.
                 let thread = {
-                    let mut state = self.state.lock().unwrap();
+                    let mut state = self.state.lock();
                     state
                         .threads
                         .get_mut(&key)
@@ -79,11 +80,11 @@ impl Parker {
             loop {
                 thread::park();
 
-                let mut state = self.state.lock().unwrap();
+                let mut state = self.state.lock();
                 if !state
                     .threads
                     .get_mut(&key)
-                    .is_some_and(|threads| threads.contains_key(&id))
+                    .is_some_and(|threads: &mut HashMap<u64, Thread>| threads.contains_key(&id))
                 {
                     break;
                 }
@@ -116,7 +117,7 @@ impl Parker {
 
         // Remove and unpark any threads waiting on the atomic.
         let threads = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.state.lock();
             state.threads.remove(&key)
         };
 
