@@ -11,7 +11,10 @@ use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
 use self::probe::Probe;
+
+#[allow(unused_imports)] // Contains polyfills for APIs that stabilized after MSRV.
 use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, StrictProvenance, Tagged};
+
 use crate::map::{Compute, Operation, ResizeMode};
 use crate::Equivalent;
 
