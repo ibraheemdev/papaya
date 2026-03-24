@@ -234,8 +234,10 @@ impl<K, V, S> HashMap<K, V, S> {
             };
         }
 
+        let capacity = probe::entries_for(capacity);
+
         // Initialize the table and mark it as the root.
-        let mut table = Table::alloc(probe::entries_for(capacity));
+        let mut table = Table::alloc(capacity);
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
         HashMap {
