@@ -2072,7 +2072,7 @@ where
                         let allocated = self.get_or_alloc_next(None, next);
 
                         // Wake anyone waiting for us to finish.
-                        let state = table.state();
+                        let state = next.state();
                         state.parker.unpark(&state.status);
 
                         // Retry in a new table.
