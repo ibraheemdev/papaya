@@ -227,17 +227,16 @@
 // Clippy trips up with pollyfills.
 #![allow(clippy::incompatible_msrv)]
 
-mod map;
+pub mod map;
 mod raw;
-mod set;
+pub mod set;
 
 #[cfg(feature = "serde")]
 mod serde_impls;
 
-pub use equivalent::Equivalent;
-pub use map::{
-    Compute, HashMap, HashMapBuilder, HashMapRef, Iter, Keys, OccupiedError, Operation, ResizeMode,
-    Values,
+pub use crate::map::{
+    Compute, HashMap, HashMapBuilder, HashMapRef, OccupiedError, Operation, ResizeMode,
 };
+pub use equivalent::Equivalent;
 pub use seize::{Guard, LocalGuard, OwnedGuard};
-pub use set::{HashSet, HashSetBuilder, HashSetRef, Iter as IterSet};
+pub use set::{HashSet, HashSetBuilder, HashSetRef};
