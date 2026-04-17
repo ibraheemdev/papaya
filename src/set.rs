@@ -1,3 +1,4 @@
+//! A fast and ergonomic concurrent hash-set for read-heavy workloads.
 use crate::raw::utils::MapGuard;
 use crate::raw::{self, InsertResult};
 use crate::Equivalent;
@@ -807,7 +808,7 @@ where
     ///
     /// See [`HashSet::retain`] for details.
     #[inline]
-    pub fn retain<F>(&mut self, mut f: F)
+    pub fn retain<F>(&self, mut f: F)
     where
         F: FnMut(&K) -> bool,
     {
