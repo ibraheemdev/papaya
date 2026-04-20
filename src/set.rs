@@ -833,6 +833,17 @@ where
             raw: self.set.raw.iter(&self.guard),
         }
     }
+
+    /// Returns a parallel iterator over all values in arbitrary order.
+    ///
+    /// Requires the `rayon` feature.
+    #[cfg(feature = "rayon")]
+    #[inline]
+    pub fn par_iter(&self) -> ParIter<'_, K, G> {
+        ParIter {
+            inner: self.set.raw.par_iter(&self.guard),
+        }
+    }
 }
 
 impl<K, S, G> fmt::Debug for HashSetRef<'_, K, S, G>
@@ -860,11 +871,51 @@ where
     }
 }
 
+#[cfg(feature = "rayon")]
+impl<'a, K, S, G> rayon::iter::IntoParallelIterator for &'a HashSetRef<'_, K, S, G>
+where
+    K: Hash + Eq + Sync,
+    S: BuildHasher,
+    G: Guard + Sync,
+{
+    type Item = &'a K;
+    type Iter = ParIter<'a, K, G>;
+
+    fn into_par_iter(self) -> Self::Iter {
+        ParIter {
+            inner: self.set.raw.par_iter(&self.guard),
+        }
+    }
+}
+
 /// An iterator over a set's entries.
 ///
 /// This struct is created by the [`iter`](HashSet::iter) method on [`HashSet`]. See its documentation for details.
 pub struct Iter<'g, K, G> {
     raw: raw::Iter<'g, K, (), MapGuard<G>>,
+}
+
+#[cfg(feature = "rayon")]
+/// A parallel iterator over a set's entries.
+#[derive(Debug)]
+pub struct ParIter<'g, K, G> {
+    inner: raw::ParIter<'g, K, (), MapGuard<G>>,
+}
+
+#[cfg(feature = "rayon")]
+impl<'g, K, G> rayon::iter::ParallelIterator for ParIter<'g, K, G>
+where
+    K: Sync + 'g,
+    G: Guard + Sync,
+{
+    type Item = &'g K;
+
+    fn drive_unindexed<C>(self, consumer: C) -> C::Result
+    where
+        C: rayon::iter::plumbing::UnindexedConsumer<Self::Item>,
+    {
+        self.inner.map(|(k, _)| k).drive_unindexed(consumer)
+    }
 }
 
 impl<'g, K: 'g, G> Iterator for Iter<'g, K, G>
