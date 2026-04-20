@@ -946,6 +946,38 @@ where
         self.raw.clear(self.raw.verify(guard))
     }
 
+    /// Drains the map, removing all key-value pairs and returning an iterator
+    /// over the removed values.
+    ///
+    /// The iterator yields values in arbitrary order. The key-value pairs are
+    /// removed even if the iterator is not consumed entirely.
+    ///
+    /// Note that this method will block until any in-progress resizes are
+    /// completed before proceeding. See the [consistency](crate#consistency)
+    /// section for details.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashMap;
+    ///
+    /// let map = HashMap::new();
+    /// map.pin().insert(1, "a");
+    /// map.pin().insert(2, "b");
+    ///
+    /// let values: Vec<_> = map.pin().drain().collect();
+    /// assert_eq!(values.len(), 2);
+    /// assert!(values.contains(&"a"));
+    /// assert!(values.contains(&"b"));
+    /// assert!(map.is_empty());
+    /// ```
+    #[inline]
+    pub fn drain<'g, G: Guard>(&'g self, guard: &'g G) -> Drain<'g, K, V, S, G> {
+        Drain {
+            raw: self.raw.drain(self.raw.verify(guard)),
+        }
+    }
+
     /// Retains only the elements specified by the predicate.
     ///
     /// In other words, remove all pairs `(k, v)` for which `f(&k, &v)` returns `false`.
@@ -1496,6 +1528,17 @@ where
         self.map.raw.clear(&self.guard)
     }
 
+    /// Drains the map, removing all key-value pairs and returning an iterator
+    /// over the removed values.
+    ///
+    /// See [`HashMap::drain`] for details.
+    #[inline]
+    pub fn drain(&self) -> Drain<K, V, S, MapGuard<G>> {
+        Drain {
+            raw: self.map.raw.drain(self.map.raw.verify(&self.guard)),
+        }
+    }
+
     /// Retains only the elements specified by the predicate.
     ///
     /// See [`HashMap::retain`] for details.
@@ -1665,5 +1708,37 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Values").field(&self.iter).finish()
+    }
+}
+
+/// An iterator over the values of a drained map.
+///
+/// This struct is created by the [`drain`](HashMap::drain) method on [`HashMap`]. See its documentation for details.
+pub struct Drain<'a, K, V, S, G> {
+    raw: raw::Drain<'a, K, V, S, MapGuard<G>>,
+}
+
+impl<'a, K, V, S, G> Iterator for Drain<'a, K, V, S, G>
+where
+    K: Hash + Eq,
+    S: BuildHasher,
+    G: Guard,
+{
+    type Item = V;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.raw.next()
+    }
+}
+
+impl<K, V, S, G> fmt::Debug for Drain<'_, K, V, S, G>
+where
+    K: fmt::Debug,
+    V: fmt::Debug,
+    G: Guard,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Drain").field(&"...").finish()
     }
 }
