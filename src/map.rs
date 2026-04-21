@@ -3,24 +3,29 @@ use crate::raw::{self, InsertResult};
 use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
+use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// A concurrent hash table.
 ///
 /// Most hash table operations require a [`Guard`](crate::Guard), which can be acquired through
 /// [`HashMap::guard`] or using the [`HashMap::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
-pub struct HashMap<K, V, S = RandomState> {
-    raw: raw::HashMap<K, V, S>,
+pub struct HashMap<K, V, S = RandomState, C = Collector>
+where
+    C: Borrow<Collector>,
+{
+    raw: raw::HashMap<K, V, S, C>,
 }
 
 // Safety: `HashMap` acts as a single-threaded collection on a single thread.
 // References to keys and values cannot outlive the map's lifetime on a given
 // thread.
-unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
+unsafe impl<K: Send, V: Send, S: Send, C: Send + Borrow<Collector>> Send for HashMap<K, V, S, C> {}
 
 // Safety: We only ever hand out `&{K, V}` through shared references to the map,
 // and never `&mut {K, V}` except through synchronized memory reclamation.
@@ -33,7 +38,7 @@ unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
 // so multiple threads cannot be involved in reclamation without sharing the
 // `HashMap` itself. If this was not true, we would require stricter bounds
 // on `HashMap` operations themselves.
-unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {}
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync, C: Sync + Borrow<Collector>> Sync for HashMap<K, V, S, C> {}
 
 /// A builder for a [`HashMap`].
 ///
@@ -56,10 +61,13 @@ unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {
 ///     // Construct the hash map.
 ///     .build();
 /// ```
-pub struct HashMapBuilder<K, V, S = RandomState> {
+pub struct HashMapBuilder<K, V, S = RandomState, C = Collector>
+where
+    C: Borrow<Collector>,
+{
     hasher: S,
     capacity: usize,
-    collector: Collector,
+    collector: C,
     resize_mode: ResizeMode,
     _kv: PhantomData<(K, V)>,
 }
@@ -86,12 +94,58 @@ impl<K, V> HashMapBuilder<K, V> {
 }
 
 impl<K, V, S> HashMapBuilder<K, V, S> {
+    /// Set the [`seize::Collector`] used for garbage collection.
+    ///
+    /// This method may be useful when you want more control over garbage collection.
+    ///
+    /// Note that all `Guard` references used to access the map must be produced by
+    /// the provided `collector`.
+    pub fn collector(self, collector: Collector) -> HashMapBuilder<K, V, S> {
+        HashMapBuilder {
+            collector,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+}
+impl<K, V, S> HashMapBuilder<K, V, S>
+where
+    K: Send + 'static,
+    V: Send + 'static,
+{
+    /// Set a shared `Arc<seize::Collector>` used for garbage collection.
+    ///
+    /// This method may be useful when wanting to utilize a single [`seize::Collector`] across
+    /// different `HashMap` contained in a single structure.
+    ///
+    /// Note that to ensure the `HashMap` are reclaimed, the `Arc<seize::Collector>` must be dropped, so
+    /// it should not be owned indefinitely.
+    pub fn shared_collector(
+        self,
+        collector: Arc<Collector>,
+    ) -> HashMapBuilder<K, V, S, Arc<Collector>> {
+        HashMapBuilder {
+            collector,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+}
+
+impl<K, V, S, C> HashMapBuilder<K, V, S, C>
+where
+    C: Borrow<Collector>,
+{
     /// Set the initial capacity of the map.
     ///
     /// The table should be able to hold at least `capacity` elements before resizing.
     /// However, the capacity is an estimate, and the table may prematurely resize due
     /// to poor hash distribution. If `capacity` is 0, the hash map will not allocate.
-    pub fn capacity(self, capacity: usize) -> HashMapBuilder<K, V, S> {
+    pub fn capacity(self, capacity: usize) -> HashMapBuilder<K, V, S, C> {
         HashMapBuilder {
             capacity,
             hasher: self.hasher,
@@ -112,24 +166,8 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
         }
     }
 
-    /// Set the [`seize::Collector`] used for garbage collection.
-    ///
-    /// This method may be useful when you want more control over garbage collection.
-    ///
-    /// Note that all `Guard` references used to access the map must be produced by
-    /// the provided `collector`.
-    pub fn collector(self, collector: Collector) -> Self {
-        HashMapBuilder {
-            collector,
-            hasher: self.hasher,
-            capacity: self.capacity,
-            resize_mode: self.resize_mode,
-            _kv: PhantomData,
-        }
-    }
-
     /// Construct a [`HashMap`] from the builder, using the configured options.
-    pub fn build(self) -> HashMap<K, V, S> {
+    pub fn build(self) -> HashMap<K, V, S, C> {
         HashMap {
             raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
         }
@@ -199,7 +237,7 @@ impl<K, V> HashMap<K, V> {
     /// let map: HashMap<&str, i32> = HashMap::new();
     /// ```
     pub fn new() -> HashMap<K, V> {
-        HashMap::with_capacity_and_hasher(0, RandomState::new())
+        HashMap::with_capacity_and_hasher(0, RandomState::default())
     }
 
     /// Creates an empty `HashMap` with the specified capacity.
@@ -218,9 +256,8 @@ impl<K, V> HashMap<K, V> {
     /// let map: HashMap<&str, i32> = HashMap::with_capacity(10);
     /// ```
     pub fn with_capacity(capacity: usize) -> HashMap<K, V> {
-        HashMap::with_capacity_and_hasher(capacity, RandomState::new())
+        HashMap::with_capacity_and_hasher(capacity, RandomState::default())
     }
-
     /// Returns a builder for a `HashMap`.
     ///
     /// The builder can be used for more complex configuration, such as using
@@ -229,19 +266,32 @@ impl<K, V> HashMap<K, V> {
         HashMapBuilder {
             capacity: 0,
             hasher: RandomState::default(),
-            collector: Collector::new(),
+            collector: Collector::default(),
             resize_mode: ResizeMode::default(),
             _kv: PhantomData,
         }
     }
 }
-
 impl<K, V, S> Default for HashMap<K, V, S>
 where
     S: Default,
 {
     fn default() -> Self {
         HashMap::with_hasher(S::default())
+    }
+}
+
+impl<K, V, S> Default for HashMap<K, V, S, Arc<Collector>>
+where
+    S: Default,
+    K: Send + 'static,
+    V: Send + 'static,
+{
+    fn default() -> Self {
+        HashMap::builder()
+            .hasher(S::default())
+            .shared_collector(Arc::new(Collector::new()))
+            .build()
     }
 }
 
@@ -268,7 +318,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// map.pin().insert(1, 2);
     /// ```
     pub fn with_hasher(hash_builder: S) -> HashMap<K, V, S> {
-        HashMap::with_capacity_and_hasher(0, hash_builder)
+        HashMap::<K, V, S>::with_capacity_and_hasher(0, hash_builder)
     }
 
     /// Creates an empty `HashMap` with at least the specified capacity, using
@@ -291,7 +341,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// ```
     /// use papaya::HashMap;
     /// use std::hash::RandomState;
-    ///
+    //
     /// let s = RandomState::new();
     /// let map = HashMap::with_capacity_and_hasher(10, s);
     /// map.pin().insert(1, 2);
@@ -306,13 +356,18 @@ impl<K, V, S> HashMap<K, V, S> {
             ),
         }
     }
+}
 
+impl<K, V, S, C> HashMap<K, V, S, C>
+where
+    C: Borrow<Collector>,
+{
     /// Returns a pinned reference to the map.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
-    pub fn pin(&self) -> HashMapRef<'_, K, V, S, LocalGuard<'_>> {
+    pub fn pin(&self) -> HashMapRef<'_, K, V, S, C, LocalGuard<'_>> {
         HashMapRef {
             guard: self.raw.guard(),
             map: self,
@@ -328,7 +383,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
-    pub fn pin_owned(&self) -> HashMapRef<'_, K, V, S, OwnedGuard<'_>> {
+    pub fn pin_owned(&self) -> HashMapRef<'_, K, V, S, C, OwnedGuard<'_>> {
         HashMapRef {
             guard: self.raw.owned_guard(),
             map: self,
@@ -341,7 +396,7 @@ impl<K, V, S> HashMap<K, V, S> {
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn guard(&self) -> LocalGuard<'_> {
-        self.raw.collector().enter()
+        self.raw.collector().borrow().enter()
     }
 
     /// Returns an owned guard for use with this map.
@@ -354,14 +409,15 @@ impl<K, V, S> HashMap<K, V, S> {
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn owned_guard(&self) -> OwnedGuard<'_> {
-        self.raw.collector().enter_owned()
+        self.raw.collector().borrow().enter_owned()
     }
 }
 
-impl<K, V, S> HashMap<K, V, S>
+impl<K, V, S, C> HashMap<K, V, S, C>
 where
     K: Hash + Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     /// Returns the number of entries in the map.
     ///
@@ -1121,11 +1177,12 @@ pub struct OccupiedError<'a, V: 'a> {
     pub not_inserted: V,
 }
 
-impl<K, V, S> PartialEq for HashMap<K, V, S>
+impl<K, V, S, C> PartialEq for HashMap<K, V, S, C>
 where
     K: Hash + Eq,
     V: PartialEq,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -1139,19 +1196,21 @@ where
     }
 }
 
-impl<K, V, S> Eq for HashMap<K, V, S>
+impl<K, V, S, C> Eq for HashMap<K, V, S, C>
 where
     K: Hash + Eq,
     V: Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
 }
 
-impl<K, V, S> fmt::Debug for HashMap<K, V, S>
+impl<K, V, S, C> fmt::Debug for HashMap<K, V, S, C>
 where
     K: Hash + Eq + fmt::Debug,
     V: fmt::Debug,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let guard = self.guard();
@@ -1159,10 +1218,11 @@ where
     }
 }
 
-impl<K, V, S> Extend<(K, V)> for &HashMap<K, V, S>
+impl<K, V, S, C> Extend<(K, V)> for &HashMap<K, V, S, C>
 where
     K: Hash + Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn extend<T: IntoIterator<Item = (K, V)>>(&mut self, iter: T) {
         // from `hashbrown::HashMap::extend`:
@@ -1186,11 +1246,12 @@ where
     }
 }
 
-impl<'a, K, V, S> Extend<(&'a K, &'a V)> for &HashMap<K, V, S>
+impl<'a, K, V, S, C> Extend<(&'a K, &'a V)> for &HashMap<K, V, S, C>
 where
     K: Copy + Hash + Eq,
     V: Copy,
     S: BuildHasher,
+    C: Borrow<Collector>,
 {
     fn extend<T: IntoIterator<Item = (&'a K, &'a V)>>(&mut self, iter: T) {
         self.extend(iter.into_iter().map(|(&key, &value)| (key, value)));
@@ -1206,17 +1267,25 @@ where
     }
 }
 
-impl<K, V, S> FromIterator<(K, V)> for HashMap<K, V, S>
+impl<K, V, S, C> FromIterator<(K, V)> for HashMap<K, V, S, C>
 where
     K: Hash + Eq,
     S: BuildHasher + Default,
+    C: Borrow<Collector> + Default,
 {
     fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
         let mut iter = iter.into_iter();
 
         if let Some((key, value)) = iter.next() {
             let (lower, _) = iter.size_hint();
-            let map = HashMap::with_capacity_and_hasher(lower.saturating_add(1), S::default());
+            let map = HashMap {
+                raw: raw::HashMap::new(
+                    lower.saturating_add(1),
+                    S::default(),
+                    C::default(),
+                    ResizeMode::default(),
+                ),
+            };
 
             // Ideally we could use an unprotected guard here. However, `insert`
             // returns references to values that were replaced and retired, so
@@ -1232,7 +1301,9 @@ where
 
             map
         } else {
-            Self::default()
+            HashMap {
+                raw: raw::HashMap::new(0, S::default(), C::default(), ResizeMode::default()),
+            }
         }
     }
 }
@@ -1247,7 +1318,31 @@ where
         let other = HashMap::builder()
             .capacity(self.len())
             .hasher(self.raw.hasher.clone())
-            .collector(seize::Collector::new())
+            .collector(Collector::default())
+            .build();
+
+        {
+            let (guard1, guard2) = (&self.guard(), &other.guard());
+            for (key, value) in self.iter(guard1) {
+                other.insert(key.clone(), value.clone(), guard2);
+            }
+        }
+
+        other
+    }
+}
+
+impl<K, V, S> Clone for HashMap<K, V, S, Arc<Collector>>
+where
+    K: Clone + Hash + Eq + Send + 'static,
+    V: Clone + Send + 'static,
+    S: BuildHasher + Clone,
+{
+    fn clone(&self) -> HashMap<K, V, S, Arc<Collector>> {
+        let other = HashMap::builder()
+            .capacity(self.len())
+            .hasher(self.raw.hasher.clone())
+            .shared_collector(Arc::new(Collector::default()))
             .build();
 
         {
@@ -1265,20 +1360,24 @@ where
 ///
 /// This type is created with [`HashMap::pin`] and can be used to easily access a [`HashMap`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
-pub struct HashMapRef<'map, K, V, S, G> {
+pub struct HashMapRef<'map, K, V, S, C, G>
+where
+    C: Borrow<Collector>,
+{
     guard: MapGuard<G>,
-    map: &'map HashMap<K, V, S>,
+    map: &'map HashMap<K, V, S, C>,
 }
 
-impl<'map, K, V, S, G> HashMapRef<'map, K, V, S, G>
+impl<'map, K, V, S, C, G> HashMapRef<'map, K, V, S, C, G>
 where
     K: Hash + Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
     G: Guard,
 {
     /// Returns a reference to the inner [`HashMap`].
     #[inline]
-    pub fn map(&self) -> &'map HashMap<K, V, S> {
+    pub fn map(&self) -> &'map HashMap<K, V, S, C> {
         self.map
     }
 
@@ -1546,11 +1645,12 @@ where
     }
 }
 
-impl<K, V, S, G> fmt::Debug for HashMapRef<'_, K, V, S, G>
+impl<K, V, S, C, G> fmt::Debug for HashMapRef<'_, K, V, S, C, G>
 where
     K: Hash + Eq + fmt::Debug,
     V: fmt::Debug,
     S: BuildHasher,
+    C: Borrow<Collector>,
     G: Guard,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1558,10 +1658,11 @@ where
     }
 }
 
-impl<'a, K, V, S, G> IntoIterator for &'a HashMapRef<'_, K, V, S, G>
+impl<'a, K, V, S, C, G> IntoIterator for &'a HashMapRef<'_, K, V, S, C, G>
 where
     K: Hash + Eq,
     S: BuildHasher,
+    C: Borrow<Collector>,
     G: Guard,
 {
     type Item = (&'a K, &'a V);
