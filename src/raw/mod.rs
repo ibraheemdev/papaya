@@ -11,7 +11,10 @@ use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
 use self::probe::Probe;
+
+#[allow(unused_imports)] // Contains polyfills for APIs that stabilized after MSRV.
 use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, StrictProvenance, Tagged};
+
 use crate::map::{Compute, Operation, ResizeMode};
 use crate::Equivalent;
 
@@ -231,8 +234,10 @@ impl<K, V, S> HashMap<K, V, S> {
             };
         }
 
+        let capacity = probe::entries_for(capacity);
+
         // Initialize the table and mark it as the root.
-        let mut table = Table::alloc(probe::entries_for(capacity));
+        let mut table = Table::alloc(capacity);
         *table.state_mut().status.get_mut() = State::PROMOTED;
 
         HashMap {
@@ -2067,7 +2072,7 @@ where
                         let allocated = self.get_or_alloc_next(None, next);
 
                         // Wake anyone waiting for us to finish.
-                        let state = table.state();
+                        let state = next.state();
                         state.parker.unpark(&state.status);
 
                         // Retry in a new table.

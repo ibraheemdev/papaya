@@ -1,9 +1,9 @@
 use std::mem::align_of;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-// Polyfill for the unstable strict-provenance APIs.
+// Polyfill for the strict-provenance API.
 #[allow(clippy::missing_safety_doc)]
-#[allow(dead_code)] // `strict_provenance` has stabilized on nightly.
+#[allow(dead_code)] // `strict_provenance` has stabilized on 1.84.0.
 pub unsafe trait StrictProvenance<T>: Sized {
     fn addr(self) -> usize;
     fn map_addr(self, f: impl FnOnce(usize) -> usize) -> Self;
@@ -92,7 +92,8 @@ impl<T> Clone for Tagged<T> {
     }
 }
 
-// Polyfill for the unstable `atomic_ptr_strict_provenance` APIs.
+// Polyfill for the strict-provenance `AtomicPtr` API.
+#[allow(dead_code)] // `strict_provenance_atomic_ptr` has stabilized on 1.91.0.
 pub trait AtomicPtrFetchOps<T> {
     fn fetch_or(&self, value: usize, ordering: Ordering) -> *mut T;
 }
