@@ -5,7 +5,6 @@ use parking_lot::Mutex;
 use rand::distributions::{Distribution, Uniform};
 
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::thread;
 
@@ -79,7 +78,7 @@ fn stress_insert_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let mut in_use = env.in_use.lock();
+        let in_use = env.in_use.lock();
         if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
@@ -126,7 +125,7 @@ fn stress_delete_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let mut in_use = env.in_use.lock();
+        let in_use = env.in_use.lock();
         if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
@@ -154,7 +153,7 @@ fn stress_find_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let mut in_use = env.in_use.lock();
+        let in_use = env.in_use.lock();
         if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
