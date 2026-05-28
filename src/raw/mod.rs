@@ -902,8 +902,14 @@ where
         ) {
             // Successfully claimed the entry.
             Ok(_) => {
-                // Update the metadata table.
-                meta_entry.store(meta, Ordering::Release);
+                // Publish the metadata unless another thread already observed
+                // the entry and repaired or removed the slot.
+                let _ = meta_entry.compare_exchange(
+                    meta::EMPTY,
+                    meta,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
 
                 // Return the value we inserted.
                 return InsertStatus::Inserted;
@@ -2404,8 +2410,14 @@ where
                     ) {
                         // Successfully inserted.
                         Ok(_) => {
-                            // Update the metadata table.
-                            meta_entry.store(h2, Ordering::Release);
+                            // Publish the metadata unless another thread already observed
+                            // the entry and repaired or removed the slot.
+                            let _ = meta_entry.compare_exchange(
+                                meta::EMPTY,
+                                h2,
+                                Ordering::Release,
+                                Ordering::Relaxed,
+                            );
                             return Some((table, probe.i));
                         }
                         Err(found) => {
