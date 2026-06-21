@@ -219,6 +219,8 @@ impl<T> Table<T> {
     }
 }
 
+// Expected sizes are based on 64-bit assumptions
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn layout() {
     unsafe {
