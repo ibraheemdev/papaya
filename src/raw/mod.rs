@@ -3,10 +3,10 @@ mod probe;
 
 pub(crate) mod utils;
 
+use parking_lot::Mutex;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
 use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
@@ -1912,9 +1912,9 @@ where
         //
         // Unlike in `init`, we do not race here to prevent unnecessary allocator pressure.
         let _allocating = match state.allocating.try_lock() {
-            Ok(lock) => lock,
+            Some(lock) => lock,
             // Someone else is currently allocating.
-            Err(_) => {
+            None => {
                 let mut spun = 0;
 
                 // Spin for a bit, waiting for the table to be initialized.
@@ -1932,7 +1932,7 @@ where
                 }
 
                 // Otherwise, we have to block.
-                state.allocating.lock().unwrap()
+                state.allocating.lock()
             }
         };
 

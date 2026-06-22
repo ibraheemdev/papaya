@@ -1,11 +1,10 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/cuckoo/stress.rs
 
 use papaya::{HashMap, ResizeMode};
-
+use parking_lot::Mutex;
 use rand::distributions::{Distribution, Uniform};
 
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::sync::{atomic::AtomicBool, Arc};
 use std::thread;
 
@@ -79,8 +78,8 @@ fn stress_insert_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let in_use = env.in_use.lock().unwrap();
-        if (*in_use)[idx]
+        let in_use = env.in_use.lock();
+        if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
@@ -101,19 +100,20 @@ fn stress_insert_thread(env: Arc<Environment>) {
             } else {
                 false
             };
-            let mut in_table = env.in_table.lock().unwrap();
-            assert_ne!(res1, (*in_table)[idx]);
-            assert_ne!(res2, (*in_table)[idx]);
+            let mut in_table = env.in_table.lock();
+            assert_ne!(res1, in_table[idx]);
+            assert_ne!(res2, in_table[idx]);
+
             if res1 {
                 assert_eq!(Some(&val1), env.table1.get(&key, &guard1));
                 assert_eq!(Some(&val2), env.table2.get(&key, &guard2));
-                let mut vals1 = env.vals1.lock().unwrap();
-                let mut vals2 = env.vals2.lock().unwrap();
-                (*vals1)[idx] = val1;
-                (*vals2)[idx] = val2;
-                (*in_table)[idx] = true;
+                let mut vals1 = env.vals1.lock();
+                let mut vals2 = env.vals2.lock();
+                vals1[idx] = val1;
+                vals2[idx] = val2;
+                in_table[idx] = true;
             }
-            (*in_use)[idx].swap(false, Ordering::SeqCst);
+            in_use[idx].swap(false, Ordering::SeqCst);
         }
     }
 }
@@ -125,23 +125,23 @@ fn stress_delete_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let in_use = env.in_use.lock().unwrap();
-        if (*in_use)[idx]
+        let in_use = env.in_use.lock();
+        if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             let key = env.keys[idx];
             let res1 = env.table1.remove(&key, &guard1).map_or(false, |_| true);
             let res2 = env.table2.remove(&key, &guard2).map_or(false, |_| true);
-            let mut in_table = env.in_table.lock().unwrap();
-            assert_eq!(res1, (*in_table)[idx]);
-            assert_eq!(res2, (*in_table)[idx]);
+            let mut in_table = env.in_table.lock();
+            assert_eq!(res1, in_table[idx]);
+            assert_eq!(res2, in_table[idx]);
             if res1 {
                 assert!(env.table1.get(&key, &guard1).is_none());
                 assert!(env.table2.get(&key, &guard2).is_none());
-                (*in_table)[idx] = false;
+                in_table[idx] = false;
             }
-            (*in_use)[idx].swap(false, Ordering::SeqCst);
+            in_use[idx].swap(false, Ordering::SeqCst);
         }
     }
 }
@@ -153,27 +153,27 @@ fn stress_find_thread(env: Arc<Environment>) {
 
     while !env.finished.load(Ordering::SeqCst) {
         let idx = env.ind_dist.sample(&mut rng);
-        let in_use = env.in_use.lock().unwrap();
-        if (*in_use)[idx]
+        let in_use = env.in_use.lock();
+        if in_use[idx]
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             let key = env.keys[idx];
-            let in_table = env.in_table.lock().unwrap();
-            let val1 = (*env.vals1.lock().unwrap())[idx];
-            let val2 = (*env.vals2.lock().unwrap())[idx];
+            let in_table = env.in_table.lock();
+            let val1 = env.vals1.lock()[idx];
+            let val2 = env.vals2.lock()[idx];
 
             let value = env.table1.get(&key, &guard1);
-            if value.is_some() {
-                assert_eq!(&val1, value.unwrap());
-                assert!((*in_table)[idx]);
+            if let Some(v) = value {
+                assert_eq!(&val1, v);
+                assert!(in_table[idx]);
             }
             let value = env.table2.get(&key, &guard2);
-            if value.is_some() {
-                assert_eq!(&val2, value.unwrap());
-                assert!((*in_table)[idx]);
+            if let Some(v) = value {
+                assert_eq!(&val2, v);
+                assert!(in_table[idx]);
             }
-            (*in_use)[idx].swap(false, Ordering::SeqCst);
+            in_use[idx].swap(false, Ordering::SeqCst);
         }
     }
 }
@@ -231,7 +231,7 @@ fn run(root: Arc<Environment>) {
     }
 
     if !cfg!(papaya_stress) {
-        let in_table = &*root.in_table.lock().unwrap();
+        let in_table = root.in_table.lock();
         let num_filled = in_table.iter().filter(|b| **b).count();
         assert_eq!(num_filled, root.table1.pin().len());
         assert_eq!(num_filled, root.table2.pin().len());
