@@ -4,7 +4,6 @@ use crate::Equivalent;
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
 use crate::map::ResizeMode;
-use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
@@ -16,18 +15,15 @@ use std::sync::Arc;
 /// Most hash set operations require a [`Guard`](crate::Guard), which can be acquired through
 /// [`HashSet::guard`] or using the [`HashSet::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
-pub struct HashSet<K, S = RandomState, C = Collector>
-where
-    C: Borrow<Collector>,
-{
-    raw: raw::HashMap<K, (), S, C>,
+pub struct HashSet<K, S = RandomState> {
+    raw: raw::HashMap<K, (), S>,
 }
 
 // Safety: We only ever hand out &K through shared references to the map,
 // so normal Send/Sync rules apply. We never expose owned or mutable references
 // to keys or values.
-unsafe impl<K: Send, S: Send, C: Send + Borrow<Collector>> Send for HashSet<K, S, C> {}
-unsafe impl<K: Sync, S: Sync, C: Sync + Borrow<Collector>> Sync for HashSet<K, S, C> {}
+unsafe impl<K: Send, S: Send> Send for HashSet<K, S> {}
+unsafe impl<K: Sync, S: Sync> Sync for HashSet<K, S> {}
 
 /// A builder for a [`HashSet`].
 ///
@@ -50,13 +46,10 @@ unsafe impl<K: Sync, S: Sync, C: Sync + Borrow<Collector>> Sync for HashSet<K, S
 ///     // Construct the hash set.
 ///     .build();
 /// ```
-pub struct HashSetBuilder<K, S = RandomState, C = Collector>
-where
-    C: Borrow<Collector>,
-{
+pub struct HashSetBuilder<K, S = RandomState> {
     hasher: S,
     capacity: usize,
-    collector: C,
+    collector: Arc<Collector>,
     resize_mode: ResizeMode,
     _kv: PhantomData<K>,
 }
@@ -82,24 +75,6 @@ impl<K> HashSetBuilder<K> {
     }
 }
 
-impl<K, S> HashSetBuilder<K, S> {
-    /// Set the [`seize::Collector`] used for garbage collection.
-    ///
-    /// This method may be useful when you want more control over garbage collection.
-    ///
-    /// Note that all `Guard` references used to access the set must be produced by
-    /// the provided `collector`.
-    pub fn collector(self, collector: Collector) -> HashSetBuilder<K, S> {
-        HashSetBuilder {
-            collector,
-            hasher: self.hasher,
-            capacity: self.capacity,
-            resize_mode: self.resize_mode,
-            _kv: PhantomData,
-        }
-    }
-}
-
 impl<K, S> HashSetBuilder<K, S>
 where
     K: Send + 'static,
@@ -111,10 +86,7 @@ where
     ///
     /// Note that to ensure the `HashSet` are reclaimed, the `Arc<seize::Collector>` must be dropped, so
     /// it should not be owned indefinitely.
-    pub fn shared_collector(
-        self,
-        collector: Arc<Collector>,
-    ) -> HashSetBuilder<K, S, Arc<Collector>> {
+    pub fn shared_collector(self, collector: Arc<Collector>) -> HashSetBuilder<K, S> {
         HashSetBuilder {
             collector,
             hasher: self.hasher,
@@ -125,16 +97,28 @@ where
     }
 }
 
-impl<K, S, C> HashSetBuilder<K, S, C>
-where
-    C: Borrow<Collector>,
-{
+impl<K, S> HashSetBuilder<K, S> {
+    /// Set the [`seize::Collector`] used for garbage collection.
+    ///
+    /// This method may be useful when you want more control over garbage collection.
+    ///
+    /// Note that all `Guard` references used to access the set must be produced by
+    /// the provided `collector`.
+    pub fn collector(self, collector: Collector) -> HashSetBuilder<K, S> {
+        HashSetBuilder {
+            collector: Arc::new(collector),
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
     /// Set the initial capacity of the set.
     ///
     /// The set should be able to hold at least `capacity` elements before resizing.
     /// However, the capacity is an estimate, and the set may prematurely resize due
     /// to poor hash distribution. If `capacity` is 0, the hash set will not allocate.
-    pub fn capacity(self, capacity: usize) -> HashSetBuilder<K, S, C> {
+    pub fn capacity(self, capacity: usize) -> HashSetBuilder<K, S> {
         HashSetBuilder {
             capacity,
             hasher: self.hasher,
@@ -156,17 +140,14 @@ where
     }
 
     /// Construct a [`HashSet`] from the builder, using the configured options.
-    pub fn build(self) -> HashSet<K, S, C> {
+    pub fn build(self) -> HashSet<K, S> {
         HashSet {
             raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
         }
     }
 }
 
-impl<K, S, C> fmt::Debug for HashSetBuilder<K, S, C>
-where
-    C: Borrow<Collector> + fmt::Debug,
-{
+impl<K, S> fmt::Debug for HashSetBuilder<K, S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HashSetBuilder")
             .field("capacity", &self.capacity)
@@ -189,7 +170,7 @@ impl<K> HashSet<K> {
     /// let map: HashSet<&str> = HashSet::new();
     /// ```
     pub fn new() -> HashSet<K> {
-        HashSet::with_capacity_and_hasher(0, RandomState::default())
+        HashSet::with_capacity_and_hasher(0, RandomState::new())
     }
 
     /// Creates an empty `HashSet` with the specified capacity.
@@ -205,7 +186,7 @@ impl<K> HashSet<K> {
     /// let set: HashSet<&str> = HashSet::with_capacity(10);
     /// ```
     pub fn with_capacity(capacity: usize) -> HashSet<K> {
-        HashSet::with_capacity_and_hasher(capacity, RandomState::default())
+        HashSet::with_capacity_and_hasher(capacity, RandomState::new())
     }
 
     /// Returns a builder for a `HashSet`.
@@ -216,7 +197,7 @@ impl<K> HashSet<K> {
         HashSetBuilder {
             capacity: 0,
             hasher: RandomState::default(),
-            collector: Collector::default(),
+            collector: Arc::new(Collector::default()),
             resize_mode: ResizeMode::default(),
             _kv: PhantomData,
         }
@@ -229,19 +210,6 @@ where
 {
     fn default() -> Self {
         HashSet::with_hasher(S::default())
-    }
-}
-
-impl<K, S> Default for HashSet<K, S, Arc<Collector>>
-where
-    S: Default,
-    K: Send + 'static,
-{
-    fn default() -> Self {
-        HashSet::builder()
-            .hasher(S::default())
-            .shared_collector(Arc::new(Collector::new()))
-            .build()
     }
 }
 
@@ -301,23 +269,18 @@ impl<K, S> HashSet<K, S> {
             raw: raw::HashMap::new(
                 capacity,
                 hash_builder,
-                Collector::default(),
+                Arc::new(Collector::default()),
                 ResizeMode::default(),
             ),
         }
     }
-}
 
-impl<K, S, C> HashSet<K, S, C>
-where
-    C: Borrow<Collector>,
-{
     /// Returns a pinned reference to the set.
     ///
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
-    pub fn pin(&self) -> HashSetRef<'_, K, S, C, LocalGuard<'_>> {
+    pub fn pin(&self) -> HashSetRef<'_, K, S, LocalGuard<'_>> {
         HashSetRef {
             guard: self.raw.guard(),
             set: self,
@@ -333,7 +296,7 @@ where
     /// The returned reference manages a guard internally, preventing garbage collection
     /// for as long as it is held. See the [crate-level documentation](crate#usage) for details.
     #[inline]
-    pub fn pin_owned(&self) -> HashSetRef<'_, K, S, C, OwnedGuard<'_>> {
+    pub fn pin_owned(&self) -> HashSetRef<'_, K, S, OwnedGuard<'_>> {
         HashSetRef {
             guard: self.raw.owned_guard(),
             set: self,
@@ -346,7 +309,7 @@ where
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn guard(&self) -> LocalGuard<'_> {
-        self.raw.collector().borrow().enter()
+        self.raw.collector().enter()
     }
 
     /// Returns an owned guard for use with this set.
@@ -359,15 +322,14 @@ where
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn owned_guard(&self) -> OwnedGuard<'_> {
-        self.raw.collector().borrow().enter_owned()
+        self.raw.collector().enter_owned()
     }
 }
 
-impl<K, S, C> HashSet<K, S, C>
+impl<K, S> HashSet<K, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     /// Returns the number of entries in the set.
     ///
@@ -631,11 +593,10 @@ where
     }
 }
 
-impl<K, S, C> PartialEq for HashSet<K, S, C>
+impl<K, S> PartialEq for HashSet<K, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     fn eq(&self, other: &Self) -> bool {
         if self.len() != other.len() {
@@ -649,18 +610,16 @@ where
     }
 }
 
-impl<K, S, C> Eq for HashSet<K, S, C>
+impl<K, S> Eq for HashSet<K, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
 }
 
-impl<K, S, C> fmt::Debug for HashSet<K, S, C>
+impl<K, S> fmt::Debug for HashSet<K, S>
 where
     K: Hash + Eq + fmt::Debug,
-    C: Borrow<Collector> + fmt::Debug,
     S: BuildHasher,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -669,11 +628,10 @@ where
     }
 }
 
-impl<K, S, C> Extend<K> for &HashSet<K, S, C>
+impl<K, S> Extend<K> for &HashSet<K, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
         // from `hashbrown::HashSet::extend`:
@@ -697,11 +655,10 @@ where
     }
 }
 
-impl<'a, K, S, C> Extend<&'a K> for &HashSet<K, S, C>
+impl<'a, K, S> Extend<&'a K> for &HashSet<K, S>
 where
     K: Copy + Hash + Eq + 'a,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     fn extend<T: IntoIterator<Item = &'a K>>(&mut self, iter: T) {
         self.extend(iter.into_iter().copied());
@@ -717,25 +674,17 @@ where
     }
 }
 
-impl<K, S, C> FromIterator<K> for HashSet<K, S, C>
+impl<K, S> FromIterator<K> for HashSet<K, S>
 where
     K: Hash + Eq,
     S: BuildHasher + Default,
-    C: Borrow<Collector> + Default,
 {
     fn from_iter<T: IntoIterator<Item = K>>(iter: T) -> Self {
         let mut iter = iter.into_iter();
 
         if let Some(key) = iter.next() {
             let (lower, _) = iter.size_hint();
-            let set = HashSet {
-                raw: raw::HashMap::new(
-                    lower.saturating_add(1),
-                    S::default(),
-                    C::default(),
-                    ResizeMode::default(),
-                ),
-            };
+            let set = HashSet::with_capacity_and_hasher(lower.saturating_add(1), S::default());
 
             // Ideally we could use an unprotected guard here. However, `insert`
             // returns references to values that were replaced and retired, so
@@ -751,9 +700,7 @@ where
 
             set
         } else {
-            HashSet {
-                raw: raw::HashMap::new(0, S::default(), C::default(), ResizeMode::default()),
-            }
+            Self::default()
         }
     }
 }
@@ -781,51 +728,24 @@ where
     }
 }
 
-impl<K, S> Clone for HashSet<K, S, Arc<Collector>>
-where
-    K: Clone + Hash + Eq + Send + 'static,
-    S: BuildHasher + Clone,
-{
-    fn clone(&self) -> HashSet<K, S, Arc<Collector>> {
-        let other = HashSet::builder()
-            .capacity(self.len())
-            .hasher(self.raw.hasher.clone())
-            .shared_collector(Arc::new(seize::Collector::new()))
-            .build();
-
-        {
-            let (guard1, guard2) = (&self.guard(), &other.guard());
-            for key in self.iter(guard1) {
-                other.insert(key.clone(), guard2);
-            }
-        }
-
-        other
-    }
-}
-
 /// A pinned reference to a [`HashSet`].
 ///
 /// This type is created with [`HashSet::pin`] and can be used to easily access a [`HashSet`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
-pub struct HashSetRef<'set, K, S, C, G>
-where
-    C: Borrow<Collector>,
-{
+pub struct HashSetRef<'set, K, S, G> {
     guard: MapGuard<G>,
-    set: &'set HashSet<K, S, C>,
+    set: &'set HashSet<K, S>,
 }
 
-impl<'set, K, S, C, G> HashSetRef<'set, K, S, C, G>
+impl<'set, K, S, G> HashSetRef<'set, K, S, G>
 where
     K: Hash + Eq,
     S: BuildHasher,
     G: Guard,
-    C: Borrow<Collector>,
 {
     /// Returns a reference to the inner [`HashSet`].
     #[inline]
-    pub fn set(&self) -> &'set HashSet<K, S, C> {
+    pub fn set(&self) -> &'set HashSet<K, S> {
         self.set
     }
 
@@ -937,11 +857,10 @@ where
     }
 }
 
-impl<K, S, C, G> fmt::Debug for HashSetRef<'_, K, S, C, G>
+impl<K, S, G> fmt::Debug for HashSetRef<'_, K, S, G>
 where
     K: Hash + Eq + fmt::Debug,
     S: BuildHasher,
-    C: Borrow<Collector> + fmt::Debug,
     G: Guard,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -949,11 +868,10 @@ where
     }
 }
 
-impl<'a, K, S, C, G> IntoIterator for &'a HashSetRef<'_, K, S, C, G>
+impl<'a, K, S, G> IntoIterator for &'a HashSetRef<'_, K, S, G>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
     G: Guard,
 {
     type Item = &'a K;

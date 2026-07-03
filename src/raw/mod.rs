@@ -3,11 +3,10 @@ mod probe;
 
 pub(crate) mod utils;
 
-use std::borrow::Borrow;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
@@ -23,15 +22,12 @@ use seize::{Collector, LocalGuard, OwnedGuard};
 use utils::{MapGuard, Stack, VerifiedGuard};
 
 /// A lock-free hash-table.
-pub struct HashMap<K, V, S, C = Collector>
-where
-    C: Borrow<Collector>,
-{
+pub struct HashMap<K, V, S> {
     /// A pointer to the root table.
     table: AtomicPtr<RawTable<Entry<K, V>>>,
 
     /// Collector for memory reclamation.
-    collector: C,
+    collector: Arc<Collector>,
 
     /// The resize mode, either blocking or incremental.
     resize: ResizeMode,
@@ -217,18 +213,15 @@ enum InsertStatus<K, V> {
     Found(EntryStatus<K, V>),
 }
 
-impl<K, V, S, C> HashMap<K, V, S, C>
-where
-    C: Borrow<Collector>,
-{
+impl<K, V, S> HashMap<K, V, S> {
     /// Creates new hash-table with the given options.
     #[inline]
     pub fn new(
         capacity: usize,
         hasher: S,
-        collector: C,
+        collector: Arc<Collector>,
         resize: ResizeMode,
-    ) -> HashMap<K, V, S, C> {
+    ) -> HashMap<K, V, S> {
         // The table is lazily allocated.
         if capacity == 0 {
             return HashMap {
@@ -259,13 +252,13 @@ where
     /// Returns a guard for this collector
     pub fn guard(&self) -> MapGuard<LocalGuard<'_>> {
         // Safety: Created the guard from our collector.
-        unsafe { MapGuard::new(self.collector().borrow().enter()) }
+        unsafe { MapGuard::new(self.collector().enter()) }
     }
 
     /// Returns an owned guard for this collector
     pub fn owned_guard(&self) -> MapGuard<OwnedGuard<'_>> {
         // Safety: Created the guard from our collector.
-        unsafe { MapGuard::new(self.collector().borrow().enter_owned()) }
+        unsafe { MapGuard::new(self.collector().enter_owned()) }
     }
 
     /// Verify a guard is valid to use with this map.
@@ -276,7 +269,7 @@ where
     {
         assert_eq!(
             *guard.collector(),
-            *self.collector.borrow(),
+            *self.collector,
             "Attempted to access map with incorrect guard"
         );
 
@@ -296,7 +289,7 @@ where
 
     /// Returns a reference to the collector.
     #[inline]
-    pub fn collector(&self) -> &C {
+    pub fn collector(&self) -> &Collector {
         &self.collector
     }
 
@@ -313,11 +306,10 @@ where
     }
 }
 
-impl<K, V, S, C> HashMap<K, V, S, C>
+impl<K, V, S> HashMap<K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     /// Returns a reference to the entry corresponding to the key.
     #[inline]
@@ -1391,11 +1383,10 @@ impl<K, V> LazyEntry<K, V> {
 }
 
 /// RMW operations.
-impl<K, V, S, C> HashMap<K, V, S, C>
+impl<K, V, S> HashMap<K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     /// Tries to insert a key and value computed from a closure into the map,
     /// and returns a reference to the value that was inserted.
@@ -1858,11 +1849,10 @@ where
 }
 
 /// Resize operations.
-impl<K, V, S, C> HashMap<K, V, S, C>
+impl<K, V, S> HashMap<K, V, S>
 where
     K: Hash + Eq,
     S: BuildHasher,
-    C: Borrow<Collector>,
 {
     /// Allocate the initial table.
     #[cold]
@@ -2732,10 +2722,7 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
     }
 }
 
-impl<K, V, S, C> Drop for HashMap<K, V, S, C>
-where
-    C: Borrow<Collector>,
-{
+impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
         let mut raw = *self.table.get_mut();
 
@@ -2745,7 +2732,7 @@ where
         // using the shared collector pointer that is invalidated by drop.
         //
         // Safety: We have a unique reference to the collector.
-        unsafe { self.collector.borrow().reclaim_all() };
+        unsafe { self.collector.reclaim_all() };
 
         // Drop all nested tables and entries.
         while !raw.is_null() {
@@ -2800,7 +2787,7 @@ unsafe fn drop_entries<K, V>(table: Table<Entry<K, V>>) {
 // # Safety
 //
 // The table must not be accessed after this call.
-unsafe fn drop_table<K, V, C: Borrow<Collector>>(mut table: Table<Entry<K, V>>, collector: &C) {
+unsafe fn drop_table<K, V>(mut table: Table<Entry<K, V>>, collector: &Collector) {
     // Drop any entries that were deferred during an incremental resize.
     //
     // Safety: Entries are deferred after they are made unreachable from the
@@ -2813,7 +2800,7 @@ unsafe fn drop_table<K, V, C: Borrow<Collector>>(mut table: Table<Entry<K, V>>, 
     table
         .state_mut()
         .deferred
-        .drain(|entry| unsafe { collector.borrow().retire(entry, seize::reclaim::boxed) });
+        .drain(|entry| unsafe { collector.retire(entry, seize::reclaim::boxed) });
 
     // Deallocate the table.
     //
