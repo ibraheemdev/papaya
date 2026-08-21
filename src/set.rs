@@ -555,7 +555,7 @@ where
     /// assert_eq!(set.pin().contains(&2), true);
     /// ```
     #[inline]
-    pub fn retain<F>(&mut self, mut f: F, guard: &impl Guard)
+    pub fn retain<F>(&self, mut f: F, guard: &impl Guard)
     where
         F: FnMut(&K) -> bool,
     {
@@ -829,7 +829,7 @@ where
     ///
     /// See [`HashSet::retain`] for details.
     #[inline]
-    pub fn retain<F>(&mut self, mut f: F)
+    pub fn retain<F>(&self, mut f: F)
     where
         F: FnMut(&K) -> bool,
     {
