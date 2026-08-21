@@ -93,11 +93,11 @@ where
 {
     /// Set a shared `Arc<seize::Collector>` used for garbage collection.
     ///
-    /// This method may be useful when wanting to utilize a single [`seize::Collector`] across
-    /// different `HashMap` contained in a single structure.
+    /// This method may be useful when you wish to utilize a single [`seize::Collector`] across
+    /// multiple maps contained in a single structure.
     ///
-    /// Note that to ensure the `HashMap` are reclaimed, the `Arc<seize::Collector>` must be dropped, so
-    /// it should not be owned indefinitely.
+    /// Note that the entries in the map will not be reclaimed until the `Arc<seize::Collector>`,
+    /// is dropped and so may outlive the lifetime of the map.
     pub fn shared_collector(self, collector: Arc<Collector>) -> HashMapBuilder<K, V, S> {
         HashMapBuilder {
             collector,
