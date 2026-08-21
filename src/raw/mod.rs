@@ -6,7 +6,7 @@ pub(crate) mod utils;
 use std::hash::{BuildHasher, Hash};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicPtr, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::{hint, panic, ptr};
 
 use self::alloc::{RawTable, Table};
@@ -27,7 +27,7 @@ pub struct HashMap<K, V, S> {
     table: AtomicPtr<RawTable<Entry<K, V>>>,
 
     /// Collector for memory reclamation.
-    collector: Collector,
+    collector: Arc<Collector>,
 
     /// The resize mode, either blocking or incremental.
     resize: ResizeMode,
@@ -219,7 +219,7 @@ impl<K, V, S> HashMap<K, V, S> {
     pub fn new(
         capacity: usize,
         hasher: S,
-        collector: Collector,
+        collector: Arc<Collector>,
         resize: ResizeMode,
     ) -> HashMap<K, V, S> {
         // The table is lazily allocated.
@@ -249,7 +249,6 @@ impl<K, V, S> HashMap<K, V, S> {
             count: Counter::default(),
         }
     }
-
     /// Returns a guard for this collector
     pub fn guard(&self) -> MapGuard<LocalGuard<'_>> {
         // Safety: Created the guard from our collector.
@@ -270,7 +269,7 @@ impl<K, V, S> HashMap<K, V, S> {
     {
         assert_eq!(
             *guard.collector(),
-            self.collector,
+            *self.collector,
             "Attempted to access map with incorrect guard"
         );
 

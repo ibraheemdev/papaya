@@ -8,6 +8,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// A concurrent hash set.
 ///
@@ -48,7 +49,7 @@ unsafe impl<K: Sync, S: Sync> Sync for HashSet<K, S> {}
 pub struct HashSetBuilder<K, S = RandomState> {
     hasher: S,
     capacity: usize,
-    collector: Collector,
+    collector: Arc<Collector>,
     resize_mode: ResizeMode,
     _kv: PhantomData<K>,
 }
@@ -74,7 +75,44 @@ impl<K> HashSetBuilder<K> {
     }
 }
 
+impl<K, S> HashSetBuilder<K, S>
+where
+    K: Send + 'static,
+{
+    /// Set a shared `Arc<seize::Collector>` used for garbage collection.
+    ///
+    /// This method may be useful when you wish to utilize a single [`seize::Collector`] across
+    /// multiple sets contained in a single structure.
+    ///
+    /// Note that the entries in the set will not be reclaimed until the `Arc<seize::Collector>`
+    /// is dropped, and so may outlive the lifetime of the map.
+    pub fn shared_collector(self, collector: Arc<Collector>) -> HashSetBuilder<K, S> {
+        HashSetBuilder {
+            collector,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+}
+
 impl<K, S> HashSetBuilder<K, S> {
+    /// Set the [`seize::Collector`] used for garbage collection.
+    ///
+    /// This method may be useful when you want more control over garbage collection.
+    ///
+    /// Note that all `Guard` references used to access the set must be produced by
+    /// the provided `collector`.
+    pub fn collector(self, collector: Collector) -> HashSetBuilder<K, S> {
+        HashSetBuilder {
+            collector: Arc::new(collector),
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
     /// Set the initial capacity of the set.
     ///
     /// The set should be able to hold at least `capacity` elements before resizing.
@@ -97,22 +135,6 @@ impl<K, S> HashSetBuilder<K, S> {
             hasher: self.hasher,
             capacity: self.capacity,
             collector: self.collector,
-            _kv: PhantomData,
-        }
-    }
-
-    /// Set the [`seize::Collector`] used for garbage collection.
-    ///
-    /// This method may be useful when you want more control over garbage collection.
-    ///
-    /// Note that all `Guard` references used to access the set must be produced by
-    /// the provided `collector`.
-    pub fn collector(self, collector: Collector) -> Self {
-        HashSetBuilder {
-            collector,
-            hasher: self.hasher,
-            capacity: self.capacity,
-            resize_mode: self.resize_mode,
             _kv: PhantomData,
         }
     }
@@ -175,7 +197,7 @@ impl<K> HashSet<K> {
         HashSetBuilder {
             capacity: 0,
             hasher: RandomState::default(),
-            collector: Collector::new(),
+            collector: Arc::new(Collector::default()),
             resize_mode: ResizeMode::default(),
             _kv: PhantomData,
         }
@@ -247,7 +269,7 @@ impl<K, S> HashSet<K, S> {
             raw: raw::HashMap::new(
                 capacity,
                 hash_builder,
-                Collector::default(),
+                Arc::new(Collector::default()),
                 ResizeMode::default(),
             ),
         }
