@@ -1,4 +1,4 @@
-//! A fast and ergonomic concurrent hash-set for read-heavy workloads.
+//! A fast and ergonomic concurrent hash-set.
 
 use crate::raw::utils::MapGuard;
 use crate::raw::{self, InsertResult};
