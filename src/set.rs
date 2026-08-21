@@ -1,9 +1,7 @@
-use crate::raw::utils::MapGuard;
-use crate::raw::{self, InsertResult};
-use crate::Equivalent;
+use crate::{Equivalent, HashMap, HashMapRef};
 use seize::{Collector, Guard, LocalGuard, OwnedGuard};
 
-use crate::map::ResizeMode;
+use crate::map::{self, ResizeMode};
 use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
@@ -15,7 +13,7 @@ use std::marker::PhantomData;
 /// [`HashSet::guard`] or using the [`HashSet::pin`] API. See the [crate-level documentation](crate#usage)
 /// for details.
 pub struct HashSet<K, S = RandomState> {
-    raw: raw::HashMap<K, (), S>,
+    map: HashMap<K, (), S>,
 }
 
 // Safety: We only ever hand out &K through shared references to the map,
@@ -120,7 +118,12 @@ impl<K, S> HashSetBuilder<K, S> {
     /// Construct a [`HashSet`] from the builder, using the configured options.
     pub fn build(self) -> HashSet<K, S> {
         HashSet {
-            raw: raw::HashMap::new(self.capacity, self.hasher, self.collector, self.resize_mode),
+            map: HashMap::builder()
+                .capacity(self.capacity)
+                .hasher(self.hasher)
+                .collector(self.collector)
+                .resize_mode(self.resize_mode)
+                .build(),
         }
     }
 }
@@ -244,12 +247,7 @@ impl<K, S> HashSet<K, S> {
     /// ```
     pub fn with_capacity_and_hasher(capacity: usize, hash_builder: S) -> HashSet<K, S> {
         HashSet {
-            raw: raw::HashMap::new(
-                capacity,
-                hash_builder,
-                Collector::default(),
-                ResizeMode::default(),
-            ),
+            map: HashMap::with_capacity_and_hasher(capacity, hash_builder),
         }
     }
 
@@ -260,8 +258,8 @@ impl<K, S> HashSet<K, S> {
     #[inline]
     pub fn pin(&self) -> HashSetRef<'_, K, S, LocalGuard<'_>> {
         HashSetRef {
-            guard: self.raw.guard(),
             set: self,
+            map_ref: self.map.pin(),
         }
     }
 
@@ -276,8 +274,8 @@ impl<K, S> HashSet<K, S> {
     #[inline]
     pub fn pin_owned(&self) -> HashSetRef<'_, K, S, OwnedGuard<'_>> {
         HashSetRef {
-            guard: self.raw.owned_guard(),
             set: self,
+            map_ref: self.map.pin_owned(),
         }
     }
 
@@ -287,7 +285,7 @@ impl<K, S> HashSet<K, S> {
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn guard(&self) -> LocalGuard<'_> {
-        self.raw.collector().enter()
+        self.map.guard()
     }
 
     /// Returns an owned guard for use with this set.
@@ -300,7 +298,7 @@ impl<K, S> HashSet<K, S> {
     /// See the [crate-level documentation](crate#usage) for details.
     #[inline]
     pub fn owned_guard(&self) -> OwnedGuard<'_> {
-        self.raw.collector().enter_owned()
+        self.map.owned_guard()
     }
 }
 
@@ -324,7 +322,7 @@ where
     /// ```
     #[inline]
     pub fn len(&self) -> usize {
-        self.raw.len()
+        self.map.len()
     }
 
     /// Returns `true` if the set is empty. Otherwise returns `false`.
@@ -369,7 +367,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.get(key, self.raw.verify(guard)).is_some()
+        self.map.get(key, guard).is_some()
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -396,7 +394,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        match self.raw.get(key, self.raw.verify(guard)) {
+        match self.map.get_key_value(key, guard) {
             Some((key, _)) => Some(key),
             None => None,
         }
@@ -427,15 +425,10 @@ where
     /// ```
     #[inline]
     pub fn insert(&self, key: K, guard: &impl Guard) -> bool {
-        match self.raw.insert(key, (), true, self.raw.verify(guard)) {
-            InsertResult::Inserted(_) => true,
-            InsertResult::Replaced(_) => false,
-            InsertResult::Error { .. } => unreachable!(),
-        }
+        self.map.insert(key, (), guard).is_none()
     }
 
-    /// Removes a key from the set, returning the value at the key if the key
-    /// was previously in the set.
+    /// Removes a value from the set. Returns whether the value was present in the set.
     ///
     /// The key may be any borrowed form of the set's key type, but
     /// [`Hash`] and [`Eq`] on the borrowed form *must* match those for
@@ -456,10 +449,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        match self.raw.remove(key, self.raw.verify(guard)) {
-            Some((_, _)) => true,
-            None => false,
-        }
+        self.map.remove(key, guard).is_some()
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -484,7 +474,7 @@ where
     /// ```
     #[inline]
     pub fn reserve(&self, additional: usize, guard: &impl Guard) {
-        self.raw.reserve(additional, self.raw.verify(guard))
+        self.map.reserve(additional, guard)
     }
 
     /// Clears the set, removing all values.
@@ -506,7 +496,7 @@ where
     /// ```
     #[inline]
     pub fn clear(&self, guard: &impl Guard) {
-        self.raw.clear(self.raw.verify(guard))
+        self.map.clear(guard)
     }
 
     /// Retains only the elements specified by the predicate.
@@ -537,7 +527,7 @@ where
     where
         F: FnMut(&K) -> bool,
     {
-        self.raw.retain(|k, _| f(k), self.raw.verify(guard))
+        self.map.retain(|k, _| f(k), guard)
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -566,7 +556,35 @@ where
         G: Guard,
     {
         Iter {
-            raw: self.raw.iter(self.raw.verify(guard)),
+            inner: self.map.iter(guard),
+        }
+    }
+}
+
+impl<K, S> IntoIterator for HashSet<K, S> {
+    type Item = K;
+    type IntoIter = IntoIter<K>;
+
+    /// Creates a consuming iterator, that is, one that moves each value out
+    /// of the set in arbitrary order. The set cannot be used after calling
+    /// this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use papaya::HashSet;
+    ///
+    /// let set = HashSet::from([
+    ///     "a",
+    ///     "b",
+    ///     "c"
+    /// ]);
+    ///
+    /// let v: Vec<&str> = set.into_iter().collect();
+    /// ```
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter {
+            inner: self.map.into_iter(),
         }
     }
 }
@@ -577,14 +595,7 @@ where
     S: BuildHasher,
 {
     fn eq(&self, other: &Self) -> bool {
-        if self.len() != other.len() {
-            return false;
-        }
-
-        let (guard1, guard2) = (&self.guard(), &other.guard());
-
-        let mut iter = self.iter(guard1);
-        iter.all(|key| other.get(key, guard2).is_some())
+        self.map.eq(&other.map)
     }
 }
 
@@ -612,24 +623,8 @@ where
     S: BuildHasher,
 {
     fn extend<T: IntoIterator<Item = K>>(&mut self, iter: T) {
-        // from `hashbrown::HashSet::extend`:
-        // Keys may be already present or show multiple times in the iterator.
-        // Reserve the entire hint lower bound if the set is empty.
-        // Otherwise reserve half the hint (rounded up), so the set
-        // will only resize twice in the worst case.
-        let iter = iter.into_iter();
-        let reserve = if self.is_empty() {
-            iter.size_hint().0
-        } else {
-            (iter.size_hint().0 + 1) / 2
-        };
-
-        let guard = self.guard();
-        self.reserve(reserve, &guard);
-
-        for key in iter {
-            self.insert(key, &guard);
-        }
+        let mut map = &self.map;
+        map.extend(iter.into_iter().map(|key| (key, ())));
     }
 }
 
@@ -658,27 +653,8 @@ where
     S: BuildHasher + Default,
 {
     fn from_iter<T: IntoIterator<Item = K>>(iter: T) -> Self {
-        let mut iter = iter.into_iter();
-
-        if let Some(key) = iter.next() {
-            let (lower, _) = iter.size_hint();
-            let set = HashSet::with_capacity_and_hasher(lower.saturating_add(1), S::default());
-
-            // Ideally we could use an unprotected guard here. However, `insert`
-            // returns references to values that were replaced and retired, so
-            // we need a "real" guard. A `raw_insert` method that strictly returns
-            // pointers would fix this.
-            {
-                let set = set.pin();
-                set.insert(key);
-                for key in iter {
-                    set.insert(key);
-                }
-            }
-
-            set
-        } else {
-            Self::default()
+        HashSet {
+            map: HashMap::from_iter(iter.into_iter().map(|key| (key, ()))),
         }
     }
 }
@@ -689,20 +665,9 @@ where
     S: BuildHasher + Clone,
 {
     fn clone(&self) -> HashSet<K, S> {
-        let other = HashSet::builder()
-            .capacity(self.len())
-            .hasher(self.raw.hasher.clone())
-            .collector(seize::Collector::new())
-            .build();
-
-        {
-            let (guard1, guard2) = (&self.guard(), &other.guard());
-            for key in self.iter(guard1) {
-                other.insert(key.clone(), guard2);
-            }
+        HashSet {
+            map: self.map.clone(),
         }
-
-        other
     }
 }
 
@@ -711,8 +676,8 @@ where
 /// This type is created with [`HashSet::pin`] and can be used to easily access a [`HashSet`]
 /// without explicitly managing a guard. See the [crate-level documentation](crate#usage) for details.
 pub struct HashSetRef<'set, K, S, G> {
-    guard: MapGuard<G>,
     set: &'set HashSet<K, S>,
+    map_ref: HashMapRef<'set, K, (), S, G>,
 }
 
 impl<'set, K, S, G> HashSetRef<'set, K, S, G>
@@ -732,7 +697,7 @@ where
     /// See [`HashSet::len`] for details.
     #[inline]
     pub fn len(&self) -> usize {
-        self.set.raw.len()
+        self.map_ref.len()
     }
 
     /// Returns `true` if the set is empty. Otherwise returns `false`.
@@ -740,7 +705,7 @@ where
     /// See [`HashSet::is_empty`] for details.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.map_ref.is_empty()
     }
 
     /// Returns `true` if the set contains a value for the specified key.
@@ -751,7 +716,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        self.get(key).is_some()
+        self.map_ref.get(key).is_some()
     }
 
     /// Returns a reference to the value corresponding to the key.
@@ -762,7 +727,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        match self.set.raw.get(key, &self.guard) {
+        match self.map_ref.get_key_value(key) {
             Some((k, _)) => Some(k),
             None => None,
         }
@@ -773,11 +738,7 @@ where
     /// See [`HashSet::insert`] for details.
     #[inline]
     pub fn insert(&self, key: K) -> bool {
-        match self.set.raw.insert(key, (), true, &self.guard) {
-            InsertResult::Inserted(_) => true,
-            InsertResult::Replaced(_) => false,
-            InsertResult::Error { .. } => unreachable!(),
-        }
+        self.map_ref.insert(key, ()).is_none()
     }
 
     /// Removes a key from the set, returning the value at the key if the key
@@ -789,10 +750,7 @@ where
     where
         Q: Equivalent<K> + Hash + ?Sized,
     {
-        match self.set.raw.remove(key, &self.guard) {
-            Some((_, _)) => true,
-            None => false,
-        }
+        self.map_ref.remove(key).is_some()
     }
 
     /// Clears the set, removing all values.
@@ -800,7 +758,7 @@ where
     /// See [`HashSet::clear`] for details.
     #[inline]
     pub fn clear(&self) {
-        self.set.raw.clear(&self.guard)
+        self.map_ref.clear()
     }
 
     /// Retains only the elements specified by the predicate.
@@ -811,7 +769,7 @@ where
     where
         F: FnMut(&K) -> bool,
     {
-        self.set.raw.retain(|k, _| f(k), &self.guard)
+        self.map_ref.retain(|k, _| f(k))
     }
 
     /// Tries to reserve capacity for `additional` more elements to be inserted
@@ -820,7 +778,7 @@ where
     /// See [`HashSet::reserve`] for details.
     #[inline]
     pub fn reserve(&self, additional: usize) {
-        self.set.raw.reserve(additional, &self.guard)
+        self.map_ref.reserve(additional)
     }
 
     /// An iterator visiting all values in arbitrary order.
@@ -830,7 +788,7 @@ where
     #[inline]
     pub fn iter(&self) -> Iter<'_, K, G> {
         Iter {
-            raw: self.set.raw.iter(&self.guard),
+            inner: self.map_ref.iter(),
         }
     }
 }
@@ -864,7 +822,7 @@ where
 ///
 /// This struct is created by the [`iter`](HashSet::iter) method on [`HashSet`]. See its documentation for details.
 pub struct Iter<'g, K, G> {
-    raw: raw::Iter<'g, K, (), MapGuard<G>>,
+    inner: map::Iter<'g, K, (), G>,
 }
 
 impl<'g, K: 'g, G> Iterator for Iter<'g, K, G>
@@ -875,7 +833,15 @@ where
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.raw.next().map(|(k, _)| k)
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K, G> Clone for Iter<'_, K, G> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -885,10 +851,34 @@ where
     G: Guard,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(Iter {
-                raw: self.raw.clone(),
-            })
-            .finish()
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// An owned iterator over the entries of a `HashSet`.
+///
+/// This `struct` is created by the [`into_iter`] method on [`HashSet`]
+/// (provided by the [`IntoIterator`] trait). See its documentation for more.
+///
+/// [`into_iter`]: IntoIterator::into_iter
+pub struct IntoIter<K> {
+    inner: map::IntoIter<K, ()>,
+}
+
+impl<K> Iterator for IntoIter<K> {
+    type Item = K;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, _)| k)
+    }
+}
+
+impl<K> fmt::Debug for IntoIter<K>
+where
+    K: fmt::Debug,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.inner.raw.iter()).finish()
     }
 }
