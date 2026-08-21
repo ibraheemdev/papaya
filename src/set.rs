@@ -84,8 +84,8 @@ where
     /// This method may be useful when you wish to utilize a single [`seize::Collector`] across
     /// multiple sets contained in a single structure.
     ///
-    /// Note that the entries in the set will not be reclaimed until the `Arc<seize::Collector>`,
-    /// is dropped and so may outlive the lifetime of the map.
+    /// Note that the entries in the set will not be reclaimed until the `Arc<seize::Collector>`
+    /// is dropped, and so may outlive the lifetime of the map.
     pub fn shared_collector(self, collector: Arc<Collector>) -> HashSetBuilder<K, S> {
         HashSetBuilder {
             collector,
