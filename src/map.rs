@@ -30,10 +30,10 @@ unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
 // on a different thread than they were created on through shared access to the
 // `HashMap`.
 //
-// Additionally, `HashMap` owns its `seize::Collector` and never exposes it,
-// so multiple threads cannot be involved in reclamation without sharing the
-// `HashMap` itself. If this was not true, we would require stricter bounds
-// on `HashMap` operations themselves.
+// Additionally, `HashMap` owns its `seize::Collector` except when the `shared_collector`
+// method is used, which enforces a stricter `{K, V}: Send + 'static` bound directly, as
+// it allows multiple threads to participate in reclamation without ever sharing the `HashMap`
+// itself, and allows keys and values to outlive the lifetime of the map.
 unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {}
 
 /// A builder for a [`HashMap`].
