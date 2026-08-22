@@ -234,9 +234,7 @@ pub mod set;
 #[cfg(feature = "serde")]
 mod serde_impls;
 
-pub use crate::map::{
-    Compute, HashMap, HashMapBuilder, HashMapRef, OccupiedError, Operation, ResizeMode,
-};
+pub use crate::map::{Compute, HashMap, OccupiedError, Operation, ResizeMode};
 pub use equivalent::Equivalent;
 pub use seize::{Guard, LocalGuard, OwnedGuard};
-pub use set::{HashSet, HashSetBuilder, HashSetRef};
+pub use set::HashSet;
