@@ -9,6 +9,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// A concurrent hash table.
 ///
@@ -31,10 +32,10 @@ unsafe impl<K: Send, V: Send, S: Send> Send for HashMap<K, V, S> {}
 // on a different thread than they were created on through shared access to the
 // `HashMap`.
 //
-// Additionally, `HashMap` owns its `seize::Collector` and never exposes it,
-// so multiple threads cannot be involved in reclamation without sharing the
-// `HashMap` itself. If this was not true, we would require stricter bounds
-// on `HashMap` operations themselves.
+// Additionally, `HashMap` owns its `seize::Collector` except when the `shared_collector`
+// method is used, which enforces a stricter `{K, V}: Send + 'static` bound directly, as
+// it allows multiple threads to participate in reclamation without ever sharing the `HashMap`
+// itself, and allows keys and values to outlive the lifetime of the map.
 unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {}
 
 /// A builder for a [`HashMap`].
@@ -61,7 +62,7 @@ unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync> Sync for HashMap<K, V, S> {
 pub struct HashMapBuilder<K, V, S = RandomState> {
     hasher: S,
     capacity: usize,
-    collector: Collector,
+    collector: Arc<Collector>,
     resize_mode: ResizeMode,
     _kv: PhantomData<(K, V)>,
 }
@@ -87,7 +88,46 @@ impl<K, V> HashMapBuilder<K, V> {
     }
 }
 
+impl<K, V, S> HashMapBuilder<K, V, S>
+where
+    K: Send + 'static,
+    V: Send + 'static,
+{
+    /// Set a shared `Arc<seize::Collector>` used for garbage collection.
+    ///
+    /// This method may be useful when you wish to utilize a single [`seize::Collector`] across
+    /// multiple maps contained in a single structure.
+    ///
+    /// Note that the entries in the map will not be reclaimed until the `Arc<seize::Collector>`
+    /// is dropped, and so may outlive the lifetime of the map.
+    pub fn shared_collector(self, collector: Arc<Collector>) -> HashMapBuilder<K, V, S> {
+        HashMapBuilder {
+            collector,
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+}
+
 impl<K, V, S> HashMapBuilder<K, V, S> {
+    /// Set the [`seize::Collector`] used for garbage collection.
+    ///
+    /// This method may be useful when you want more control over garbage collection.
+    ///
+    /// Note that all `Guard` references used to access the map must be produced by
+    /// the provided `collector`.
+    pub fn collector(self, collector: Collector) -> HashMapBuilder<K, V, S> {
+        HashMapBuilder {
+            collector: Arc::new(collector),
+            hasher: self.hasher,
+            capacity: self.capacity,
+            resize_mode: self.resize_mode,
+            _kv: PhantomData,
+        }
+    }
+
     /// Set the initial capacity of the map.
     ///
     /// The table should be able to hold at least `capacity` elements before resizing.
@@ -110,22 +150,6 @@ impl<K, V, S> HashMapBuilder<K, V, S> {
             hasher: self.hasher,
             capacity: self.capacity,
             collector: self.collector,
-            _kv: PhantomData,
-        }
-    }
-
-    /// Set the [`seize::Collector`] used for garbage collection.
-    ///
-    /// This method may be useful when you want more control over garbage collection.
-    ///
-    /// Note that all `Guard` references used to access the map must be produced by
-    /// the provided `collector`.
-    pub fn collector(self, collector: Collector) -> Self {
-        HashMapBuilder {
-            collector,
-            hasher: self.hasher,
-            capacity: self.capacity,
-            resize_mode: self.resize_mode,
             _kv: PhantomData,
         }
     }
@@ -222,7 +246,6 @@ impl<K, V> HashMap<K, V> {
     pub fn with_capacity(capacity: usize) -> HashMap<K, V> {
         HashMap::with_capacity_and_hasher(capacity, RandomState::new())
     }
-
     /// Returns a builder for a `HashMap`.
     ///
     /// The builder can be used for more complex configuration, such as using
@@ -231,13 +254,12 @@ impl<K, V> HashMap<K, V> {
         HashMapBuilder {
             capacity: 0,
             hasher: RandomState::default(),
-            collector: Collector::new(),
+            collector: Arc::new(Collector::new()),
             resize_mode: ResizeMode::default(),
             _kv: PhantomData,
         }
     }
 }
-
 impl<K, V, S> Default for HashMap<K, V, S>
 where
     S: Default,
@@ -303,7 +325,7 @@ impl<K, V, S> HashMap<K, V, S> {
             raw: raw::HashMap::new(
                 capacity,
                 hash_builder,
-                Collector::default(),
+                Arc::new(Collector::new()),
                 ResizeMode::default(),
             ),
         }
@@ -1440,8 +1462,8 @@ where
             .update_or_insert_with(key, update, f, &self.guard)
     }
 
-    // Updates an entry with a compare-and-swap (CAS) function.
-    //
+    /// Updates an entry with a compare-and-swap (CAS) function.
+    ///
     /// See [`HashMap::compute`] for details.
     #[inline]
     pub fn compute<'g, F, T>(&'g self, key: K, compute: F) -> Compute<'g, K, V, T>
