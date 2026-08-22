@@ -35,8 +35,8 @@ fn insert() {
     with_set::<usize>(|set| {
         let set = set();
         let guard = set.guard();
-        assert_eq!(set.insert(42, &guard), true);
-        assert_eq!(set.insert(42, &guard), false);
+        assert!(set.insert(42, &guard));
+        assert!(!set.insert(42, &guard));
         assert_eq!(set.len(), 1);
     });
 }
@@ -56,7 +56,7 @@ fn remove_empty() {
     with_set::<usize>(|set| {
         let set = set();
         let guard = set.guard();
-        assert_eq!(set.remove(&42, &guard), false);
+        assert!(!set.remove(&42, &guard));
     });
 }
 
@@ -375,9 +375,9 @@ fn extend() {
         let mut entries: Vec<usize> = vec![42, 16, 38];
         entries.sort_unstable();
 
-        (&set).extend(entries.clone().into_iter());
+        (&set).extend(entries.clone());
 
-        let mut collected: Vec<usize> = set.iter(&guard).map(|key| *key).collect();
+        let mut collected: Vec<usize> = set.iter(&guard).copied().collect();
         collected.sort_unstable();
 
         assert_eq!(entries, collected);
@@ -395,7 +395,7 @@ fn extend_ref() {
         let mut entries: Vec<&usize> = vec![&42, &36, &18];
         entries.sort();
 
-        (&set).extend(entries.clone().into_iter());
+        (&set).extend(entries.clone());
 
         let guard = set.guard();
         let mut collected: Vec<&usize> = set.iter(&guard).collect();
@@ -410,7 +410,7 @@ fn from_iter_empty() {
     use std::iter::FromIterator;
 
     let entries: Vec<usize> = Vec::new();
-    let set: HashSet<usize> = HashSet::from_iter(entries.into_iter());
+    let set: HashSet<usize> = HashSet::from_iter(entries);
 
     assert_eq!(set.len(), 0)
 }
@@ -420,7 +420,7 @@ fn from_iter_repeated() {
     use std::iter::FromIterator;
 
     let entries = vec![0, 0, 0];
-    let set: HashSet<_> = HashSet::from_iter(entries.into_iter());
+    let set: HashSet<_> = HashSet::from_iter(entries);
     let set = set.pin();
     assert_eq!(set.len(), 1);
     assert_eq!(set.iter().collect::<Vec<_>>(), vec![&0])
@@ -448,11 +448,11 @@ fn iter() {
         let set = set();
         let len = if cfg!(miri) { 100 } else { 10_000 };
         for i in 0..len {
-            assert_eq!(set.pin().insert(i), true);
+            assert!(set.pin().insert(i));
         }
 
         let v: Vec<_> = (0..len).collect();
-        let mut got: Vec<_> = set.pin().iter().map(|&k| k).collect();
+        let mut got: Vec<_> = set.pin().iter().copied().collect();
         got.sort();
         assert_eq!(v, got);
     });
@@ -521,16 +521,16 @@ fn mixed() {
 
         assert!(set.pin().get(&300).is_none());
 
-        assert_eq!(set.pin().remove(&100), true);
-        assert_eq!(set.pin().remove(&200), true);
-        assert_eq!(set.pin().remove(&300), false);
+        assert!(set.pin().remove(&100));
+        assert!(set.pin().remove(&200));
+        assert!(!set.pin().remove(&300));
 
         assert!(set.pin().get(&100).is_none());
         assert!(set.pin().get(&200).is_none());
         assert!(set.pin().get(&300).is_none());
 
         for i in 0..LEN {
-            assert_eq!(set.pin().insert(i), true);
+            assert!(set.pin().insert(i));
         }
 
         for i in 0..LEN {
@@ -538,7 +538,7 @@ fn mixed() {
         }
 
         for i in 0..LEN {
-            assert_eq!(set.pin().remove(&i), true);
+            assert!(set.pin().remove(&i));
         }
 
         for i in 0..LEN {
@@ -546,7 +546,7 @@ fn mixed() {
         }
 
         for i in 0..(LEN * 2) {
-            assert_eq!(set.pin().insert(i), true);
+            assert!(set.pin().insert(i));
         }
 
         for i in 0..(LEN * 2) {
@@ -557,8 +557,9 @@ fn mixed() {
 
 // run tests with hashers that create unrealistically long probe sequences
 mod hasher {
-    use super::*;
 
+    use super::*;
+    #[allow(clippy::extra_unused_type_parameters)]
     fn check<S: BuildHasher + Default>() {
         let range = if cfg!(miri) { 0..16 } else { 0..100 };
 
@@ -569,13 +570,13 @@ mod hasher {
                 set.insert(i, &guard);
             }
 
-            assert!(!set.contains(&i32::min_value(), &guard));
+            assert!(!set.contains(&i32::MIN, &guard));
             assert!(!set.contains(&(range.start - 1), &guard));
             for i in range.clone() {
                 assert!(set.contains(&i, &guard));
             }
             assert!(!set.contains(&range.end, &guard));
-            assert!(!set.contains(&i32::max_value(), &guard));
+            assert!(!set.contains(&i32::MAX, &guard));
         });
     }
 
@@ -602,7 +603,7 @@ mod hasher {
 
         impl Hasher for MaxHasher {
             fn finish(&self) -> u64 {
-                u64::max_value()
+                u64::MAX
             }
 
             fn write(&mut self, _: &[u8]) {}

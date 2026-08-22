@@ -63,8 +63,8 @@ impl Environment {
             vals1: Mutex::new(vec![0usize; cfg::NUM_KEYS]),
             vals2: Mutex::new(vec![0usize; cfg::NUM_KEYS]),
             ind_dist: Uniform::from(0..cfg::NUM_KEYS - 1),
-            val_dist1: Uniform::from(Value::min_value()..Value::max_value()),
-            val_dist2: Uniform::from(Value::min_value()..Value::max_value()),
+            val_dist1: Uniform::from(Value::MIN..Value::MAX),
+            val_dist2: Uniform::from(Value::MIN..Value::MAX),
             in_table: Mutex::new(vec![false; cfg::NUM_KEYS]),
             in_use: Mutex::new(in_use),
             finished: AtomicBool::new(false),
@@ -131,8 +131,8 @@ fn stress_delete_thread(env: Arc<Environment>) {
             .is_ok()
         {
             let key = env.keys[idx];
-            let res1 = env.table1.remove(&key, &guard1).map_or(false, |_| true);
-            let res2 = env.table2.remove(&key, &guard2).map_or(false, |_| true);
+            let res1 = env.table1.remove(&key, &guard1).is_some();
+            let res2 = env.table2.remove(&key, &guard2).is_some();
             let mut in_table = env.in_table.lock().unwrap();
             assert_eq!(res1, (*in_table)[idx]);
             assert_eq!(res2, (*in_table)[idx]);
@@ -164,13 +164,13 @@ fn stress_find_thread(env: Arc<Environment>) {
             let val2 = (*env.vals2.lock().unwrap())[idx];
 
             let value = env.table1.get(&key, &guard1);
-            if value.is_some() {
-                assert_eq!(&val1, value.unwrap());
+            if let Some(value) = value {
+                assert_eq!(&val1, value);
                 assert!((*in_table)[idx]);
             }
             let value = env.table2.get(&key, &guard2);
-            if value.is_some() {
-                assert_eq!(&val2, value.unwrap());
+            if let Some(value) = value {
+                assert_eq!(&val2, value);
                 assert!((*in_table)[idx]);
             }
             (*in_use)[idx].swap(false, Ordering::SeqCst);
