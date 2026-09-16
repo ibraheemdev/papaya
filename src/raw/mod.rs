@@ -18,7 +18,7 @@ use self::utils::{untagged, AtomicPtrFetchOps, Counter, Parker, StrictProvenance
 use crate::map::{Compute, Operation, ResizeMode};
 use crate::Equivalent;
 
-use seize::{Collector, LocalGuard, OwnedGuard};
+use seize::{Collector, Guard as _, LocalGuard, OwnedGuard};
 use utils::{MapGuard, Stack, VerifiedGuard};
 
 /// A lock-free hash-table.
@@ -2724,36 +2724,55 @@ impl<K, V, G> Clone for Iter<'_, K, V, G> {
 
 impl<K, V, S> Drop for HashMap<K, V, S> {
     fn drop(&mut self) {
-        let mut raw = *self.table.get_mut();
+        let raw = *self.table.get_mut();
 
-        // Make sure all objects are reclaimed before the collector is dropped.
-        //
-        // Dropping a table depends on accessing the collector for deferred retirement,
-        // using the shared collector pointer that is invalidated by drop.
-        //
-        // Safety: We have a unique reference to the collector.
-        unsafe { self.collector.reclaim_all() };
+        if Arc::get_mut(&mut self.collector).is_some() {
+            // Make sure all objects are reclaimed before the collector is dropped.
+            //
+            // Safety: `Arc::get_mut` proves that no other strong or weak references
+            // to the collector exist, so no guards can still be active.
+            unsafe { self.collector.reclaim_all() };
 
-        // Drop all nested tables and entries.
-        while !raw.is_null() {
-            // Safety: The root and next tables are always valid pointers to a
-            // table allocation, or null.
-            let mut table = unsafe { Table::from_raw(raw) };
+            // Safety: We have exclusive access to the map and its collector.
+            unsafe { drop_tables(raw, &self.collector) };
+        } else {
+            let guard = self.collector.enter();
 
-            // Read the next table pointer before dropping the current one.
-            let next = *table.state_mut().next.get_mut();
-
-            // Safety: We have unique access to the table and do
-            // not access the entries after this call.
-            unsafe { drop_entries(table) };
-
-            // Safety: We have unique access to the table and do
-            // not access it after this call.
-            unsafe { drop_table(table, &self.collector) };
-
-            // Continue for all nested tables.
-            raw = next;
+            // Defer destruction of this map's table chain through the shared
+            // collector so active guards from any map sharing it remain protected.
+            //
+            // Safety: Dropping the map makes its root table unreachable. `raw` is
+            // the valid root of the complete table chain owned by this map.
+            unsafe {
+                guard.defer_retire(raw, |raw, collector| {
+                    drop_tables(raw, collector);
+                });
+            }
         }
+    }
+}
+
+// Drop all tables and entries owned by a map.
+//
+// # Safety
+//
+// `raw` must be the root of a valid table chain that is no longer accessible.
+unsafe fn drop_tables<K, V>(mut raw: *mut RawTable<Entry<K, V>>, collector: &Collector) {
+    while !raw.is_null() {
+        // Safety: The root and next tables are always valid pointers to a
+        // table allocation, or null.
+        let mut table = unsafe { Table::from_raw(raw) };
+
+        // Read the next table pointer before dropping the current one.
+        let next = *table.state_mut().next.get_mut();
+
+        // Safety: The table is inaccessible and its entries are not used afterward.
+        unsafe { drop_entries(table) };
+
+        // Safety: The table is inaccessible and is not used afterward.
+        unsafe { drop_table(table, collector) };
+
+        raw = next;
     }
 }
 

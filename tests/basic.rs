@@ -1,9 +1,13 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::{Compute, HashMap, OccupiedError, Operation};
+use papaya::{Compute, HashMap, OccupiedError, Operation, ResizeMode};
+use seize::Collector;
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 mod common;
 use common::with_map;
@@ -578,6 +582,51 @@ fn current_kv_dropped() {
         assert_eq!(Arc::strong_count(&dropped1), 1);
         assert_eq!(Arc::strong_count(&dropped2), 1);
     });
+}
+
+#[test]
+fn shared_collector_drop_respects_active_guards() {
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let collector = Arc::new(Collector::new());
+    let drops = Arc::new(AtomicUsize::new(0));
+    let protected = HashMap::builder()
+        .shared_collector(Arc::clone(&collector))
+        .build();
+    let growing = HashMap::builder()
+        .capacity(1)
+        .resize_mode(ResizeMode::Blocking)
+        .shared_collector(Arc::clone(&collector))
+        .build();
+    let trigger = HashMap::<usize, usize>::builder()
+        .shared_collector(Arc::clone(&collector))
+        .build();
+
+    let guard = protected.guard();
+    protected.insert(0, DropProbe(Arc::clone(&drops)), &guard);
+    let reference = protected.get(&0, &guard).unwrap();
+    std::hint::black_box(reference);
+    protected.remove(&0, &guard);
+
+    for key in 0..1_024 {
+        growing.pin().insert(key, key);
+    }
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    drop(trigger);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+    drop(guard);
+    drop(growing);
+    drop(protected);
+    drop(collector);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 #[test]
