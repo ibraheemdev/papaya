@@ -5,7 +5,9 @@ use std::fmt::{self, Formatter};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
-use crate::{Guard, HashMap, HashMapRef, HashSet, HashSetRef};
+use crate::map::HashMapRef;
+use crate::set::HashSetRef;
+use crate::{Guard, HashMap, HashSet};
 
 struct MapVisitor<K, V, S> {
     _marker: PhantomData<HashMap<K, V, S>>,

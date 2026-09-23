@@ -1,3 +1,5 @@
+//! A fast and ergonomic concurrent hash-set.
+
 use crate::raw::utils::MapGuard;
 use crate::raw::{self, InsertResult};
 use crate::Equivalent;

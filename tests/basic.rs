@@ -1,6 +1,6 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::{Compute, HashMap, OccupiedError, Operation};
+use papaya::map::{Compute, HashMap, OccupiedError, Operation};
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -716,7 +716,7 @@ fn extend() {
         let mut entries: Vec<(usize, usize)> = vec![(42, 0), (16, 6), (38, 42)];
         entries.sort_unstable();
 
-        (&map).extend(entries.clone().into_iter());
+        (&map).extend(entries.clone());
 
         let mut collected: Vec<(usize, usize)> = map
             .iter(&guard)
@@ -739,7 +739,7 @@ fn extend_ref() {
         let mut entries: Vec<(&usize, &usize)> = vec![(&42, &0), (&16, &6), (&38, &42)];
         entries.sort();
 
-        (&map).extend(entries.clone().into_iter());
+        (&map).extend(entries.clone());
 
         let guard = map.guard();
         let mut collected: Vec<(&usize, &usize)> = map.iter(&guard).collect();
@@ -754,7 +754,7 @@ fn from_iter_empty() {
     use std::iter::FromIterator;
 
     let entries: Vec<(usize, usize)> = Vec::new();
-    let map: HashMap<usize, usize> = HashMap::from_iter(entries.into_iter());
+    let map: HashMap<usize, usize> = HashMap::from_iter(entries);
 
     assert_eq!(map.len(), 0)
 }
@@ -764,7 +764,7 @@ fn from_iter_repeated() {
     use std::iter::FromIterator;
 
     let entries = vec![(0, 1), (0, 2), (0, 3)];
-    let map: HashMap<_, _> = HashMap::from_iter(entries.into_iter());
+    let map: HashMap<_, _> = HashMap::from_iter(entries);
     let map = map.pin();
     assert_eq!(map.len(), 1);
     assert_eq!(map.iter().collect::<Vec<_>>(), vec![(&0, &3)])
@@ -911,8 +911,9 @@ fn mixed() {
 
 // run tests with hashers that create unrealistically long probe sequences
 mod hasher {
-    use super::*;
 
+    use super::*;
+    #[allow(clippy::extra_unused_type_parameters)]
     fn check<S: BuildHasher + Default>() {
         let range = if cfg!(miri) { 0..16 } else { 0..100 };
 
@@ -923,13 +924,13 @@ mod hasher {
                 map.insert(i, i, &guard);
             }
 
-            assert!(!map.contains_key(&i32::min_value(), &guard));
+            assert!(!map.contains_key(&i32::MIN, &guard));
             assert!(!map.contains_key(&(range.start - 1), &guard));
             for i in range.clone() {
                 assert!(map.contains_key(&i, &guard));
             }
             assert!(!map.contains_key(&range.end, &guard));
-            assert!(!map.contains_key(&i32::max_value(), &guard));
+            assert!(!map.contains_key(&i32::MIN, &guard));
         });
     }
 
@@ -956,7 +957,7 @@ mod hasher {
 
         impl Hasher for MaxHasher {
             fn finish(&self) -> u64 {
-                u64::max_value()
+                u64::MAX
             }
 
             fn write(&mut self, _: &[u8]) {}
