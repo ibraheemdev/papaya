@@ -1,6 +1,6 @@
 // Adapted from: https://github.com/jonhoo/flurry/blob/main/tests/basic.rs
 
-use papaya::{Compute, HashMap, OccupiedError, Operation};
+use papaya::{Compute, HashMap, OccupiedError, Operation, ResizeMode};
 
 use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
 use std::sync::Arc;
@@ -910,6 +910,118 @@ fn mixed() {
 }
 
 // run tests with hashers that create unrealistically long probe sequences
+
+// Runs each operation that forces an in-progress resize to complete, asserting that it returns
+// and produces the correct contents.
+//
+// Every operation runs on its own thread because a failure here is a livelock rather than a
+// panic. The spinning thread cannot be joined or cancelled, so it is left running until the
+// test process exits.
+fn with_forced_operations(build: fn() -> HashMap<usize, usize>) {
+    const ENTRIES: usize = 32;
+
+    // Each case is an operation that forces the resize to complete, and the value it is
+    // expected to produce.
+    let cases: [(&str, fn(&HashMap<usize, usize>) -> usize, usize); 4] = [
+        (
+            "reserve",
+            |map| {
+                map.reserve(1 << 16, &map.guard());
+                map.len()
+            },
+            ENTRIES,
+        ),
+        (
+            "clear",
+            |map| {
+                map.clear(&map.guard());
+                map.len()
+            },
+            0,
+        ),
+        (
+            "retain",
+            |map| {
+                map.retain(|key, _| key % 2 == 0, &map.guard());
+                map.len()
+            },
+            ENTRIES / 2,
+        ),
+        ("iter", |map| map.iter(&map.guard()).count(), ENTRIES),
+    ];
+
+    // Collected so that a single run reports every operation that failed to complete, instead
+    // of stopping at the first one.
+    let mut incomplete = Vec::new();
+
+    for (name, operation, expected) in cases {
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let map = build();
+
+            // Insert enough entries to leave a resize in progress.
+            let guard = map.guard();
+            for i in 0..ENTRIES {
+                map.insert(i, i, &guard);
+            }
+            drop(guard);
+
+            let _ = sender.send(operation(&map));
+        });
+
+        // These operations complete in microseconds, so the timeout is only generous enough to
+        // avoid flaking on a loaded machine. A chunk size that makes no copy progress never
+        // completes at all, so no timeout can cause a false pass.
+        let timeout = std::time::Duration::from_secs(10);
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => assert_eq!(result, expected, "`{name}` returned the wrong result"),
+            Err(_) => incomplete.push(name),
+        }
+    }
+
+    assert!(
+        incomplete.is_empty(),
+        "operations did not complete: {incomplete:?}"
+    );
+}
+
+#[test]
+fn incremental_zero_chunk() {
+    // A chunk size of zero must still make copy progress. Otherwise the claim counter never
+    // advances and operations that force the resize to complete spin forever.
+    with_forced_operations(|| {
+        HashMap::builder()
+            .capacity(8)
+            .resize_mode(ResizeMode::Incremental(0))
+            .build()
+    });
+}
+
+#[test]
+fn forced_operations() {
+    with_forced_operations(|| {
+        HashMap::builder()
+            .capacity(8)
+            .resize_mode(ResizeMode::Incremental(1))
+            .build()
+    });
+
+    with_forced_operations(|| {
+        HashMap::builder()
+            .capacity(8)
+            .resize_mode(ResizeMode::Incremental(64))
+            .build()
+    });
+
+    with_forced_operations(|| {
+        HashMap::builder()
+            .capacity(8)
+            .resize_mode(ResizeMode::Blocking)
+            .build()
+    });
+}
+
 mod hasher {
     use super::*;
 
