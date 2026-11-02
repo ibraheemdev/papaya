@@ -2000,7 +2000,9 @@ where
         match self.resize {
             ResizeMode::Blocking => self.help_copy_blocking(table, guard),
             ResizeMode::Incremental(chunk) => {
-                let copied_to = self.help_copy_incremental(chunk, copy_all, guard);
+                // A chunk size of zero would never make any copy progress, so operations that
+                // force the copy to complete would spin forever.
+                let copied_to = self.help_copy_incremental(chunk.max(1), copy_all, guard);
 
                 if !copy_all {
                     // If we weren't trying to linearize, we have to write to the next table
